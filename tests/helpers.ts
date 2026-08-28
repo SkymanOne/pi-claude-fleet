@@ -11,6 +11,7 @@ export const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), ".."
 export const CLI_TS = path.join(ROOT, "src", "cli.ts");
 export const TSX_LOADER = fileURLToPath(import.meta.resolve("tsx"));
 export const FAKE_PI = path.join(ROOT, "tests", "fixtures", "fake-pi.mjs");
+export const FAIL_PI = path.join(ROOT, "tests", "fixtures", "fail-pi.mjs");
 export const TERMINAL = ["settled", "stopped", "error", "dead", "archived"];
 
 export function fakePiEnv(over: Record<string, string> = {}): NodeJS.ProcessEnv {

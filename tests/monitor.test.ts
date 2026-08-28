@@ -1,0 +1,68 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { isAlive } from "../src/state.js";
+import {
+  initRepo, runCli, fakePiEnv, readState, firstRunId, fleetDirOf, waitFor, TERMINAL, FAIL_PI,
+} from "./helpers.js";
+
+const settledState = (root: string) =>
+  waitFor(() => {
+    const s = readState(root);
+    return TERMINAL.includes(s.status) ? s : undefined;
+  }, { timeoutMs: 30_000 });
+
+test("full run: spawn → settled → lastAssistantText + report + events captured; monitor exits", async () => {
+  const root = initRepo("pf-mon-");
+  const r = await runCli(["spawn", "auth", "--cwd", root, "--no-worktree", "--", "create hello.txt"],
+    { env: fakePiEnv({ FAKE_PI_DELAY_MS: "300" }) });
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /Spawned auth-\d{14}/);
+
+  const state = await settledState(root);
+  assert.equal(state.status, "settled");
+  assert.equal(state.lastAssistantText, "Working: wrote hello.txt");
+  assert.equal(state.lastTool, "bash");
+  assert.ok(state.lastActivity);
+  assert.ok(state.settledAt);
+  assert.equal(state.error, null);
+  assert.ok(Number.isInteger(state.pid));
+
+  const fleetDir = fleetDirOf(root);
+  const runId = firstRunId(root);
+  assert.equal(fs.existsSync(path.join(fleetDir, "reports", `${runId}.md`)), true);
+  const events = fs.readFileSync(path.join(fleetDir, "runs", runId, "events.jsonl"), "utf8");
+  assert.match(events, /"task_prompt"/);
+  assert.match(events, /"tool_execution_end"/);
+  assert.match(events, /"text_end"/);
+  assert.doesNotMatch(events, /"turn_start"/, "unselected events are not captured");
+  const rpcLog = fs.readFileSync(path.join(fleetDir, "runs", runId, "rpc.log"), "utf8");
+  assert.match(rpcLog, /"agent_settled"/);
+  assert.match(rpcLog, /"turn_start"/, "rpc.log keeps every raw line");
+
+  // the monitor shuts pi down and exits after settling
+  await waitFor(() => (isAlive(state.pid) ? undefined : true), { timeoutMs: 15_000 });
+}, { timeout: 60_000 });
+
+test("pi child exits without settling → error state with exit code", async () => {
+  const root = initRepo("pf-err-");
+  const r = await runCli(["spawn", "boom", "--cwd", root, "--no-worktree", "--", "x"],
+    { env: fakePiEnv({ PI_FLEET_PI_BIN: `${process.execPath} ${FAIL_PI}` }) });
+  assert.equal(r.code, 0, r.stderr);
+  const state = await settledState(root);
+  assert.equal(state.status, "error");
+  assert.match(state.error, /exited with code 1/);
+  assert.match(state.error, /model provider unreachable/, "stderr tail captured");
+  assert.ok(state.settledAt);
+}, { timeout: 60_000 });
+
+test("missing pi binary → error state naming the spawn failure", async () => {
+  const root = initRepo("pf-nopi-");
+  const r = await runCli(["spawn", "ghost", "--cwd", root, "--no-worktree", "--", "x"],
+    { env: fakePiEnv({ PI_FLEET_PI_BIN: "/nonexistent/pi-binary" }) });
+  assert.equal(r.code, 0, r.stderr);
+  const state = await settledState(root);
+  assert.equal(state.status, "error");
+  assert.match(state.error, /failed to start pi/);
+}, { timeout: 60_000 });
