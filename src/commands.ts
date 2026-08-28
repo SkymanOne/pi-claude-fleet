@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import Table from "cli-table3";
+import { SRC_DIR } from "./paths.js";
 import { createRun, sanitizeName, resolveFleetDir, type SpawnOpts } from "./spawn.js";
 import {
   runDirFor,
@@ -25,8 +26,7 @@ import { gitRaw, isGitRepo, repoRoot, removeWorktree } from "./worktree.js";
 
 export type { SpawnOpts } from "./spawn.js";
 
-export const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
-export const PACKAGE_ROOT = path.dirname(SRC_DIR);
+export { SRC_DIR, PACKAGE_ROOT } from "./paths.js";
 
 /**
  * How to re-invoke this CLI as a detached background process.

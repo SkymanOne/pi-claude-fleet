@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { splitJsonLines, parseLineSafe, nowIso, readNewLines } from "./util.js";
+import { FLEET_EXTENSION_PATH, FLEET_SKILL_PATH } from "./paths.js";
 import {
   loadState,
   saveState,
@@ -45,7 +46,13 @@ export function piCommand(): { bin: string; prefix: string[] } {
 }
 
 export function buildPiArgs(state: RunState, runDir: string): string[] {
-  const args = ["--mode", "rpc", "--session-dir", path.join(runDir, "session")];
+  const args = [
+    "--mode", "rpc",
+    "--session-dir", path.join(runDir, "session"),
+    // the worker protocol travels with the CLI, so `pi install` is optional
+    "--extension", FLEET_EXTENSION_PATH,
+    "--skill", FLEET_SKILL_PATH,
+  ];
   if (state.provider) args.push("--provider", state.provider);
   if (state.model) args.push("--model", state.model);
   if (state.thinking) args.push("--thinking", state.thinking);
