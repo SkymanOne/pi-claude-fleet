@@ -165,10 +165,17 @@ export function isAlive(pid: number | null | undefined): boolean {
   }
 }
 
+/** A freshly spawned run has no pid until its monitor boots; don't call it dead yet. */
+export const STARTING_GRACE_MS = 30_000;
+
 export function deriveStatus(
   state: RunState,
   liveness: (pid: number | null | undefined) => boolean = isAlive,
+  now: number = Date.now(),
 ): RunStateName {
+  if (state.status === "starting" && state.pid === null) {
+    return now - Date.parse(state.createdAt) > STARTING_GRACE_MS ? "dead" : "starting";
+  }
   if (
     (state.status === "starting" || state.status === "running") &&
     !liveness(state.pid)

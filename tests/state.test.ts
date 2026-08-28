@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   newRunState, loadState, saveState, deriveStatus, isAlive, recordSteering,
-  recordToolActivity, appendControl, listRuns, findRun, runDirFor,
+  recordToolActivity, appendControl, listRuns, findRun, runDirFor, STARTING_GRACE_MS,
 } from "../src/state.js";
 import { tmpDir } from "./helpers.js";
 
@@ -93,4 +93,11 @@ test("listRuns newest-first; findRun prefers non-archived; throws when absent", 
   await saveState(newest.runDir, newest.state);
   assert.equal(findRun(fleetDir, "auth").runId, "auth-20260828141530");
   assert.throws(() => findRun(fleetDir, "ghost"), /No run found/);
+});
+
+test("deriveStatus: starting with no pid is 'starting' within the grace period, 'dead' after", () => {
+  const s = newRunState(base);
+  const created = Date.parse(s.createdAt);
+  assert.equal(deriveStatus(s, () => false, created + 1000), "starting");
+  assert.equal(deriveStatus(s, () => false, created + STARTING_GRACE_MS + 1), "dead");
 });

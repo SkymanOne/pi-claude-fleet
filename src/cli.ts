@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 import { Command, CommanderError, type OptionValues } from "commander";
-import { cmdSpawn, type SpawnOpts } from "./commands.js";
+import {
+  cmdSpawn,
+  cmdStatus,
+  cmdWait,
+  cmdOutput,
+  cmdLogs,
+  type SpawnOpts,
+} from "./commands.js";
 
 let exitCode = 0;
 const done = (n: number): void => {
@@ -44,6 +51,43 @@ program
       }),
     );
   });
+
+program
+  .command("status [name]")
+  .description("fleet table, or one run's full state as JSON")
+  .option(...cwdOption)
+  .option("--json", "machine-readable output")
+  .option("--all", "include archived runs")
+  .action(async (name: string | undefined, options: OptionValues) =>
+    done(await cmdStatus({ name, cwd: options.cwd, json: options.json, all: options.all })),
+  );
+
+program
+  .command("wait <name>")
+  .description("block until the run settles (exit 0), times out (3), or ends stopped/error/dead (4)")
+  .option(...cwdOption)
+  .option("--timeout <sec>", "seconds to wait (default 600)")
+  .action(async (name: string, options: OptionValues) =>
+    done(await cmdWait({ name, cwd: options.cwd, timeout: options.timeout })),
+  );
+
+program
+  .command("output <name>")
+  .description("last assistant text, or the last n tool results with --tail")
+  .option(...cwdOption)
+  .option("--tail <n>", "print the last n tool results instead")
+  .action(async (name: string, options: OptionValues) =>
+    done(await cmdOutput({ name, cwd: options.cwd, tail: options.tail })),
+  );
+
+program
+  .command("logs <name>")
+  .description("tail the captured raw RPC stream")
+  .option(...cwdOption)
+  .option("--tail <n>", "lines to print (default 50)")
+  .action(async (name: string, options: OptionValues) =>
+    done(await cmdLogs({ name, cwd: options.cwd, tail: options.tail })),
+  );
 
 program
   .command("__monitor <piFleetDir> <runId>", { hidden: true })

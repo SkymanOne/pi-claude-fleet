@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   splitJsonLines, parseLineSafe, atomicWriteJson, appendJsonLine, readJsonlTail,
-  runIdFor, short7, branchFor, firstLine, formatAge, resultTextOf, readNewLines,
+  runIdFor, short7, branchFor, firstLine, formatAge, resultTextOf, readNewLines, tailText,
 } from "../src/util.js";
 import { tmpDir } from "./helpers.js";
 
@@ -86,4 +86,14 @@ test("readNewLines advances only past complete lines and re-reads partial tails"
   assert.equal(second.offset, fs.statSync(p).size);
   assert.deepEqual(readNewLines(p, second.offset), { lines: [], offset: second.offset });
   assert.deepEqual(readNewLines(path.join(p, "missing"), 0), { lines: [], offset: 0 });
+});
+
+test("tailText returns the last n lines regardless of a trailing newline", async () => {
+  const p = path.join(tmpDir("pf-util-"), "rpc.log");
+  fs.writeFileSync(p, "a\nb\nc\n");
+  assert.equal(await tailText(p, 2), "b\nc");
+  assert.equal(await tailText(p, 10), "a\nb\nc");
+  fs.writeFileSync(p, "a\nb");
+  assert.equal(await tailText(p, 1), "b");
+  assert.equal(await tailText(path.join(p, "missing"), 3), "");
 });

@@ -79,7 +79,9 @@ export async function tailText(
 ): Promise<string> {
   try {
     const raw = await fs.readFile(filePath, "utf8");
-    return raw.split("\n").slice(-nLines).join("\n");
+    const body = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
+    if (!body) return "";
+    return body.split("\n").slice(-nLines).join("\n");
   } catch {
     return "";
   }
