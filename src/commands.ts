@@ -19,6 +19,7 @@ import {
   type RunState,
 } from "./state.js";
 import { readJsonlTail, tailText, firstLine, formatAge, resultTextOf } from "./util.js";
+import { readReport, buildSteeringAppendix } from "./report.js";
 
 export type { SpawnOpts } from "./spawn.js";
 
@@ -228,4 +229,18 @@ export async function cmdFollowup(args: ControlArgs): Promise<number> {
 
 export async function cmdStop(args: { name: string; cwd?: string }): Promise<number> {
   return controlCommand("abort", { name: args.name, cwd: args.cwd });
+}
+
+/** Exit 0 with the report (or fallback text) + steering appendix; exit 2 when there is nothing. */
+export async function cmdReport(args: { name: string; cwd?: string }): Promise<number> {
+  const { piFleetDir, run } = await resolveRun(args.name, args.cwd);
+  const result = readReport(piFleetDir, run.state);
+  if (result.kind === "missing") {
+    console.error(`report: no report file and no captured output for ${run.state.name}`);
+    return 2;
+  }
+  console.log(result.text);
+  const appendix = buildSteeringAppendix(run.state);
+  if (appendix) console.log(appendix);
+  return 0;
 }

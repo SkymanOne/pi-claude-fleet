@@ -9,6 +9,7 @@ import {
   cmdSend,
   cmdFollowup,
   cmdStop,
+  cmdReport,
   type SpawnOpts,
 } from "./commands.js";
 
@@ -114,6 +115,14 @@ program
   .option(...cwdOption)
   .action(async (name: string, options: OptionValues) =>
     done(await cmdStop({ name, cwd: options.cwd })),
+  );
+
+program
+  .command("report <name>")
+  .description("the worker's final report (or last assistant text) plus the steering log; exit 2 if none")
+  .option(...cwdOption)
+  .action(async (name: string, options: OptionValues) =>
+    done(await cmdReport({ name, cwd: options.cwd })),
   );
 
 program
