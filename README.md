@@ -14,9 +14,9 @@ Requires Node ≥ 22 and `pi` on `PATH`.
 ## Install
 
 ```bash
-pnpm install && pnpm build          # or: npm install -g .   → `pi-fleet` on PATH
-pi install /path/to/pi-claude-fleet # optional: pi loads the extension + skill globally
-pi-fleet install-claude-skill       # symlinks claude/skills/pi-orchestrator → ~/.claude/skills
+pnpm install && pnpm build && pnpm link --global   # `pi-fleet` on PATH (or: npm install -g .)
+pi install /path/to/pi-claude-fleet                # optional: pi loads the extension + skill globally
+pi-fleet install-claude-skill                      # symlinks claude/skills/pi-orchestrator → ~/.claude/skills
 ```
 
 `pi-fleet` passes its extension and skill to every worker with `--extension`/`--skill`, so the

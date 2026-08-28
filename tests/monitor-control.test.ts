@@ -58,9 +58,11 @@ test("abort via control.jsonl → abort_requested event and stopped state", asyn
   assert.match(fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8"), /"abort_requested"/);
 }, { timeout: 60_000 });
 
-test("steering after settle is not forwarded or recorded", async () => {
+test("steering after settle is not forwarded or recorded (logged as control_dropped while the monitor lives)", async () => {
   const root = initRepo("pf-late-");
-  const r = await runCli(["spawn", "auth", "--cwd", root, "--no-worktree", "--", "x"]);
+  // pi lingers after settle so the monitor is still polling control.jsonl when the late steer lands
+  const r = await runCli(["spawn", "auth", "--cwd", root, "--no-worktree", "--", "x"],
+    { env: fakePiEnv({ FAKE_PI_EXIT_DELAY_MS: "3000" }) });
   assert.equal(r.code, 0, r.stderr);
   const runId = firstRunId(root);
   const runDir = path.join(fleetDirOf(root), "runs", runId);
@@ -69,5 +71,23 @@ test("steering after settle is not forwarded or recorded", async () => {
   fs.appendFileSync(path.join(runDir, "control.jsonl"), controlLine({ type: "steer", message: "too late", source: "console" }));
   await new Promise((res) => setTimeout(res, 800));
   assert.equal(readState(root, runId).steerCount, 0);
-  assert.doesNotMatch(fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8"), /too late/);
+  const events = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8");
+  assert.doesNotMatch(events, /steering_delivered.*too late/);
+  assert.match(events, /"control_dropped".*"run already settled"/);
+}, { timeout: 60_000 });
+
+test("a steer sent before the monitor boots is still delivered", async () => {
+  const root = initRepo("pf-early-");
+  const r = await runCli(["spawn", "auth", "--cwd", root, "--no-worktree", "--", "x"],
+    { env: fakePiEnv({ FAKE_PI_DELAY_MS: "3000" }) });
+  assert.equal(r.code, 0, r.stderr);
+  const sent = await runCli(["send", "auth", "--cwd", root, "--", "early bird"]);
+  assert.equal(sent.code, 0, sent.stderr);
+  const runId = firstRunId(root);
+  const state = await settled(root, runId);
+  assert.equal(state.status, "settled");
+  assert.equal(state.steerCount, 1);
+  assert.equal(state.steeringLog[0].message, "early bird");
+  const report = fs.readFileSync(path.join(fleetDirOf(root), "reports", `${runId}.md`), "utf8");
+  assert.match(report, /- early bird/);
 }, { timeout: 60_000 });

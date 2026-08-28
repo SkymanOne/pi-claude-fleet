@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { atomicWriteJson, nowIso } from "./util.js";
+import { atomicWriteJson, nowIso, sanitizeName, escapeRegExp } from "./util.js";
 
 export const RUN_STATES = [
   "starting",
@@ -253,27 +253,27 @@ export function listRuns(
     .sort((a, b) => (a.runId < b.runId ? 1 : -1));
 }
 
+/**
+ * Resolve `<name>` (newest non-archived run of exactly that name) or a full run id.
+ * A name matches only `<name>-<14-digit stamp>`, so `api` never resolves to `api-tests-…`.
+ */
 export function findRun(fleetDir: string, nameOrId: string): RunRef {
-  const runs = listRuns(fleetDir);
-  const candidates = runs.filter(
-    (r) => r.runId === nameOrId || r.runId.startsWith(`${nameOrId}-`),
-  );
-  const nonArchived = candidates.filter((r) => {
+  const key = sanitizeName(nameOrId.trim());
+  const ofName = new RegExp(`^${escapeRegExp(key)}-\\d{14}$`);
+  const candidates: RunRef[] = [];
+  for (const r of listRuns(fleetDir)) {
+    if (r.runId !== key && !ofName.test(r.runId)) continue;
     try {
-      return loadStateSync(r.runDir).status !== "archived";
+      candidates.push({ runId: r.runId, runDir: r.runDir, state: loadStateSync(r.runDir) });
     } catch {
-      return false;
+      // unreadable state.json: not a usable run
     }
-  });
-  const chosen = nonArchived[0] ?? candidates[0];
+  }
+  const chosen = candidates.find((c) => c.state.status !== "archived") ?? candidates[0];
   if (!chosen) {
     throw new Error(`No run found matching "${nameOrId}" in ${fleetDir}/runs`);
   }
-  return {
-    runId: chosen.runId,
-    runDir: chosen.runDir,
-    state: loadStateSync(chosen.runDir),
-  };
+  return chosen;
 }
 
 /** Newest pi session file under `<runDir>/session`, for `--session` resume hints. */

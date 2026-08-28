@@ -35,7 +35,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "prepare": "pnpm run build",
+    "prepare": "tsc -p tsconfig.json",
     "test": "node --import tsx --test --test-force-exit \"tests/**/*.test.ts\"",
     "test:e2e": "node --import tsx tests/e2e.ts"
   },

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { runIdFor } from "./util.js";
+import { runIdFor, sanitizeName } from "./util.js";
 import { newRunState, saveState, runDirFor, type RunState } from "./state.js";
 import {
   isGitRepo,
@@ -24,12 +24,7 @@ export interface SpawnOpts {
   worktree?: boolean;
 }
 
-export function sanitizeName(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
+export { sanitizeName };
 
 export interface ResolvedFleet {
   targetDir: string;
@@ -88,6 +83,10 @@ export async function createRun(args: {
   if (isGit && root) await ensureGitignoreEntry(root, ".pi-fleet/");
 
   const runId = runIdFor(name);
+  const runDir = runDirFor(piFleetDir, runId);
+  if (fs.existsSync(runDir)) {
+    throw new Error(`spawn: run ${runId} already exists (same name spawned twice within one second) — retry`);
+  }
   let worktreePath: string | null = null;
   let branch: string | null = null;
   let baseCommit: string | null = null;
@@ -104,7 +103,6 @@ export async function createRun(args: {
     baseCommit = created.baseCommit;
   }
 
-  const runDir = runDirFor(piFleetDir, runId);
   await fsp.mkdir(runDir, { recursive: true });
   const state = newRunState({
     fleetDir: piFleetDir,

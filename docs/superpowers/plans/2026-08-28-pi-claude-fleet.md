@@ -4718,3 +4718,22 @@ Expected: all green; `--help` lists the commands (no `__monitor`); all five file
 git add README.md package.json
 git commit -m "docs: README with install surfaces, quickstart, command table"
 ```
+
+---
+
+## Deviations from the spec (as shipped)
+
+The spec is the design authority; these are the places the implementation knowingly differs, each with the reason. Read the spec with these overlays.
+
+| Spec | Shipped | Why |
+|---|---|---|
+| §3 zero runtime dependencies, `.mjs` sources | TypeScript + commander, simple-git, cli-table3, ink/react | User decision (libraries for common logic); tsc → `dist/` |
+| §4.5 zero-dep readline/ANSI console | ink 7 + react 19 (`ink-select-input`, `ink-text-input`); Node ≥ 22 | User chose a TUI library |
+| §4.1 `-xt` short flag | `--exclude-tools` only | commander long-option style; `-xt` is pi's flag, not ours |
+| §7 run id `<name>-<YYYYMMDD-HHMMSS>` | `<name>-<YYYYMMDDHHMMSS>` (UTC) | clean 7-char branch suffix |
+| §5.1 report protocol injected as a message on `session_start` | appended to the system prompt in `before_agent_start` (idempotent marker) | compaction/resume safe; no race with the first prompt |
+| §4.2 monitor keeps pi alive after settle | monitor ends stdin, then SIGTERM/SIGKILL | otherwise every run leaks a pi process |
+| §4.6 `diff <base>...HEAD` | `<baseCommit>...HEAD` with the base SHA pinned at spawn; stderr warning about uncommitted worker changes | inside the worktree `HEAD...HEAD` is empty; uncommitted work is the one thing `cleanup --force` can destroy |
+| §4.6 merge "from the orchestrating checkout" | merges into `state.repoRoot` regardless of invocation cwd | `--cwd <repo>` works from anywhere |
+| §4.3 `dead` = pid not alive | 30 s startup grace while `starting` with no pid | `wait` right after `spawn` must not report `dead` |
+| §4.6 cleanup of a run whose worktree cannot be removed | refuses (exit 1) unless `--force` | never claim `archived` while the worktree is still on disk |

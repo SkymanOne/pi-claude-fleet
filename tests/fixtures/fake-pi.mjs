@@ -99,4 +99,5 @@ process.stdin.on("data", (chunk) => {
     }
   }
 });
-process.stdin.on("end", () => process.exit(0));
+// FAKE_PI_EXIT_DELAY_MS: linger after stdin closes, like real pi's shutdown() teardown.
+process.stdin.on("end", () => setTimeout(() => process.exit(0), Number(process.env.FAKE_PI_EXIT_DELAY_MS || 0)));

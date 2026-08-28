@@ -54,7 +54,8 @@ test("worker skill has valid frontmatter and the same template headings", () => 
 test("monitor passes --extension and --skill for the fleet protocol", async () => {
   const root = initRepo("pf-ext-");
   const argvFile = path.join(tmpDir("pf-argv-"), "argv.json");
-  const r = await runCli(["spawn", "w", "--cwd", root, "--no-worktree", "--skill", "/extra/skill", "--", "t"],
+  const r = await runCli(["spawn", "w", "--cwd", root, "--no-worktree", "--skill", "/extra/skill",
+    "--session", "abc123", "--model", "glm", "--thinking", "high", "--", "t"],
     { env: fakePiEnv({ FAKE_PI_ARGV_FILE: argvFile }) });
   assert.equal(r.code, 0, r.stderr);
   await waitFor(() => (TERMINAL.includes(readState(root).status) ? true : undefined), { timeoutMs: 30_000 });
@@ -63,4 +64,8 @@ test("monitor passes --extension and --skill for the fleet protocol", async () =
   assert.equal(argv[argv.indexOf("--extension") + 1], FLEET_EXTENSION_PATH);
   assert.equal(argv[argv.indexOf("--skill") + 1], FLEET_SKILL_PATH);
   assert.ok(argv.includes("/extra/skill"), "user --skill still passed");
+  const pair = (flag: string) => argv[argv.lastIndexOf(flag) + 1];
+  assert.equal(pair("--session"), "abc123");
+  assert.equal(pair("--model"), "glm");
+  assert.equal(pair("--thinking"), "high");
 }, { timeout: 60_000 });

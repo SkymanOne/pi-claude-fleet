@@ -52,7 +52,9 @@ export async function attachRun(run: RunRef, opts: { interactive: boolean }): Pr
       <AttachView
         runDir={run.runDir}
         writeControl={(type: ControlType, message: string | null) => {
-          void appendControl(run.runDir, { type, message, source: "console" });
+          appendControl(run.runDir, { type, message, source: "console" }).catch((err: unknown) => {
+            console.error(`console: could not write ${type}: ${err instanceof Error ? err.message : String(err)}`);
+          });
         }}
         onQuit={() => app.unmount()}
       />,
@@ -79,25 +81,24 @@ export async function cmdOpen(args: { cwd?: string }): Promise<number> {
   }
   for (;;) {
     const rows = nonArchivedRows(piFleetDir);
-    const choice = await new Promise<RunRow | "quit" | "refresh">((resolve) => {
-      const app = render(
-        <OpenMenu
-          runs={rows}
-          onSelect={(row) => {
-            app.unmount();
-            resolve(row);
-          }}
-          onQuit={() => {
-            app.unmount();
-            resolve("quit");
-          }}
-          onRefresh={() => {
-            app.unmount();
-            resolve("refresh");
-          }}
-        />,
-      );
-    });
+    // Ctrl+C unmounts without a callback: waitUntilExit resolves and `choice` stays "quit".
+    // asserted initializer: the callbacks below assign inside closures, which TS can't see
+    let choice = "quit" as RunRow | "quit" | "refresh";
+    const app = render(
+      <OpenMenu
+        runs={rows}
+        onSelect={(row) => {
+          choice = row;
+          app.unmount();
+        }}
+        onQuit={() => app.unmount()}
+        onRefresh={() => {
+          choice = "refresh";
+          app.unmount();
+        }}
+      />,
+    );
+    await app.waitUntilExit();
     if (choice === "quit") return 0;
     if (choice === "refresh") continue;
     await attachRun({ runId: choice.runId, runDir: choice.runDir, state: choice.state }, { interactive: true });

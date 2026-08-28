@@ -83,6 +83,8 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
   let settledHandled = false;
   let pendingAbort = false;
   let finished = false;
+  let promptSent = false;
+  let abortRequests = 0;
   let lastTextTimer: NodeJS.Timeout | null = null;
   let shutdownTimers: NodeJS.Timeout[] = [];
 
@@ -93,14 +95,29 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
       // events are best-effort; state.json is the source of truth
     }
   };
-  const flushNow = async (): Promise<void> => {
+  // Flushes are serialized, and never overwrite an `archived` state written by
+  // `cleanup` (which can land between our settle flush and the child's close).
+  let flushChain: Promise<void> = Promise.resolve();
+  let archivedOnDisk = false;
+  const flushNow = (): Promise<void> => {
     dirty = false;
-    try {
-      await saveState(runDir, state);
-    } catch {
-      // retried by the periodic flusher
-      dirty = true;
-    }
+    flushChain = flushChain.then(async () => {
+      if (archivedOnDisk) return;
+      try {
+        if ((await loadState(runDir)).status === "archived") {
+          archivedOnDisk = true;
+          return;
+        }
+      } catch {
+        // missing or mid-rename: write ours
+      }
+      try {
+        await saveState(runDir, state);
+      } catch {
+        dirty = true; // retried by the periodic flusher
+      }
+    });
+    return flushChain;
   };
   const flusher = setInterval(() => {
     if (dirty) void flushNow();
@@ -220,26 +237,31 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
       type: "prompt",
       message: `${state.taskBrief}\n\n${reportReminder(piFleetDir, runId)}`,
     });
+    promptSent = true;
   }, PROMPT_DELAY_MS);
 
+  /** First request: RPC abort. Second: SIGTERM pi. Third: SIGKILL pi. */
   const requestAbort = (): void => {
     pendingAbort = true;
-    send({ type: "abort" });
+    abortRequests += 1;
+    if (abortRequests === 1) send({ type: "abort" });
+    else if (abortRequests === 2) child.kill("SIGTERM");
+    else child.kill("SIGKILL");
   };
   process.on("SIGTERM", requestAbort);
 
   // Control channel: orchestrator/console append lines to control.jsonl; we
-  // forward them to pi and record provenance. Start after existing content.
+  // forward them to pi and record provenance. We read from byte 0 so lines
+  // written before this monitor booted are still delivered (once pi has its prompt).
   const controlPath = path.join(runDir, "control.jsonl");
   let controlOffset = 0;
-  try {
-    controlOffset = fs.statSync(controlPath).size;
-  } catch {
-    controlOffset = 0;
-  }
   const handleControl = (msg: ControlMessage): void => {
     if (msg.type === "steer" || msg.type === "follow_up") {
-      if (settledHandled || typeof msg.message !== "string") return;
+      if (typeof msg.message !== "string") return;
+      if (settledHandled) {
+        writeEvent({ type: "control_dropped", control: msg.type, source: msg.source ?? "unknown", reason: "run already settled" });
+        return;
+      }
       if (!send({ type: msg.type, message: msg.message })) return;
       const source = msg.source ?? "unknown";
       writeEvent({ type: "steering_delivered", source, message: msg.message });
@@ -251,7 +273,7 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
     }
   };
   const controlTimer = setInterval(() => {
-    if (finished) return;
+    if (finished || !promptSent) return;
     const { lines, offset } = readNewLines(controlPath, controlOffset);
     controlOffset = offset;
     for (const line of lines) {

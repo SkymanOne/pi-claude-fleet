@@ -34,11 +34,15 @@ export function OpenMenu({ runs, onSelect, onQuit, onRefresh, now }: OpenMenuPro
     if (ch === "q") onQuit();
     else if (ch === "r") onRefresh();
   });
-  const items = runs.map((r, i) => ({ key: r.runId, label: formatRow(r, now), value: String(i) }));
+  const items = runs.map((r, i) => ({
+    key: r.runId,
+    label: `${String(i + 1).padStart(2)} ${formatRow(r, now)}`,
+    value: String(i),
+  }));
   return (
     <Box flexDirection="column">
       <Text bold>
-        {"  "}
+        {"   # "}
         {HEADER}
       </Text>
       {runs.length === 0 ? (
@@ -46,7 +50,7 @@ export function OpenMenu({ runs, onSelect, onQuit, onRefresh, now }: OpenMenuPro
       ) : (
         <SelectInput items={items} onSelect={(item) => onSelect(runs[Number(item.value)])} />
       )}
-      <Text dimColor>↑/↓ + Enter (or number) to attach · r refresh · q quit</Text>
+      <Text dimColor>↑/↓ (or j/k) + Enter to attach · r refresh · q quit</Text>
     </Box>
   );
 }

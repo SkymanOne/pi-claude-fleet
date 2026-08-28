@@ -101,3 +101,17 @@ test("deriveStatus: starting with no pid is 'starting' within the grace period, 
   assert.equal(deriveStatus(s, () => false, created + 1000), "starting");
   assert.equal(deriveStatus(s, () => false, created + STARTING_GRACE_MS + 1), "dead");
 });
+
+test("findRun: a name never resolves to a run whose name merely starts with it; ids and casing work", async () => {
+  const fleetDir = mkFleet();
+  for (const [id, name] of [["auth-20260828141530", "auth"], ["auth-worker-20260828141531", "auth-worker"]] as const) {
+    const runDir = runDirFor(fleetDir, id);
+    fs.mkdirSync(runDir, { recursive: true });
+    await saveState(runDir, newRunState({ ...base, runId: id, name }));
+  }
+  assert.equal(findRun(fleetDir, "auth").runId, "auth-20260828141530");
+  assert.equal(findRun(fleetDir, "auth-worker").runId, "auth-worker-20260828141531");
+  assert.equal(findRun(fleetDir, "Auth").runId, "auth-20260828141530");
+  assert.equal(findRun(fleetDir, "auth-worker-20260828141531").runId, "auth-worker-20260828141531");
+  assert.throws(() => findRun(fleetDir, "auth-work"), /No run found/);
+});

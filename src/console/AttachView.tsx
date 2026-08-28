@@ -55,6 +55,7 @@ export function AttachView({ runDir, writeControl, onQuit, pollMs = 250, tailLin
   const [lines, setLines] = useState<TranscriptLine[]>([...initial.current.transcript.lines]);
   const [partial, setPartial] = useState<string | null>(partialText(initial.current.transcript));
   const [state, setState] = useState<RunState>(() => loadStateSync(runDir));
+  const stateJsonRef = useRef<string>("");
   const [input, setInput] = useState("");
 
   const publish = () => {
@@ -73,7 +74,12 @@ export function AttachView({ runDir, writeControl, onQuit, pollMs = 250, tailLin
         publish();
       }
       try {
-        setState(loadStateSync(runDir));
+        const next = loadStateSync(runDir);
+        const json = JSON.stringify(next);
+        if (json !== stateJsonRef.current) {
+          stateJsonRef.current = json;
+          setState(next);
+        }
       } catch {
         // keep the last known state
       }

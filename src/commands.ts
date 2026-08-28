@@ -13,6 +13,7 @@ import {
   loadStateSync,
   saveState,
   deriveStatus,
+  isAlive,
   appendControl,
   resumeHint,
   TERMINAL_STATES,
@@ -22,11 +23,10 @@ import {
 } from "./state.js";
 import { readJsonlTail, tailText, firstLine, formatAge, resultTextOf } from "./util.js";
 import { readReport, buildSteeringAppendix } from "./report.js";
-import { gitRaw, isGitRepo, repoRoot, removeWorktree } from "./worktree.js";
+import { gitRaw, isGitRepo, removeWorktree } from "./worktree.js";
 
 export type { SpawnOpts } from "./spawn.js";
 
-export { SRC_DIR, PACKAGE_ROOT } from "./paths.js";
 
 /**
  * How to re-invoke this CLI as a detached background process.
@@ -64,6 +64,7 @@ export async function cmdSpawn(args: { name: string; brief: string; opts: SpawnO
   await launchMonitor({ piFleetDir: created.piFleetDir, runId: created.runId });
   console.log(`Spawned ${created.runId}`);
   console.log(`  state:    ${created.runDir}/state.json`);
+  console.log(`  logs:     ${created.runDir}/{events.jsonl,rpc.log,monitor.log}`);
   console.log(`  fleet dir: ${created.piFleetDir}`);
   if (created.worktreePath) console.log(`  worktree: ${created.worktreePath}`);
   if (created.state.branch) console.log(`  branch:   ${created.state.branch}`);
@@ -260,7 +261,17 @@ export async function cmdDiff(args: { name: string; cwd?: string; nameOnly?: boo
     return 1;
   }
   process.stdout.write(r.stdout.trim() ? (r.stdout.endsWith("\n") ? r.stdout : `${r.stdout}\n`) : "(no changes)\n");
+  await warnIfDirty(run.state.worktree, "diff", "merge will not include them");
   return 0;
+}
+
+/** Uncommitted worker output is invisible to diff/merge and lost by `cleanup --force`. */
+async function warnIfDirty(worktree: string, command: string, consequence: string): Promise<boolean> {
+  const status = await gitRaw(["status", "--porcelain"], worktree);
+  const files = status.stdout.split("\n").filter((l) => l.trim().length > 0);
+  if (status.code !== 0 || files.length === 0) return false;
+  console.error(`${command}: warning — worktree has ${files.length} uncommitted change(s) (worker did not commit); ${consequence}:\n${files.map((f) => `  ${f}`).join("\n")}`);
+  return true;
 }
 
 const MERGE_CONFLICT_EXIT = 5;
@@ -277,16 +288,13 @@ export async function cmdMerge(args: { name: string; cwd?: string; noCommit?: bo
     console.error(`merge: run ${run.state.name} has no branch (spawned without a worktree) — nothing to merge.`);
     return 1;
   }
-  const cwd = process.cwd();
-  if (!(await isGitRepo(cwd))) {
-    console.error(`merge: ${cwd} is not a git repo — run this from the orchestrating checkout.`);
+  // The orchestrating checkout is the repo the run was spawned from, wherever we're invoked.
+  const cwd = run.state.repoRoot;
+  if (!cwd || !(await isGitRepo(cwd))) {
+    console.error(`merge: run ${run.state.name} has no git checkout to merge into (repoRoot: ${cwd ?? "none"}).`);
     return 1;
   }
-  const cwdRoot = (await repoRoot(cwd)) ?? cwd;
-  if (run.state.worktree && (cwdRoot === run.state.worktree || cwdRoot.startsWith(run.state.worktree + path.sep))) {
-    console.error("merge: refusing to merge into the worker's own worktree — run from the parent checkout.");
-    return 1;
-  }
+  if (run.state.worktree) await warnIfDirty(run.state.worktree, "merge", "they are not part of the branch");
   const mergeArgs = ["merge", ...(args.noCommit ? ["--no-commit", "--no-ff"] : []), run.state.branch];
   const r = await gitRaw(mergeArgs, cwd);
   if (r.code !== 0) {
@@ -299,7 +307,7 @@ export async function cmdMerge(args: { name: string; cwd?: string; noCommit?: bo
     console.error(`merge: git merge failed:\n${r.stderr.trim()}`);
     return 1;
   }
-  console.log(`merged ${run.state.branch}${args.noCommit ? " (staged, not committed)" : ""}`);
+  console.log(`merged ${run.state.branch} into ${cwd}${args.noCommit ? " (staged, not committed)" : ""}`);
   console.log("Run your integration checks before cleanup.");
   return 0;
 }
@@ -344,7 +352,8 @@ export async function cmdCleanup(args: { target: string; cwd?: string; force?: b
           // keep last known state
         }
         derived = deriveStatus(t.state);
-        if (isTerminal(derived)) break;
+        // terminal AND monitor gone: its final flush can no longer race our archive write
+        if (isTerminal(derived) && !isAlive(t.state.pid)) break;
       }
       if (!isTerminal(derived)) console.error(`cleanup: ${t.state.name} did not stop within ${CLEANUP_ABORT_WAIT_MS / 1000}s — archiving anyway`);
     }
@@ -355,6 +364,14 @@ export async function cmdCleanup(args: { target: string; cwd?: string; force?: b
         branch: t.state.branch,
         force: Boolean(args.force),
       });
+      if (!r.worktreeRemoved && fs.existsSync(t.state.worktree)) {
+        console.error(
+          `cleanup: ${all ? "skipping" : "refusing"} ${t.state.name} — worktree ${t.state.worktree} could not be removed ` +
+            "(uncommitted changes?) — inspect or commit them, or use --force to discard.",
+        );
+        if (!all) refused = true;
+        continue;
+      }
       if (t.state.branch && !r.branchDeleted) {
         console.error(`cleanup: kept unmerged branch ${t.state.branch} (use --force to delete it)`);
       }

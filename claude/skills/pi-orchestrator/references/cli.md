@@ -14,11 +14,14 @@ root containing `<dir>`, or `<dir>` itself outside git. State lives in `<root>/.
 | `followup <name> -- "<msg>"` | queue a message for after the worker finishes its current work | 0 · 1 refused |
 | `stop <name>` | abort a running worker (state → `stopped`) | 0 · 1 refused |
 | `report <name>` | final report (or last assistant text as fallback) + steering-log appendix | 0 · 2 no report and no output |
-| `diff <name> [--name-only]` | `git diff --stat <baseCommit>...HEAD` in the worker's worktree | 0 |
-| `merge <name> [--no-commit]` | merge the worker branch into the current checkout | 0 · 1 refused (not settled / no branch / not a repo / inside the worker worktree) · 5 conflicts (file list printed) |
-| `cleanup <name\|all> [--force]` | remove worktree + branch, mark `archived` (reports/events kept) | 0 · 1 refused (running without `--force`) |
-| `open` / `attach <name>` | human console: run menu / live view + steering input (non-TTY `attach` prints the captured tail) | 0 |
+| `diff <name> [--name-only]` | `git diff --stat <baseCommit>...HEAD` in the worker's worktree; warns on stderr about uncommitted worker changes (they are NOT in the diff or the merge) | 0 · 1 git failure |
+| `merge <name> [--no-commit]` | merge the worker branch into the run's orchestrating checkout (`state.repoRoot`, i.e. the repo it was spawned from — independent of where you invoke it) | 0 · 1 refused (not settled / no branch / no repo) · 5 conflicts (file list printed) |
+| `cleanup <name\|all> [--force]` | remove worktree + branch, mark `archived` (reports/events kept); refuses a running run or a dirty worktree without `--force` | 0 · 1 refused |
+| `open` / `attach <name>` | human console: run menu / live view + steering input (non-TTY `attach` prints the captured tail) | 0 · `open` exits 1 on a non-TTY |
 | `install-claude-skill` | symlink this skill into `~/.claude/skills` | 0 · 1 refused |
+
+`--cwd <repo>/sub` still runs a worktree worker at the worktree root (the worker's cwd is the
+whole isolated checkout); put the sub-path in the brief.
 
 Run names are kebab-cased; a run id is `<name>-<YYYYMMDDHHMMSS>` (UTC); the worker branch is
 `pi-fleet/<name>-<last 7 digits>`. `<name>` on the command line resolves to the newest

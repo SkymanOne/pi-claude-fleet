@@ -31,11 +31,14 @@ export function parseLineSafe<T = unknown>(line: string): ParsedLine<T> {
   }
 }
 
+let tmpSeq = 0;
+
 export async function atomicWriteJson(
   filePath: string,
   data: unknown,
 ): Promise<void> {
-  const tmp = `${filePath}.tmp-${process.pid}`;
+  // pid + sequence: overlapping writes from one process must not share a tmp path
+  const tmp = `${filePath}.tmp-${process.pid}-${++tmpSeq}`;
   await fs.writeFile(tmp, JSON.stringify(data, null, 2));
   await fs.rename(tmp, filePath);
 }
@@ -157,4 +160,16 @@ export function readNewLines(
   if (lastNl === -1) return { lines: [], offset };
   const { lines } = splitJsonLines(buf.subarray(0, lastNl + 1).toString("utf8"), "");
   return { lines: lines.filter((l) => l.length > 0), offset: offset + lastNl + 1 };
+}
+
+/** Run/branch-safe name: lowercase kebab-case, no leading/trailing hyphens. */
+export function sanitizeName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+export function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

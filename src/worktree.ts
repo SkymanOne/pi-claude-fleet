@@ -35,7 +35,7 @@ export function gitRaw(
   return new Promise((resolve) => {
     execFile("git", args, { cwd, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
       const code = err ? (typeof (err as any).code === "number" ? (err as any).code : 1) : 0;
-      resolve({ code, stdout: String(stdout ?? ""), stderr: String(stderr ?? (err?.message ?? "")) });
+      resolve({ code, stdout: String(stdout ?? ""), stderr: String(stderr || err?.message || "") });
     });
   });
 }
