@@ -69,11 +69,12 @@ test("steering after settle is not forwarded or recorded (logged as control_drop
   const state = await settled(root, runId);
   assert.equal(state.status, "settled");
   fs.appendFileSync(path.join(runDir, "control.jsonl"), controlLine({ type: "steer", message: "too late", source: "console" }));
-  await new Promise((res) => setTimeout(res, 800));
-  assert.equal(readState(root, runId).steerCount, 0);
-  const events = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8");
+  const events = await waitFor(() => {
+    const text = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8");
+    return /"control_dropped".*"run already settled"/.test(text) ? text : undefined;
+  }, { timeoutMs: 10_000 });
   assert.doesNotMatch(events, /steering_delivered.*too late/);
-  assert.match(events, /"control_dropped".*"run already settled"/);
+  assert.equal(readState(root, runId).steerCount, 0);
 }, { timeout: 60_000 });
 
 test("a steer sent before the monitor boots is still delivered", async () => {
