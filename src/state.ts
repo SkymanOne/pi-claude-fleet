@@ -36,6 +36,8 @@ export interface RunState {
   worktree: string | null;
   branch: string | null;
   base: string | null;
+  /** Commit the worker branch was cut from (resolved at spawn); null without a worktree. */
+  baseCommit: string | null;
   model: string | null;
   provider: string | null;
   thinking: string | null;
@@ -95,6 +97,7 @@ export function newRunState(input: {
     worktree: input.worktree ?? null,
     branch: input.branch ?? null,
     base: input.base ?? null,
+    baseCommit: null,
     model: input.model ?? null,
     provider: input.provider ?? null,
     thinking: input.thinking ?? null,

@@ -90,6 +90,7 @@ export async function createRun(args: {
   const runId = runIdFor(name);
   let worktreePath: string | null = null;
   let branch: string | null = null;
+  let baseCommit: string | null = null;
   if (isGit && root && args.opts.worktree !== false) {
     const created = await ensureWorktree({
       repoRoot: root,
@@ -100,6 +101,7 @@ export async function createRun(args: {
     });
     worktreePath = created.worktreePath;
     branch = created.branch;
+    baseCommit = created.baseCommit;
   }
 
   const runDir = runDirFor(piFleetDir, runId);
@@ -124,6 +126,7 @@ export async function createRun(args: {
   });
   state.repoRoot = root;
   state.isGit = isGit;
+  state.baseCommit = baseCommit;
   await saveState(runDir, state);
   return { runId, runDir, piFleetDir, state, worktreePath };
 }

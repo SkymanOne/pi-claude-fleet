@@ -23,25 +23,34 @@ export async function repoRoot(dir: string): Promise<string | null> {
   }
 }
 
+/** Run a git command without throwing; callers decide what a failure means. */
+export async function gitRaw(
+  args: string[],
+  cwd: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  try {
+    const stdout = await simpleGit({ baseDir: cwd }).raw(args);
+    return { code: 0, stdout, stderr: "" };
+  } catch (err) {
+    return { code: 1, stdout: "", stderr: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export async function ensureWorktree(args: {
   repoRoot: string;
   worktreesDir: string;
   runId: string;
   name: string;
   base: string | null;
-}): Promise<{ worktreePath: string; branch: string; baseRef: string }> {
+}): Promise<{ worktreePath: string; branch: string; baseRef: string; baseCommit: string }> {
   const branch = branchFor(args.name, args.runId);
   const worktreePath = path.join(args.worktreesDir, args.runId);
   const baseRef = args.base || "HEAD";
-  await simpleGit({ baseDir: args.repoRoot }).raw([
-    "worktree",
-    "add",
-    worktreePath,
-    "-b",
-    branch,
-    baseRef,
-  ]);
-  return { worktreePath, branch, baseRef };
+  const g = simpleGit({ baseDir: args.repoRoot });
+  // Pin the base commit now: inside the worktree HEAD moves, so `diff` needs the SHA.
+  const baseCommit = (await g.revparse([`${baseRef}^{commit}`])).trim();
+  await g.raw(["worktree", "add", worktreePath, "-b", branch, baseRef]);
+  return { worktreePath, branch, baseRef, baseCommit };
 }
 
 export interface RemoveWorktreeResult {

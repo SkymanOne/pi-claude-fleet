@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { resolveFleetDir, createRun, sanitizeName } from "../src/spawn.js";
 import { initRepo, tmpDir } from "./helpers.js";
 
@@ -40,6 +41,7 @@ test("createRun builds state dir, gitignore, worktree and initial state", async 
   assert.match(state.branch ?? "", /^pi-fleet\/auth-worker-.{7}$/);
   assert.equal(state.repoRoot, fs.realpathSync(root));
   assert.equal(state.isGit, true);
+  assert.equal(state.baseCommit, execFileSync("git", ["rev-parse", "HEAD"], { cwd: root }).toString().trim());
   assert.equal(state.taskBrief, "create hello");
   assert.equal(state.status, "starting");
   assert.equal(state.model, "glm");

@@ -10,6 +10,9 @@ import {
   cmdFollowup,
   cmdStop,
   cmdReport,
+  cmdDiff,
+  cmdMerge,
+  cmdCleanup,
   type SpawnOpts,
 } from "./commands.js";
 
@@ -123,6 +126,33 @@ program
   .option(...cwdOption)
   .action(async (name: string, options: OptionValues) =>
     done(await cmdReport({ name, cwd: options.cwd })),
+  );
+
+program
+  .command("diff <name>")
+  .description("the worker's changes vs its base commit (git diff --stat, or --name-only)")
+  .option(...cwdOption)
+  .option("--name-only", "list changed files only")
+  .action(async (name: string, options: OptionValues) =>
+    done(await cmdDiff({ name, cwd: options.cwd, nameOnly: options.nameOnly })),
+  );
+
+program
+  .command("merge <name>")
+  .description("merge the settled worker's branch into the current checkout (exit 5 on conflicts)")
+  .option(...cwdOption)
+  .option("--no-commit", "stage the merge without committing (--no-commit --no-ff)")
+  .action(async (name: string, options: OptionValues) =>
+    done(await cmdMerge({ name, cwd: options.cwd, noCommit: options.commit === false })),
+  );
+
+program
+  .command("cleanup <target>")
+  .description("remove a run's worktree + branch and archive it (<name> or all; --force aborts running workers)")
+  .option(...cwdOption)
+  .option("--force", "abort running workers and delete unmerged branches")
+  .action(async (target: string, options: OptionValues) =>
+    done(await cmdCleanup({ target, cwd: options.cwd, force: options.force })),
   );
 
 program
