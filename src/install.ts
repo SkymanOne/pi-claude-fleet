@@ -42,6 +42,7 @@ export function installClaudeSkill(opts: { home?: string; source?: string } = {}
 export async function cmdInstallClaudeSkill(): Promise<number> {
   const r = installClaudeSkill();
   console.log(`${r.status === "created" ? "linked" : "already linked"} ${r.target} -> ${r.source}`);
-  console.log("Claude Code picks up the pi-orchestrator skill in new sessions.");
+  console.log("Start a new Claude Code session: the skill is available as /pi-orchestrator and loads on its own");
+  console.log("when you ask Claude to delegate work to pi. `pi-fleet` must be on that shell's PATH.");
   return 0;
 }

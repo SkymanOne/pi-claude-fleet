@@ -12,13 +12,42 @@ You need Node 22 or newer and `pi` on your `PATH`.
 
 ## Install
 
+There are three things to install, and only the first is required. Run everything from a clone of this repo.
+
+### 1. The `pi-fleet` CLI (required)
+
 ```bash
-pnpm install && pnpm build && pnpm link --global   # puts `pi-fleet` on PATH (or: npm install -g .)
-pi install /path/to/pi-claude-fleet                # optional: pi loads the extension + skill globally
-pi-fleet install-claude-skill                      # symlinks claude/skills/pi-orchestrator into ~/.claude/skills
+pnpm install && pnpm build   # compiles src/ to dist/
+pnpm link --global           # puts `pi-fleet` on your PATH (npm users: npm install -g .)
+pi-fleet --help              # verify
 ```
 
-The `pi install` step is optional because `pi-fleet` passes its own extension and skill to every worker with `--extension` and `--skill`.
+The orchestrator skill runs `pi-fleet` from Claude Code's Bash tool, so it has to be on the PATH of the shell Claude Code uses. `pnpm unlink --global pi-claude-fleet` removes it.
+
+### 2. The Claude Code skill (`pi-orchestrator`)
+
+```bash
+pi-fleet install-claude-skill                 # symlinks claude/skills/pi-orchestrator into ~/.claude/skills/
+ls -la ~/.claude/skills/pi-orchestrator       # verify: a symlink back into this repo
+```
+
+Claude Code reads personal skills from `~/.claude/skills/<name>/SKILL.md`. Start a new Claude Code session; the skill is then available as `/pi-orchestrator` and Claude also loads it on its own when you ask it to delegate work to pi. Because it is a symlink, `git pull` in this repo updates the skill in place. The command refuses to overwrite anything at that path that it did not create; remove the old directory first if you have one.
+
+Prefer a per-project skill instead? Copy it into the repo you are orchestrating: `cp -R claude/skills/pi-orchestrator <repo>/.claude/skills/`. To uninstall the personal one: `rm ~/.claude/skills/pi-orchestrator` (it is only a link).
+
+### 3. The pi package (optional)
+
+You can skip this. `pi-fleet` already passes the worker extension and skill to every worker it spawns (`--extension pi/extensions/fleet-report.ts --skill pi/skills/fleet-worker-report`), so workers get the report protocol without any pi-side install.
+
+Install it anyway if you want to run pi as a worker by hand (`PI_FLEET_RUN=... PI_FLEET_DIR=... pi`) or want the `fleet-worker-report` skill visible in ordinary pi sessions:
+
+```bash
+pi install /absolute/path/to/pi-claude-fleet      # global: ~/.pi/agent/settings.json
+pi install -l /absolute/path/to/pi-claude-fleet   # or project-local: <repo>/.pi/settings.json
+pi list                                          # verify: the path appears under packages
+```
+
+pi references the directory in place (no copy), so edits here are live. The extension does nothing unless `PI_FLEET_RUN` is set, and it is safe to have it loaded both ways: the system-prompt block is only added once. Remove it with `pi remove /absolute/path/to/pi-claude-fleet` (add `-l` for a project-local install).
 
 ## Quickstart
 
