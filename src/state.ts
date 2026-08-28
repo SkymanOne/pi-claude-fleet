@@ -272,3 +272,24 @@ export function findRun(fleetDir: string, nameOrId: string): RunRef {
     state: loadStateSync(chosen.runDir),
   };
 }
+
+/** Newest pi session file under `<runDir>/session`, for `--session` resume hints. */
+export function findSessionFile(runDir: string): string | null {
+  const dir = path.join(runDir, "session");
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir).filter((n) => n.endsWith(".jsonl"));
+  } catch {
+    return null;
+  }
+  const newest = names
+    .map((n) => ({ n, mtime: fs.statSync(path.join(dir, n)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime)[0];
+  return newest ? path.join(dir, newest.n) : null;
+}
+
+/** Copy-pasteable command to continue a finished run's session in a new run. */
+export function resumeHint(state: RunState, runDir: string): string {
+  const session = findSessionFile(runDir) ?? path.join(runDir, "session", "<session-file>");
+  return `pi-fleet spawn ${state.name}-2 --session ${session} -- "<new brief>"`;
+}

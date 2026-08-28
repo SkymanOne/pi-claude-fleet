@@ -6,6 +6,9 @@ import {
   cmdWait,
   cmdOutput,
   cmdLogs,
+  cmdSend,
+  cmdFollowup,
+  cmdStop,
   type SpawnOpts,
 } from "./commands.js";
 
@@ -87,6 +90,30 @@ program
   .option("--tail <n>", "lines to print (default 50)")
   .action(async (name: string, options: OptionValues) =>
     done(await cmdLogs({ name, cwd: options.cwd, tail: options.tail })),
+  );
+
+program
+  .command("send <name> [message...]")
+  .description("steer a running worker (delivered after its current tool calls)")
+  .option(...cwdOption)
+  .action(async (name: string, messageArgs: string[], options: OptionValues) =>
+    done(await cmdSend({ name, cwd: options.cwd, message: messageArgs.join(" ") })),
+  );
+
+program
+  .command("followup <name> [message...]")
+  .description("queue a message for after the worker finishes its current work")
+  .option(...cwdOption)
+  .action(async (name: string, messageArgs: string[], options: OptionValues) =>
+    done(await cmdFollowup({ name, cwd: options.cwd, message: messageArgs.join(" ") })),
+  );
+
+program
+  .command("stop <name>")
+  .description("abort a running worker (state becomes stopped)")
+  .option(...cwdOption)
+  .action(async (name: string, options: OptionValues) =>
+    done(await cmdStop({ name, cwd: options.cwd })),
   );
 
 program

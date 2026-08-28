@@ -11,7 +11,10 @@ import {
   loadState,
   loadStateSync,
   deriveStatus,
+  appendControl,
+  resumeHint,
   TERMINAL_STATES,
+  type ControlType,
   type RunRef,
   type RunState,
 } from "./state.js";
@@ -189,4 +192,40 @@ export async function cmdLogs(args: OutputArgs): Promise<number> {
   if (text.trim()) process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
   else console.log("(no rpc.log yet)");
   return 0;
+}
+
+export interface ControlArgs {
+  name: string;
+  cwd?: string;
+  message?: string;
+}
+
+async function controlCommand(type: ControlType, args: ControlArgs): Promise<number> {
+  const { run } = await resolveRun(args.name, args.cwd);
+  const derived = deriveStatus(run.state);
+  if (isTerminal(derived)) {
+    const what = type === "abort" ? "nothing to stop" : "steering refused";
+    console.error(
+      `${type}: run ${run.state.name} is ${derived} — ${what}.\n` +
+        `Answer its open questions in a new brief and resume with:\n  ${resumeHint(run.state, run.runDir)}`,
+    );
+    return 1;
+  }
+  await appendControl(run.runDir, { type, message: args.message ?? null, source: "orchestrator" });
+  console.log(type === "abort" ? `abort requested for ${run.state.name}` : `${type} queued for ${run.state.name}`);
+  return 0;
+}
+
+export async function cmdSend(args: ControlArgs): Promise<number> {
+  if (!args.message?.trim()) throw new Error('send: message required after "--"');
+  return controlCommand("steer", args);
+}
+
+export async function cmdFollowup(args: ControlArgs): Promise<number> {
+  if (!args.message?.trim()) throw new Error('followup: message required after "--"');
+  return controlCommand("follow_up", args);
+}
+
+export async function cmdStop(args: { name: string; cwd?: string }): Promise<number> {
+  return controlCommand("abort", { name: args.name, cwd: args.cwd });
 }
