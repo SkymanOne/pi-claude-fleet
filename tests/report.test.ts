@@ -24,7 +24,7 @@ test("buildSteeringAppendix: empty without steering, one line per entry otherwis
     ],
   });
   assert.match(appendix, /^\n---\n## Steering log \(orchestrator-side, most recent last\)\n/);
-  assert.match(appendix, /\[orchestrator\] t1 first\n\[console\] t2 second\n$/);
+  assert.match(appendix, /- \[orchestrator\] t1 first\n- \[console\] t2 second\n$/);
 });
 
 test("readReport: report file wins; fallback uses lastAssistantText; otherwise missing", async () => {

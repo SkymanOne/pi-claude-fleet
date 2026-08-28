@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import fsp from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { simpleGit } from "simple-git";
 import { branchFor } from "./util.js";
 
@@ -23,17 +24,20 @@ export async function repoRoot(dir: string): Promise<string | null> {
   }
 }
 
-/** Run a git command without throwing; callers decide what a failure means. */
-export async function gitRaw(
+/**
+ * Run a git command and report its real exit code (simple-git's `raw()` only
+ * rejects when stderr is non-empty, which hides merge conflicts).
+ */
+export function gitRaw(
   args: string[],
   cwd: string,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  try {
-    const stdout = await simpleGit({ baseDir: cwd }).raw(args);
-    return { code: 0, stdout, stderr: "" };
-  } catch (err) {
-    return { code: 1, stdout: "", stderr: err instanceof Error ? err.message : String(err) };
-  }
+  return new Promise((resolve) => {
+    execFile("git", args, { cwd, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+      const code = err ? (typeof (err as any).code === "number" ? (err as any).code : 1) : 0;
+      resolve({ code, stdout: String(stdout ?? ""), stderr: String(stderr ?? (err?.message ?? "")) });
+    });
+  });
 }
 
 export async function ensureWorktree(args: {

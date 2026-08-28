@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { isGitRepo, repoRoot, ensureWorktree, removeWorktree, ensureGitignoreEntry } from "../src/worktree.js";
+import { isGitRepo, repoRoot, ensureWorktree, removeWorktree, ensureGitignoreEntry, gitRaw } from "../src/worktree.js";
 import { initRepo, tmpDir } from "./helpers.js";
 
 test("isGitRepo/repoRoot detect repos", async () => {
@@ -57,4 +57,12 @@ test("ensureGitignoreEntry appends once with marker", async () => {
   assert.equal(await ensureGitignoreEntry(root, ".pi-fleet/"), true);
   assert.equal(await ensureGitignoreEntry(root, ".pi-fleet/"), false);
   assert.match(fs.readFileSync(path.join(root, ".gitignore"), "utf8"), /# pi-fleet\n\.pi-fleet\//);
+});
+
+test("gitRaw reports real exit codes (merge conflicts print to stdout, not stderr)", async () => {
+  const root = initRepo("pf-wt-");
+  assert.equal((await gitRaw(["rev-parse", "--is-inside-work-tree"], root)).stdout.trim(), "true");
+  const bad = await gitRaw(["rev-parse", "--verify", "nope"], root);
+  assert.notEqual(bad.code, 0);
+  assert.match(bad.stderr, /fatal/);
 });
