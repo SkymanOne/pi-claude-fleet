@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 
 export interface SplitResult {
   lines: string[];
@@ -125,4 +126,33 @@ export function resultTextOf(ev: any): string {
   const content = ev?.result?.content;
   if (!Array.isArray(content)) return "";
   return content.map((c: any) => c.text ?? "").join("");
+}
+
+/**
+ * Read the complete lines appended to `filePath` after byte `offset`.
+ * The returned offset sits just past the last "\n" seen, so a partial
+ * trailing line is re-read on the next call instead of being split.
+ */
+export function readNewLines(
+  filePath: string,
+  offset: number,
+): { lines: string[]; offset: number } {
+  let size = 0;
+  try {
+    size = fsSync.statSync(filePath).size;
+  } catch {
+    return { lines: [], offset };
+  }
+  if (size <= offset) return { lines: [], offset };
+  const buf = Buffer.alloc(size - offset);
+  const fd = fsSync.openSync(filePath, "r");
+  try {
+    fsSync.readSync(fd, buf, 0, buf.length, offset);
+  } finally {
+    fsSync.closeSync(fd);
+  }
+  const lastNl = buf.lastIndexOf(0x0a);
+  if (lastNl === -1) return { lines: [], offset };
+  const { lines } = splitJsonLines(buf.subarray(0, lastNl + 1).toString("utf8"), "");
+  return { lines: lines.filter((l) => l.length > 0), offset: offset + lastNl + 1 };
 }

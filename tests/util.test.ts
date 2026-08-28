@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   splitJsonLines, parseLineSafe, atomicWriteJson, appendJsonLine, readJsonlTail,
-  runIdFor, short7, branchFor, firstLine, formatAge, resultTextOf,
+  runIdFor, short7, branchFor, firstLine, formatAge, resultTextOf, readNewLines,
 } from "../src/util.js";
 import { tmpDir } from "./helpers.js";
 
@@ -73,4 +73,17 @@ test("formatAge renders compact ages", () => {
 test("resultTextOf joins text content and tolerates missing result", () => {
   assert.equal(resultTextOf({ result: { content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] } }), "ab");
   assert.equal(resultTextOf({}), "");
+});
+
+test("readNewLines advances only past complete lines and re-reads partial tails", () => {
+  const p = path.join(tmpDir("pf-util-"), "control.jsonl");
+  fs.writeFileSync(p, '{"a":1}\n{"b":');
+  const first = readNewLines(p, 0);
+  assert.deepEqual(first, { lines: ['{"a":1}'], offset: 8 });
+  fs.appendFileSync(p, '"é"}\r\n');
+  const second = readNewLines(p, first.offset);
+  assert.deepEqual(second.lines, ['{"b":"é"}']);
+  assert.equal(second.offset, fs.statSync(p).size);
+  assert.deepEqual(readNewLines(p, second.offset), { lines: [], offset: second.offset });
+  assert.deepEqual(readNewLines(path.join(p, "missing"), 0), { lines: [], offset: 0 });
 });

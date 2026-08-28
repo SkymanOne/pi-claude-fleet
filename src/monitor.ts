@@ -1,12 +1,14 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { splitJsonLines, parseLineSafe, nowIso } from "./util.js";
+import { splitJsonLines, parseLineSafe, nowIso, readNewLines } from "./util.js";
 import {
   loadState,
   saveState,
   recordToolActivity,
+  recordSteering,
   type RunState,
+  type ControlMessage,
 } from "./state.js";
 
 /** A pi RPC event or response, as parsed from one stdout line. */
@@ -30,6 +32,7 @@ const TEXT_TYPES = new Set(["text_start", "text_delta", "text_end"]);
 
 const FLUSH_INTERVAL_MS = 300;
 const PROMPT_DELAY_MS = 150;
+const CONTROL_POLL_MS = 300;
 /** After settling: wait this long for get_last_assistant_text, then end stdin. */
 const LAST_TEXT_TIMEOUT_MS = 2000;
 /** After ending stdin: escalate to SIGTERM, then SIGKILL. */
@@ -218,12 +221,47 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
   };
   process.on("SIGTERM", requestAbort);
 
+  // Control channel: orchestrator/console append lines to control.jsonl; we
+  // forward them to pi and record provenance. Start after existing content.
+  const controlPath = path.join(runDir, "control.jsonl");
+  let controlOffset = 0;
+  try {
+    controlOffset = fs.statSync(controlPath).size;
+  } catch {
+    controlOffset = 0;
+  }
+  const handleControl = (msg: ControlMessage): void => {
+    if (msg.type === "steer" || msg.type === "follow_up") {
+      if (settledHandled || typeof msg.message !== "string") return;
+      if (!send({ type: msg.type, message: msg.message })) return;
+      const source = msg.source ?? "unknown";
+      writeEvent({ type: "steering_delivered", source, message: msg.message });
+      recordSteering(state, { source, message: msg.message, ts: nowIso() });
+      void flushNow();
+    } else if (msg.type === "abort") {
+      writeEvent({ type: "abort_requested", source: msg.source ?? "unknown" });
+      requestAbort();
+    }
+  };
+  const controlTimer = setInterval(() => {
+    if (finished) return;
+    const { lines, offset } = readNewLines(controlPath, controlOffset);
+    controlOffset = offset;
+    for (const line of lines) {
+      const parsed = parseLineSafe<ControlMessage>(line);
+      if (parsed.ok && parsed.value && typeof parsed.value.type === "string") {
+        handleControl(parsed.value);
+      }
+    }
+  }, CONTROL_POLL_MS);
+
   return await new Promise<number>((resolve) => {
     let spawnError: Error | null = null;
     const finish = async (code: number | null): Promise<void> => {
       if (finished) return;
       finished = true;
       clearInterval(flusher);
+      clearInterval(controlTimer);
       clearTimeout(promptTimer);
       if (lastTextTimer) clearTimeout(lastTextTimer);
       for (const t of shutdownTimers) clearTimeout(t);

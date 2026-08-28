@@ -203,18 +203,27 @@ export function recordSteering(
 
 export type ControlType = "steer" | "follow_up" | "abort";
 
+/** One line of `control.jsonl` (orchestrator/console → monitor). */
+export interface ControlMessage {
+  type: ControlType;
+  message: string | null;
+  source: string;
+  ts: string;
+}
+
 export async function appendControl(
   runDir: string,
   msg: { type: ControlType; message: string | null; source: string },
 ): Promise<void> {
+  const line: ControlMessage = {
+    type: msg.type,
+    message: msg.message,
+    source: msg.source,
+    ts: nowIso(),
+  };
   await fsp.appendFile(
     path.join(runDir, "control.jsonl"),
-    JSON.stringify({
-      type: msg.type,
-      message: msg.message,
-      source: msg.source,
-      ts: nowIso(),
-    }) + "\n",
+    JSON.stringify(line) + "\n",
   );
 }
 
