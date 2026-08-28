@@ -15,6 +15,7 @@ import {
   cmdCleanup,
   type SpawnOpts,
 } from "./commands.js";
+import { cmdOpen, cmdAttach } from "./console/index.js";
 
 let exitCode = 0;
 const done = (n: number): void => {
@@ -154,6 +155,18 @@ program
   .action(async (target: string, options: OptionValues) =>
     done(await cmdCleanup({ target, cwd: options.cwd, force: options.force })),
   );
+
+program
+  .command("open")
+  .description("interactive run menu → attach to a worker")
+  .option(...cwdOption)
+  .action(async (options: OptionValues) => done(await cmdOpen({ cwd: options.cwd })));
+
+program
+  .command("attach <name>")
+  .description("live view + steering console for one worker (non-TTY: prints the captured tail)")
+  .option(...cwdOption)
+  .action(async (name: string, options: OptionValues) => done(await cmdAttach({ name, cwd: options.cwd })));
 
 program
   .command("__monitor <piFleetDir> <runId>", { hidden: true })

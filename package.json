@@ -16,7 +16,7 @@
     "pi-fleet": "dist/cli.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "files": [
     "dist",
@@ -36,16 +36,22 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "prepare": "pnpm run build",
-    "test": "node --import tsx --test \"tests/**/*.test.ts\"",
+    "test": "node --import tsx --test --test-force-exit \"tests/**/*.test.ts\"",
     "test:e2e": "node --import tsx tests/e2e.ts"
   },
   "dependencies": {
     "cli-table3": "^0.6.5",
     "commander": "^15.0.0",
+    "ink": "^7.1.1",
+    "ink-select-input": "^6.2.0",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.2.8",
     "simple-git": "^3.36.0"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
+    "@types/react": "^19.2.18",
+    "ink-testing-library": "^4.0.0",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2"
   }
