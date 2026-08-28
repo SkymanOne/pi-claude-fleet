@@ -164,12 +164,14 @@ Human-in-the-loop console. Zero-dependency implementation (node:readline raw mod
 escape codes; no TUI frameworks).
 
 **`pi-fleet open`** — interactive menu:
+
 - Lists all non-archived runs: `#  NAME  STATE  LAST-ACTIVITY  LAST-TOOL  STEERED  AGE`
   (STEERED shows steer count). Keys: number to attach, `r` refresh, `q` quit; arrow/Enter
   selection when the terminal supports it (fallback: type the number).
 - Also reachable non-interactively: `pi-fleet attach <name>` attaches directly.
 
 **Live view (`attach`)** — a follow-style renderer over the run's captured stream:
+
 - Replays the last ~40 lines of `events.jsonl` (assistant text, tool activity, steering
   delivered), then follows new events by polling the file every ~250ms (fs.watch with
   poll fallback). Renders:
