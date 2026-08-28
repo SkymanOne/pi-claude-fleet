@@ -39,6 +39,7 @@ pi-claude-fleet/
 │   ├── cli.mjs                   # arg parsing + command dispatch
 │   ├── spawn.mjs                 # spawn/monitor launcher
 │   ├── monitor.mjs               # __monitor: owns pi subprocess, captures events
+│   ├── console.mjs               # open (run menu) + attach (live view/steering TUI)
 │   ├── state.mjs                 # state.json read/write, status derivation
 │   ├── worktree.mjs              # git worktree add/remove, branch naming
 │   ├── report.mjs                # report file lookup + fallback
@@ -72,6 +73,8 @@ pi-fleet spawn <name> [--cwd <dir>] [--model <pattern>] [--provider <name>]
               [--tools <list>] [-xt <list>] -- "<task brief>"
 pi-fleet status [<name>] [--json]
 pi-fleet wait <name> [--timeout <sec>]
+pi-fleet open                             # interactive run menu → attach
+pi-fleet attach <name>                    # live chat view + steering input
 pi-fleet send <name> -- "<steer message>"
 pi-fleet followup <name> -- "<message>"
 pi-fleet output <name> [--tail <n>]
@@ -144,17 +147,48 @@ Monitor loop (`__monitor`):
 
 ### 4.4 Steering & follow-up
 
-- `send` sends `{"type":"steer","message":...}` to the live pi process (writes to
-  monitor's stdin via a control channel). Implementation: monitor keeps the pi child's
-  stdin; `send` communicates with the monitor through `state.json` sibling file
-  `control.jsonl` — `send` appends `{"type":"steer","message":...}`, monitor watches the
-  file (fs.watch on the run dir, fallback 500ms poll) and forwards to pi stdin. This
-  avoids needing a live socket and keeps everything file-based and debuggable.
-- `followup` appends `{"type":"follow_up","message":...}` the same way.
-- If the agent has settled, `send`/`followup` refuse and print guidance to `spawn` a new
-  run with `--session` to resume, or answer open questions first.
+- Control channel: `send`, `followup`, and the live console (§4.5) all append control
+  messages to the run's `control.jsonl`: `{type:"steer"|"follow_up"|"abort", message,
+  source:"orchestrator"|"console", ts}`. The monitor watches the file (fs.watch on the
+  run dir, fallback 500ms poll) and forwards steer/follow_up to the pi child's stdin as
+  the matching RPC command; `abort` triggers the `abort` RPC command.
+- Provenance is recorded: on delivery the monitor appends a `steering_delivered` entry
+  to `events.jsonl`, increments `state.steerCount`, and appends `{source, ts, message}`
+  (last 20) to `state.steeringLog`.
+- If the agent has settled, `send`/`followup`/console steering refuse and print guidance
+  to `spawn` a new run with `--session` to resume, or answer open questions first.
 
-### 4.5 diff / merge / cleanup
+### 4.5 Console: live view + steering (`open` / `attach`)
+
+Human-in-the-loop console. Zero-dependency implementation (node:readline raw mode + ANSI
+escape codes; no TUI frameworks).
+
+**`pi-fleet open`** — interactive menu:
+- Lists all non-archived runs: `#  NAME  STATE  LAST-ACTIVITY  LAST-TOOL  STEERED  AGE`
+  (STEERED shows steer count). Keys: number to attach, `r` refresh, `q` quit; arrow/Enter
+  selection when the terminal supports it (fallback: type the number).
+- Also reachable non-interactively: `pi-fleet attach <name>` attaches directly.
+
+**Live view (`attach`)** — a follow-style renderer over the run's captured stream:
+- Replays the last ~40 lines of `events.jsonl` (assistant text, tool activity, steering
+  delivered), then follows new events by polling the file every ~250ms (fs.watch with
+  poll fallback). Renders:
+  - steering/user messages: `▶ <source>: <message>`
+  - assistant streaming text (from `message_update` text deltas, assembled per
+    contentIndex)
+  - tool calls: `⚙ <toolName> <args summary>` on start; first line of result on end
+  - state header line (name, state, model, branch) + footer hint line
+- Input line at the bottom (always visible): typing text + Enter sends a **steer**
+  (source `console`) via `control.jsonl`; slash commands: `/followup <msg>`, `/stop`
+  (abort the run), `/quit` (detach; the run keeps running in the background).
+- If the run is settled/stopped/error/dead: view is read-only transcript mode with a
+  footer hint (`resume: pi-fleet spawn <name>-2 --session <path> -- "<new brief>"`), and
+  steering input is disabled.
+- Concurrent attaches are allowed (multiple viewers are just file readers); a warning is
+  printed when a run already has an active console (marker file `runs/<id>/console.lock`
+  with pid + timestamp, refreshed every 5s, expired entries ignored).
+
+### 4.6 diff / merge / cleanup
 
 - `diff <name>`: `git -C <worktree> diff --stat <base>...HEAD` (plus `--name-only` mode).
   Non-worktree runs print "not applicable".
@@ -184,6 +218,10 @@ set, injects an agent-visible instruction message containing:
   `<PI_FLEET_DIR>/runs/<PI_FLEET_RUN>/progress.md`.
 - Stay scoped to your task brief; do not touch files outside the worktree; do not run
   `git merge` or modify the parent checkout.
+- If you receive steering messages mid-run (course corrections from the orchestrator or
+  the user's console), incorporate them immediately, and your final report MUST reflect
+  the adjusted direction — note any steering you received under "Steering received" and
+  keep Status/Verification consistent with the work as finally done.
 
 This makes report-writing deterministic regardless of model skill-following.
 
@@ -212,6 +250,9 @@ done | blocked | failed
 ## Decisions & assumptions
 (any choice made without explicit instruction)
 
+## Steering received
+(mid-run course corrections you were given and how you handled them; "none" if none)
+
 ## Open questions for orchestrator
 (thing I could not resolve — empty if none; REQUIRED if Status: blocked)
 
@@ -225,6 +266,10 @@ Both the skill and the injected message point to the same template.
 
 - `pi-fleet report <name>`: if `reports/<id>.md` exists, print it; else print captured
   `lastAssistantText` labeled as fallback; exit 2 if neither exists.
+- The command then appends an orchestrator-side **steering log** appendix rendered from
+  `state.steeringLog` (source, timestamp, message — console vs orchestrator), so the
+  orchestrator always sees who steered the worker and when, even if the worker's own
+  "Steering received" section is thin.
 
 ## 6. Claude Code orchestrator skill `pi-orchestrator`
 
@@ -248,11 +293,16 @@ JSON schemas of state). Skill content (concise, imperative):
 6. **Integrate**: `pi-fleet diff <name>` to review the change; `pi-fleet merge <name>`;
    run integration checks in the parent checkout; resolve conflicts from worker reports
    if any (exit 5).
-7. **Blocked handling**: if a report says `blocked` or `failed`, read its open questions;
+7. **Human console interventions**: the user may open `pi-fleet open` and steer a worker
+   mid-run. The worker's report (and the steering-log appendix) reflects those
+   interventions — always re-read the report after any console interaction, reconcile
+   your plan with the adjusted direction, and don't undo console steering decisions
+   unless the work is actually wrong.
+8. **Blocked handling**: if a report says `blocked` or `failed`, read its open questions;
    either answer them yourself and `pi-fleet send` (if still running) or spawn a fresh
    resumed run (`--session` + new brief). Diagnose repeated failures from `logs` before
    retrying; escalate to the user after 2 failed attempts on the same step.
-8. **Drive forward**: update the todo list, spawn the next step(s), and repeat until the
+9. **Drive forward**: update the todo list, spawn the next step(s), and repeat until the
    plan is complete. Then `cleanup all` and give the user a final rollup (per-step
    outcomes, merged changes, verification results).
 
@@ -263,11 +313,12 @@ workers are cheap — prefer a fresh, better-briefed worker over endless steerin
 ## 7. Data & file formats
 
 - `state.json` — single JSON object, written atomically (tmp file + rename). Schema as in
-  §4.2 step 3 plus `status` extensions `archived`.
-- `events.jsonl` — one JSON object per line, subset of pi RPC events (documented in
-  `references/cli.md`).
-- `control.jsonl` — orchestrator→monitor control messages
-  (`{"type":"steer"|"follow_up"|"abort","message":...}`).
+  §4.2 step 3 plus `status` extensions `archived`, plus steering fields `steerCount`
+  (number) and `steeringLog` (last 20 `{source, ts, message}`).
+- `events.jsonl` — one JSON object per line: a subset of pi RPC events (documented in
+  `references/cli.md`) plus fleet events `steering_delivered` and `abort_requested`.
+- `control.jsonl` — orchestrator/console→monitor control messages:
+  `{type:"steer"|"follow_up"|"abort", message, source:"orchestrator"|"console", ts}`.
 - `reports/<id>.md` — §5.2 template.
 - `.pi-fleet/` is project-local and must be added to the repo's `.gitignore` by `spawn`
   if not present (one-time, appended with a `# pi-fleet` marker comment).
@@ -283,21 +334,29 @@ workers are cheap — prefer a fresh, better-briefed worker over endless steerin
 - `spawn` on non-git dir with worktree default → warning + in-place run (documented).
 - Refusals (merge on error state, cleanup of running run, send to settled run) exit
   non-zero with explicit guidance text.
+- Attaching to a non-running run → read-only transcript mode with resume hint (not an
+  error); steering into a settled run refuses with resume guidance.
 - Monitor itself crashes → stale run detected by `dead` state (pid liveness + no
-  settled marker); `cleanup --force` recovers the worktree.
+  settled marker); `cleanup --force` recovers the worktree. `attach` to a run whose
+  monitor is dead falls back to a static tail of the captured logs.
 
 ## 9. Testing
 
 - **Unit (node:test):** state transitions & atomic writes; JSONL framing (CRLF, unicode
   separators inside strings); worktree module against a temp git repo (add/branch/remove,
-  dirty-unmerged protection); report fallback logic; control.jsonl parsing.
+  dirty-unmerged protection); report fallback logic; control.jsonl parsing incl.
+  provenance field; steeringLog/steerCount updates.
 - **E2E (script):** temp git repo → `pi-fleet spawn hello --cwd <tmp> --model
   <cheap-model> -- "Create hello.txt containing 'hi', verify, write your fleet report."`
   → assert worktree created, `wait` settles, report exists with `## Status`, `diff`
   shows hello.txt, `merge` succeeds, file exists in parent, `cleanup` removes worktree +
-  branch. Cheap default model: the user's pi default (openrouter glm-5.3-flash) is
-  acceptable for tests.
-- **Manual:** real orchestration run on a small repo via the `pi-orchestrator` skill.
+  branch. Second scenario: append a `control.jsonl` steer (source `console`) mid-run and
+  assert a `steering_delivered` event lands, `state.steerCount` increments, and the final
+  report carries a non-"none" "Steering received" section. Cheap default model: the
+  user's pi default (openrouter glm-5.3-flash) is acceptable for tests.
+- **Manual:** real orchestration run on a small repo via the `pi-orchestrator` skill;
+  `pi-fleet open` menu → attach → live view updates while working → steer from the
+  console → detach → verify final report reflects the steering.
 
 ## 10. Out of scope (v1)
 
