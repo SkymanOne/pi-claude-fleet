@@ -1,0 +1,52 @@
+{
+  "name": "pi-claude-fleet",
+  "version": "0.1.0",
+  "description": "Claude Code orchestrates pi agents: pi-fleet CLI, report protocol, orchestrator skill",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "claude-code",
+    "orchestration",
+    "fleet"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@11.24.0",
+  "bin": {
+    "pi-fleet": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "pi",
+    "claude",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "pi/extensions/fleet-report.ts"
+    ],
+    "skills": [
+      "pi/skills"
+    ]
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepare": "pnpm run build",
+    "test": "node --import tsx --test \"tests/**/*.test.ts\"",
+    "test:e2e": "node --import tsx tests/e2e.ts"
+  },
+  "dependencies": {
+    "cli-table3": "^0.6.5",
+    "commander": "^15.0.0",
+    "simple-git": "^3.36.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}

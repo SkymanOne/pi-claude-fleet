@@ -1,0 +1,258 @@
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+import { atomicWriteJson, nowIso } from "./util.js";
+
+export const RUN_STATES = [
+  "starting",
+  "running",
+  "settled",
+  "stopped",
+  "error",
+  "dead",
+  "archived",
+] as const;
+export type RunStateName = (typeof RUN_STATES)[number];
+
+export const TERMINAL_STATES = [
+  "settled",
+  "stopped",
+  "error",
+  "dead",
+  "archived",
+] as const;
+
+export interface SteeringEntry {
+  source: string;
+  ts: string;
+  message: string;
+}
+
+export interface RunState {
+  id: string;
+  name: string;
+  status: RunStateName;
+  cwd: string;
+  worktree: string | null;
+  branch: string | null;
+  base: string | null;
+  model: string | null;
+  provider: string | null;
+  thinking: string | null;
+  sessionArg: string | null;
+  skill: string | null;
+  appendSystemPrompt: string | null;
+  tools: string | null;
+  excludeTools: string | null;
+  taskBrief: string;
+  fleetDir: string;
+  repoRoot: string | null;
+  isGit: boolean;
+  pid: number | null;
+  createdAt: string;
+  settledAt: string | null;
+  lastTool: string | null;
+  lastActivity: string | null;
+  lastAssistantText: string | null;
+  steerCount: number;
+  steeringLog: SteeringEntry[];
+  error: string | null;
+}
+
+export interface RunRef {
+  runId: string;
+  runDir: string;
+  state: RunState;
+}
+
+export function runDirFor(fleetDir: string, runId: string): string {
+  return path.join(fleetDir, "runs", runId);
+}
+
+export function newRunState(input: {
+  fleetDir: string;
+  runId: string;
+  name: string;
+  cwd: string;
+  worktree?: string | null;
+  branch?: string | null;
+  base?: string | null;
+  model?: string | null;
+  provider?: string | null;
+  thinking?: string | null;
+  sessionArg?: string | null;
+  skill?: string | null;
+  appendSystemPrompt?: string | null;
+  tools?: string | null;
+  excludeTools?: string | null;
+  taskBrief?: string;
+}): RunState {
+  return {
+    id: input.runId,
+    name: input.name,
+    status: "starting",
+    cwd: input.cwd,
+    worktree: input.worktree ?? null,
+    branch: input.branch ?? null,
+    base: input.base ?? null,
+    model: input.model ?? null,
+    provider: input.provider ?? null,
+    thinking: input.thinking ?? null,
+    sessionArg: input.sessionArg ?? null,
+    skill: input.skill ?? null,
+    appendSystemPrompt: input.appendSystemPrompt ?? null,
+    tools: input.tools ?? null,
+    excludeTools: input.excludeTools ?? null,
+    taskBrief: input.taskBrief ?? "",
+    fleetDir: input.fleetDir,
+    repoRoot: null,
+    isGit: false,
+    pid: null,
+    createdAt: nowIso(),
+    settledAt: null,
+    lastTool: null,
+    lastActivity: null,
+    lastAssistantText: null,
+    steerCount: 0,
+    steeringLog: [],
+    error: null,
+  };
+}
+
+export async function loadState(runDir: string): Promise<RunState> {
+  let raw: string;
+  try {
+    raw = await fsp.readFile(path.join(runDir, "state.json"), "utf8");
+  } catch {
+    throw new Error(`No readable state.json in ${runDir}`);
+  }
+  try {
+    return JSON.parse(raw) as RunState;
+  } catch {
+    throw new Error(`Corrupted state.json in ${runDir}`);
+  }
+}
+
+export function loadStateSync(runDir: string): RunState {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(runDir, "state.json"), "utf8");
+  } catch {
+    throw new Error(`No readable state.json in ${runDir}`);
+  }
+  try {
+    return JSON.parse(raw) as RunState;
+  } catch {
+    throw new Error(`Corrupted state.json in ${runDir}`);
+  }
+}
+
+export async function saveState(
+  runDir: string,
+  state: RunState,
+): Promise<void> {
+  await atomicWriteJson(path.join(runDir, "state.json"), state);
+}
+
+export function isAlive(pid: number | null | undefined): boolean {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0)
+    return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    return err?.code === "EPERM";
+  }
+}
+
+export function deriveStatus(
+  state: RunState,
+  liveness: (pid: number | null | undefined) => boolean = isAlive,
+): RunStateName {
+  if (
+    (state.status === "starting" || state.status === "running") &&
+    !liveness(state.pid)
+  ) {
+    return "dead";
+  }
+  return state.status;
+}
+
+export function recordToolActivity(
+  state: RunState,
+  toolName: string | null | undefined,
+): void {
+  state.lastTool = toolName ?? state.lastTool;
+  state.lastActivity = nowIso();
+}
+
+export function recordSteering(
+  state: RunState,
+  entry: { source: string; message: string; ts: string },
+): void {
+  state.steerCount += 1;
+  state.steeringLog.push({
+    source: entry.source,
+    ts: entry.ts,
+    message: entry.message,
+  });
+  if (state.steeringLog.length > 20) {
+    state.steeringLog.splice(0, state.steeringLog.length - 20);
+  }
+}
+
+export type ControlType = "steer" | "follow_up" | "abort";
+
+export async function appendControl(
+  runDir: string,
+  msg: { type: ControlType; message: string | null; source: string },
+): Promise<void> {
+  await fsp.appendFile(
+    path.join(runDir, "control.jsonl"),
+    JSON.stringify({
+      type: msg.type,
+      message: msg.message,
+      source: msg.source,
+      ts: nowIso(),
+    }) + "\n",
+  );
+}
+
+export function listRuns(
+  fleetDir: string,
+): { runId: string; runDir: string }[] {
+  const runsDir = path.join(fleetDir, "runs");
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(runsDir);
+  } catch {
+    return [];
+  }
+  return entries
+    .map((runId) => ({ runId, runDir: path.join(runsDir, runId) }))
+    .filter((r) => fs.existsSync(path.join(r.runDir, "state.json")))
+    .sort((a, b) => (a.runId < b.runId ? 1 : -1));
+}
+
+export function findRun(fleetDir: string, nameOrId: string): RunRef {
+  const runs = listRuns(fleetDir);
+  const candidates = runs.filter(
+    (r) => r.runId === nameOrId || r.runId.startsWith(`${nameOrId}-`),
+  );
+  const nonArchived = candidates.filter((r) => {
+    try {
+      return loadStateSync(r.runDir).status !== "archived";
+    } catch {
+      return false;
+    }
+  });
+  const chosen = nonArchived[0] ?? candidates[0];
+  if (!chosen) {
+    throw new Error(`No run found matching "${nameOrId}" in ${fleetDir}/runs`);
+  }
+  return {
+    runId: chosen.runId,
+    runDir: chosen.runDir,
+    state: loadStateSync(chosen.runDir),
+  };
+}

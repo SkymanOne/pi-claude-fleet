@@ -1,0 +1,22 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { runCli, tmpDir } from "./helpers.js";
+
+test("--help prints usage, lists spawn, hides __monitor, exits 0", async () => {
+  const r = await runCli(["--help"]);
+  assert.equal(r.code, 0);
+  assert.match(r.stdout, /pi-fleet/);
+  assert.match(r.stdout, /spawn/);
+  assert.doesNotMatch(r.stdout, /__monitor/);
+});
+
+test("unknown command exits 1", async () => {
+  const r = await runCli(["nope"]);
+  assert.equal(r.code, 1);
+});
+
+test("spawn without a brief exits 1 with guidance", async () => {
+  const r = await runCli(["spawn", "x", "--cwd", tmpDir("pf-cli-")]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /brief required/);
+});
