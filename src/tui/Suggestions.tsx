@@ -8,6 +8,7 @@ export interface SuggestionsProps {
 
 const KIND_COLOR: Record<Suggestion["kind"], string> = {
   command: "cyan",
+  agent: "magenta",
   worker: "yellow",
   file: "green",
 };

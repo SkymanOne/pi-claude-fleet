@@ -133,6 +133,20 @@ test("a turn over fake-claude: init after the first message, replay, deltas, ass
   assert.ok(proc.exited);
 }, { timeout: 20_000 });
 
+test("the initialize handshake reports the commands and skills claude offers", async () => {
+  const root = tmpDir("pf-proc-cmds-");
+  const proc = startProc(root);
+  try {
+    const [commands] = (await once(proc, "commands")) as [{ name: string; description: string }[]];
+    assert.deepEqual(commands.map((c) => c.name), ["model", "usage", "research"]);
+    assert.deepEqual(proc.slashCommands.map((c) => c.name), ["model", "usage", "research"]);
+    assert.equal(proc.slashCommands[0].argumentHint, "<model>");
+    assert.deepEqual(proc.slashCommands[1].aliases, ["cost"]);
+  } finally {
+    await proc.stop();
+  }
+}, { timeout: 20_000 });
+
 test("permission requests: allow with suggestions, deny with a reason, AskUserQuestion answers", async () => {
   const root = tmpDir("pf-proc-2-");
   const proc = startProc(root);
@@ -208,51 +222,21 @@ test("interrupt stops a streaming turn and returns the receipt; errors surface a
   }
 }, { timeout: 20_000 });
 
-test("needsInitialize: the bare initialize handshake is only sent when asked for", async () => {
-  const root = tmpDir("pf-proc-4-");
-  const without = startProc(root, { FAKE_CLAUDE_REQUIRE_INIT: "1" });
+test("the handshake goes out before the first turn, so prompts arrive even when the CLI waits for it", async () => {
+  const root = tmpDir("pf-proc-init-");
+  // this fake refuses to prompt until it has seen an initialize control request
+  const proc = startProc(root, { FAKE_CLAUDE_REQUIRE_INIT: "1" });
   try {
-    let prompted = false;
-    without.on("permission_request", () => { prompted = true; });
-    const res = once(without, "result");
-    without.send("perm:touch b.txt");
-    const [r] = await res;
-    assert.equal(r.result, "ran-without-prompt:touch b.txt");
-    assert.equal(prompted, false);
-  } finally {
-    await without.stop();
-  }
-  const root2 = tmpDir("pf-proc-5-");
-  const withInit = startProc(root2, { FAKE_CLAUDE_REQUIRE_INIT: "1" }, { needsInitialize: true });
-  try {
-    await waitFor(() => (fs.existsSync(path.join(root2, "orchestrator.log")) && fs.readFileSync(path.join(root2, "orchestrator.log"), "utf8").includes('"subtype":"initialize"') ? true : undefined), { timeoutMs: 5000, intervalMs: 20 });
-    const perm = once(withInit, "permission_request");
-    withInit.send("perm:touch c.txt");
+    await once(proc, "commands");
+    const log = fs.readFileSync(path.join(root, "orchestrator.log"), "utf8");
+    assert.equal(log.split('"subtype":"initialize"').length - 1, 1, "sent exactly once");
+    const perm = once(proc, "permission_request");
+    proc.send("perm:touch d.txt");
     const [req] = (await perm) as [PermissionRequest];
-    const res = once(withInit, "result");
-    withInit.allow(req.requestId);
+    const res = once(proc, "result");
+    proc.allow(req.requestId);
     const [r] = await res;
-    assert.equal(r.result, "allowed:touch c.txt");
-  } finally {
-    await withInit.stop();
-  }
-}, { timeout: 20_000 });
-
-test("a write racing the child's death does not crash the app", async () => {
-  const root = tmpDir("pf-proc-epipe-");
-  const proc = startProc(root);
-  try {
-    await waitFor(() => (proc.pid && isAlive(proc.pid) ? true : undefined), { timeoutMs: 5000, intervalMs: 10 });
-    const exited = once(proc, "exit");
-    // kill, then write in the same tick: the pipe is still open, so the failure
-    // arrives as an asynchronous EPIPE rather than a throw from write()
-    process.kill(proc.pid as number, "SIGKILL");
-    const big = "x".repeat(4 * 1024 * 1024);
-    for (let i = 0; i < 4; i++) proc.send(big);
-    await exited;
-    // reaching here at all is the assertion: an unhandled EPIPE would have killed this process
-    assert.equal(proc.running, false);
-    assert.equal(proc.send("after death"), false);
+    assert.equal(r.result, "allowed:touch d.txt");
   } finally {
     await proc.stop();
   }

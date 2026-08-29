@@ -176,6 +176,14 @@ export type ClaudeStreamMessage =
   | ControlCancelRequestMessage
   | UnknownMessage;
 
+/** A slash command or skill the agent offers, from the initialize response. */
+export interface AgentCommand {
+  name: string;
+  description: string;
+  argumentHint?: string;
+  aliases?: string[];
+}
+
 export type PermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk" | "auto";
 
 export type PermissionDecision =

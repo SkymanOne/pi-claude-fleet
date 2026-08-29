@@ -143,3 +143,29 @@ test("/remove without a fleet dir, and the updated unknown-command hint", async 
   const unknown = await workerCommand({ runDir, state, input: "/nope" });
   assert.match(unknown.notice, /\/remove/);
 });
+
+test("a command the worker itself offers is sent to pi; an unknown one lists what it has", async () => {
+  const commands = [
+    { name: "skill:fleet-worker-report", description: "How to write the report", source: "skill" },
+    { name: "session-name", description: "Set the session name", source: "extension" },
+  ];
+  const { runDir, state } = mk({ commands });
+  const sent = await workerCommand({ runDir, state, input: "/skill:fleet-worker-report" });
+  assert.equal(sent.error, false, sent.notice);
+  assert.equal(sent.notice, "→ sent /skill:fleet-worker-report to db");
+  await workerCommand({ runDir, state, input: "/session-name my-run" });
+  assert.deepEqual(control(runDir).map((c) => [c.type, c.message, c.source]), [
+    ["command", "/skill:fleet-worker-report", "console"],
+    ["command", "/session-name my-run", "console"],
+  ]);
+
+  const unknown = await workerCommand({ runDir, state, input: "/nope" });
+  assert.equal(unknown.error, true);
+  assert.match(unknown.notice, /the worker's own: \/skill:fleet-worker-report, \/session-name/);
+
+  const finished = mk({ status: "settled", commands });
+  const late = await workerCommand({ runDir: finished.runDir, state: finished.state, input: "/session-name x" });
+  assert.equal(late.error, true);
+  assert.match(late.notice, /is settled/);
+  assert.deepEqual(control(finished.runDir), []);
+});

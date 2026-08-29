@@ -38,6 +38,7 @@ import {
   type PermissionUpdate,
   type PermissionMode,
   type AskUserQuestionAnswers,
+  type AgentCommand,
 } from "./protocol.js";
 
 export interface OrchestratorProcessOptions extends ClaudeArgsOptions {
@@ -45,8 +46,6 @@ export interface OrchestratorProcessOptions extends ClaudeArgsOptions {
   cwd: string;
   /** Raw protocol log (both directions), e.g. `.pi-fleet/orchestrator.log`. */
   logPath?: string;
-  /** Send a bare `initialize` control request right after spawning (protocol fallback). */
-  needsInitialize?: boolean;
   env?: NodeJS.ProcessEnv;
   /** Escalation delays for stop(). */
   stopGraceMs?: number;
@@ -72,6 +71,7 @@ export interface OrchestratorProcessEvents {
   result: [ResultMessage];
   permission_request: [PermissionRequest];
   control_response: [ControlResponseMessage];
+  commands: [AgentCommand[]];
   /** Every parsed message, in order. */
   message: [ClaudeStreamMessage];
   /** A line we wrote to the child's stdin. */
@@ -91,6 +91,8 @@ export class OrchestratorProcess extends EventEmitter<OrchestratorProcessEvents>
   model: string | null = null;
   claudeVersion: string | null = null;
   capabilities: string[] = [];
+  /** Slash commands and skills claude offers, learned from the initialize response. */
+  slashCommands: AgentCommand[] = [];
   costUsd = 0;
   numTurns = 0;
   /** True from the moment we send a user message until the next `result`. */
@@ -164,7 +166,16 @@ export class OrchestratorProcess extends EventEmitter<OrchestratorProcessEvents>
       this.emit("exit", { code, signal });
     });
     if (child.pid) this.emit("spawned", child.pid);
-    if (this.options.needsInitialize) void this.initialize();
+    // The handshake is also how we learn which commands and skills this claude
+    // offers, so it is always sent; the spike showed permission prompts do not
+    // depend on it.
+    void this.initialize().then((response) => {
+      const commands = response?.commands;
+      if (Array.isArray(commands)) {
+        this.slashCommands = commands.filter((c): c is AgentCommand => Boolean(c && typeof (c as AgentCommand).name === "string"));
+        this.emit("commands", this.slashCommands);
+      }
+    });
   }
 
   /** Last stderr output, for error reporting. */

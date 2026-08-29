@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { gitRaw } from "../worktree.js";
 
-export type SuggestionKind = "command" | "worker" | "file";
+export type SuggestionKind = "command" | "agent" | "worker" | "file";
 
 export interface Suggestion {
   /** Text that replaces the token being completed. */
@@ -87,11 +87,22 @@ export function rank<T>(items: T[], query: string, key: (item: T) => string): T[
   return [...prefix, ...contains];
 }
 
+/** A command the underlying agent offers: a claude slash command or skill, or a pi command. */
+export interface AgentCommandOption {
+  name: string;
+  description: string;
+  /** "skill", "prompt", "extension" for pi; the argument hint for claude. */
+  source?: string;
+  argumentHint?: string;
+}
+
 export interface CompletionContext {
   /** What the composer is aimed at; worker-only commands are hidden otherwise. */
   target: "orchestrator" | "worker";
   workers: { name: string; detail: string }[];
   files: string[];
+  /** Commands the selected agent offers, passed through to it verbatim. */
+  agentCommands?: AgentCommandOption[];
 }
 
 export const MAX_SUGGESTIONS = 8;
@@ -109,7 +120,17 @@ export function completionsFor(input: string, ctx: CompletionContext): Completio
       detail: [c.detail, `(${[...(c.aliases ?? []), c.shortcut].filter(Boolean).join(", ")})`].join("  "),
       kind: "command",
     }));
-    return items.length > 0 ? { items: items.slice(0, MAX_SUGGESTIONS), start, token } : null;
+    // then whatever the agent itself offers: claude's slash commands and skills,
+    // pi's skills, prompt templates and extension commands
+    const agent = ctx.agentCommands ?? [];
+    const agentItems = rank(agent, token.slice(1), (c) => c.name).map<Suggestion>((c) => ({
+      value: c.argumentHint ? `/${c.name} ` : `/${c.name}`,
+      label: `/${c.name}`,
+      detail: [c.description, c.argumentHint, c.source ? `[${c.source}]` : ""].filter(Boolean).join("  "),
+      kind: "agent",
+    }));
+    const all = [...items, ...agentItems];
+    return all.length > 0 ? { items: all.slice(0, MAX_SUGGESTIONS), start, token } : null;
   }
 
   if (token.startsWith("@")) {

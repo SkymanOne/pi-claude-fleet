@@ -163,7 +163,24 @@ process.stdin.on("data", (chunk) => {
       const sub = msg.request?.subtype;
       if (sub === "initialize") initialized = true;
       if (sub === "interrupt") interrupted = true;
-      send({ type: "control_response", response: { subtype: "success", request_id: msg.request_id, response: sub === "interrupt" ? { still_queued: [] } : {} } });
+      const response =
+        sub === "interrupt"
+          ? { still_queued: [] }
+          : sub === "initialize"
+            ? {
+                commands: [
+                  { name: "model", description: "Set the model", argumentHint: "<model>" },
+                  { name: "usage", description: "Show plan usage", aliases: ["cost"] },
+                  { name: "research", description: "Research a topic", argumentHint: "<topic>" },
+                ],
+                agents: [],
+                models: [],
+                output_style: "default",
+                available_output_styles: [],
+                account: {},
+              }
+            : {};
+      send({ type: "control_response", response: { subtype: "success", request_id: msg.request_id, response } });
     }
   }
 });

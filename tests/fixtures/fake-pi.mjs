@@ -176,6 +176,20 @@ process.stdin.on("data", (chunk) => {
           sessionId: "fake-session",
         },
       });
+    } else if (msg.type === "get_commands") {
+      send({
+        id: msg.id,
+        type: "response",
+        command: "get_commands",
+        success: true,
+        data: {
+          commands: [
+            { name: "skill:fleet-worker-report", description: "How to write the fleet report", source: "skill" },
+            { name: "compact-notes", description: "Summarize the session", source: "prompt" },
+            { name: "session-name", description: "Set the session name", source: "extension" },
+          ],
+        },
+      });
     } else if (msg.type === "get_last_assistant_text") {
       send({ id: msg.id, type: "response", command: "get_last_assistant_text", success: true, data: { text: "Working: wrote hello.txt" } });
     }

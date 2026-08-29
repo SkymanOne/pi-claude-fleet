@@ -7,7 +7,8 @@
  * Findings (claude 2.1.251, model haiku, 2026-08-29):
  *   F1 can_use_tool arrives without an `initialize` control request: YES. `touch x` prompted
  *      over stdio right away; `echo` never prompts (it is in the built-in read-only command
- *      set), so probe with a writing command. => needsInitialize defaults to false.
+ *      set), so probe with a writing command.
+ *      The handshake is sent at startup anyway: its response carries the command/skill list.
  *   F2 bare {subtype:"initialize"}: acknowledged with control_response success; not needed.
  *   F3 --allowedTools "mcp__fleet__*": fleet_status ran without a prompt. => pattern works.
  *   F4 updatedPermissions from permission_suggestions: honored (a second `touch` did not prompt).

@@ -28,6 +28,13 @@ export interface SteeringEntry {
   message: string;
 }
 
+/** One entry from pi's `get_commands`: an extension command, prompt template or skill. */
+export interface WorkerCommand {
+  name: string;
+  description: string;
+  source: string;
+}
+
 /** A `fleet_ask` the worker is blocked on until an `answer` control line lands. */
 export interface PendingQuestion {
   id: string;
@@ -73,6 +80,8 @@ export interface RunState {
   /** The model pi actually resolved (from its `get_state`), as opposed to the `--model` pattern asked for. */
   activeModel?: string | null;
   activeProvider?: string | null;
+  /** Commands, skills and prompt templates this worker offers (pi's `get_commands`). */
+  commands?: WorkerCommand[];
   /** Last `fleet_progress` message. */
   lastProgress?: string | null;
 }
@@ -139,6 +148,7 @@ export function newRunState(input: {
     lastProgress: null,
     activeModel: null,
     activeProvider: null,
+    commands: [],
   };
 }
 
@@ -251,7 +261,8 @@ export function recordSteering(
   }
 }
 
-export type ControlType = "steer" | "follow_up" | "abort" | "answer";
+/** `command` carries a slash command for pi to expand (skills, prompt templates, extension commands). */
+export type ControlType = "steer" | "follow_up" | "abort" | "answer" | "command";
 
 /** One line of `control.jsonl` (orchestrator/console → monitor and the worker's `fleet_ask`). */
 export interface ControlMessage {

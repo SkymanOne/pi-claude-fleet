@@ -13,6 +13,28 @@ const settledState = (root: string) =>
     return TERMINAL.includes(s.status) ? s : undefined;
   }, { timeoutMs: 30_000 });
 
+test("the monitor records the commands the worker offers, and forwards one as a prompt", async () => {
+  const root = initRepo("pf-cmds-");
+  const r = await runCli(["spawn", "w", "--cwd", root, "--no-worktree", "--", "t"], { env: fakePiEnv({ FAKE_PI_DELAY_MS: "20000" }) });
+  assert.equal(r.code, 0, r.stderr);
+  const runId = firstRunId(root);
+  const runDir = path.join(fleetDirOf(root), "runs", runId);
+  const state = await waitFor(() => (readState(root, runId).commands?.length ? readState(root, runId) : undefined), { timeoutMs: 20_000 });
+  assert.deepEqual(state.commands.map((c: any) => c.name), ["skill:fleet-worker-report", "compact-notes", "session-name"]);
+  assert.equal(state.commands[0].source, "skill");
+
+  fs.appendFileSync(path.join(runDir, "control.jsonl"), JSON.stringify({ id: "c1", type: "command", message: "/session-name mine", source: "console", ts: new Date().toISOString() }) + "\n");
+  await waitFor(() => {
+    const events = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8");
+    return events.includes("command_delivered") ? true : undefined;
+  }, { timeoutMs: 15_000 });
+  const after = readState(root, runId);
+  assert.equal(after.steerCount, 1);
+  assert.equal(after.steeringLog[0].message, "command: /session-name mine");
+  await runCli(["stop", "w", "--cwd", root]);
+  await runCli(["wait", "w", "--cwd", root, "--timeout", "15"]);
+}, { timeout: 60_000 });
+
 test("the monitor records the model pi resolved", async () => {
   const root = initRepo("pf-model-");
   const r = await runCli(["spawn", "w", "--cwd", root, "--no-worktree", "--", "t"],

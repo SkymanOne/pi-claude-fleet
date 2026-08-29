@@ -85,7 +85,19 @@ export async function workerCommand(args: WorkerActionArgs): Promise<WorkerActio
     return removeWorker({ piFleetDir: args.piFleetDir, runId: args.runId, name: state.name, force: false });
   }
   if (input.startsWith("/")) {
-    return { notice: `! unknown command ${head} — /answer, /followup, /stop, /remove, /help, /quit`, error: true };
+    // not one of ours: if the worker offers it, let pi expand it (skill, prompt
+    // template or extension command)
+    const known = (state.commands ?? []).some((c) => `/${c.name}` === head);
+    if (known) {
+      if (finished) return { notice: `! ${state.name} is ${status} — ${resumeHint(state, runDir)}`, error: true };
+      await appendControl(runDir, { type: "command", message: input, source: "console" });
+      return { notice: `→ sent ${head} to ${state.name}`, error: false };
+    }
+    const offered = (state.commands ?? []).slice(0, 6).map((c) => `/${c.name}`).join(", ");
+    return {
+      notice: `! unknown command ${head} — /answer, /followup, /stop, /remove, /help, /quit${offered ? `, or the worker's own: ${offered}` : ""}`,
+      error: true,
+    };
   }
   if (finished) return { notice: `! ${state.name} is ${status} — ${resumeHint(state, runDir)}`, error: true };
   await appendControl(runDir, { type: "steer", message: input, source: "console" });

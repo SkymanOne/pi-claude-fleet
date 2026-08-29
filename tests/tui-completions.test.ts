@@ -92,6 +92,35 @@ test("every command has a distinct ctrl shortcut", () => {
   assert.equal(SHORTCUTS.a.takesArgument, true);
 });
 
+test("the agent's own commands and skills are offered alongside the console's", () => {
+  const claude = completionsFor("/", ctx({
+    target: "orchestrator",
+    agentCommands: [
+      { name: "model", description: "Set the model", argumentHint: "<model>" },
+      { name: "research", description: "Research a topic" },
+    ],
+  }))!;
+  assert.deepEqual(claude.items.map((i) => i.label), ["/help", "/quit", "/model", "/research"]);
+  assert.deepEqual(claude.items.map((i) => i.kind), ["command", "command", "agent", "agent"]);
+  assert.equal(claude.items[2].value, "/model ", "one that takes an argument leaves the cursor after a space");
+  assert.equal(claude.items[3].value, "/research");
+  assert.match(claude.items[2].detail!, /Set the model/);
+
+  const pi = completionsFor("/sk", ctx({
+    agentCommands: [
+      { name: "skill:fleet-worker-report", description: "How to write the report", source: "skill" },
+      { name: "session-name", description: "Set the session name", source: "extension" },
+    ],
+  }))!;
+  assert.deepEqual(pi.items.map((i) => i.label), ["/skill:fleet-worker-report"]);
+  assert.match(pi.items[0].detail!, /\[skill\]/);
+
+  // ours still win the ordering, and an agent command never shadows one of ours
+  const both = completionsFor("/s", ctx({ agentCommands: [{ name: "session-name", description: "x", source: "extension" }] }))!;
+  assert.deepEqual(both.items.map((i) => i.label), ["/stop", "/session-name"]);
+  assert.equal(completionsFor("/", ctx({ agentCommands: [] }))!.items.every((i) => i.kind === "command"), true);
+});
+
 test("commands answer to short aliases, and completing one offers the long form", () => {
   assert.equal(resolveCommand("/q")!.name, "/quit");
   assert.equal(resolveCommand("/h")!.name, "/help");

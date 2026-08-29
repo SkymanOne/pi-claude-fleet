@@ -64,6 +64,7 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
   const [historyAt, setHistoryAt] = useState(-1);
   const { stdout } = useStdout();
   const [size, setSize] = useState({ rows: stdout?.rows ?? 24, columns: stdout?.columns ?? 80 });
+  const [orchestratorCommands, setOrchestratorCommands] = useState(proc.slashCommands);
   const busy = useRef(false);
   // ink-text-input also receives the ctrl keypress and would insert it as text;
   // a shortcut sets this so the next change from the input is dropped.
@@ -75,11 +76,14 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
     const onExit = (info: { code: number | null; signal: NodeJS.Signals | null }): void =>
       dispatch({ type: "exit", code: info.code, signal: info.signal });
     const onError = (err: Error): void => dispatch({ type: "error", text: `! orchestrator: ${err.message}` });
+    const onCommands = (commands: typeof proc.slashCommands): void => setOrchestratorCommands(commands);
+    proc.on("commands", onCommands);
     proc.on("message", onMessage);
     proc.on("permission_request", onPermission);
     proc.on("exit", onExit);
     proc.on("error", onError);
     return () => {
+      proc.off("commands", onCommands);
       proc.off("message", onMessage);
       proc.off("permission_request", onPermission);
       proc.off("exit", onExit);
@@ -171,12 +175,17 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
   const historyKey = target?.kind === "worker" ? target.runId : "orchestrator";
   const completion: CompletionState | null = useMemo(() => {
     if (dismissed || approvals.length > 0 || confirm || showHelp) return null;
+    const agentCommands =
+      target?.kind === "worker"
+        ? (runs.find((r) => r.runId === target.runId)?.state.commands ?? []).map((c) => ({ name: c.name, description: c.description, source: c.source }))
+        : orchestratorCommands.map((c) => ({ name: c.name, description: c.description, argumentHint: c.argumentHint }));
     return completionsFor(input, {
       target: target?.kind === "worker" ? "worker" : "orchestrator",
       workers: runs.map((r) => ({ name: r.state.name, detail: deriveStatus(r.state) })),
       files,
+      agentCommands,
     });
-  }, [input, dismissed, approvals.length, confirm, showHelp, target, runs, files]);
+  }, [input, dismissed, approvals.length, confirm, showHelp, target, runs, files, orchestratorCommands]);
   const selectedCompletion = completion?.items[Math.min(completionIndex, completion.items.length - 1)];
 
   const notice = (text: string, error = false): void => {

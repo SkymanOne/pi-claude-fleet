@@ -58,6 +58,8 @@ The composer at the bottom sends to whatever is selected. With the orchestrator 
 
 Typing `/` lists the commands available for the selected session, and `@` lists the workers and then the repository's files. `tab` accepts the highlighted suggestion, `up` and `down` move through them, and with no suggestions open `up` recalls what you sent to that session before.
 
+The list is not only the console's own commands: it also carries whatever the agent on the other end offers. For the orchestrator that is Claude Code's slash commands and skills (`/model`, `/usage`, any skill you have installed), learned from its handshake and passed through verbatim. For a worker it is pi's commands, skills and prompt templates (`/skill:some-skill`, extension commands), which the worker reports when it starts; the console delivers them as a pi `prompt`, the one form that runs extension commands as well as expanding skills.
+
 When the orchestrator wants to run something outside its allowlist, or asks you a question, an overlay appears: `y` allows once, `a` allows it for the session, `n` denies with a reason, and questions get an option picker.
 
 Workers disappear from the rail when they are done: the orchestrator removes each one after it merges and verifies it, and the console removes any settled worker whose branch is already merged. Nothing unmerged, dirty or still running is ever removed for you — that waits for `/remove`, which tells you exactly what would be lost before it does anything.
@@ -109,7 +111,7 @@ The TUI is one client; the same fleet is driveable from scripts.
 | `output <name> [--tail n]` | last assistant text, or the last n tool results |
 | `logs <name> [--tail n]` | tail of the raw RPC log |
 | `send`, `followup`, `answer`, `stop` | steer, queue a follow-up, answer a question, abort |
-| `status --json` | includes each run's `activeModel` and `pendingQuestion` |
+| `status --json` | includes each run's `activeModel`, `pendingQuestion` and the `commands` it offers |
 | `report <name>` | the final report with the steering log appended; exit 2 if there is none |
 | `diff <name> [--name-only]` | what the worker changed against its base commit |
 | `merge <name> [--no-commit]` | merge the worker's branch; exit 5 on conflicts |
@@ -127,7 +129,7 @@ Exit codes: 0 ok, 1 refusal or error, 2 no report, 3 wait timed out, 4 the run e
 |---|---|
 | `runs/<id>/state.json` | the run's durable facts: status, worktree, branch, base commit, last tool and activity, steering log, pending question |
 | `runs/<id>/events.jsonl` | the transcript: selected pi RPC events plus fleet events (`steering_delivered`, `worker_question`, `worker_progress`, `answer_delivered`, …) |
-| `runs/<id>/control.jsonl` | inbox: `steer`, `follow_up`, `abort`, `answer` lines from the orchestrator or from you |
+| `runs/<id>/control.jsonl` | inbox: `steer`, `follow_up`, `abort`, `answer`, `command` lines from the orchestrator or from you |
 | `runs/<id>/outbox.jsonl` | outbox: the worker's `question`, `progress` and `question_resolved` envelopes |
 | `runs/<id>/rpc.log`, `monitor.log` | raw pi stream and the monitor's own output |
 | `reports/<id>.md` | the worker's final report |

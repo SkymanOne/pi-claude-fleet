@@ -55,6 +55,9 @@ export function applyEvent(t: Transcript, ev: any): void {
     case "worker_progress":
       push(t, "system", `· ${clip(String(ev.message ?? ""), 200)}`);
       return;
+    case "command_delivered":
+      push(t, "steer", `▶ command (${ev.source ?? "unknown"}): ${ev.message ?? ""}`);
+      return;
     case "answer_delivered":
       push(t, "steer", `▶ answer (${ev.source ?? "unknown"}): ${ev.message ?? ""}`);
       return;
