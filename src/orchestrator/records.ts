@@ -48,6 +48,8 @@ export interface OrchestratorState {
   activity: Activity | null;
   /** Reasoning level last asked for, since claude does not report one. */
   effort: string | null;
+  /** How permission prompts are handled: default, auto, acceptEdits, dontAsk, plan. */
+  permissionMode: string;
   startedAt: string;
   lastActivity: string | null;
   pendingRequests: PendingRequestRecord[];
@@ -71,6 +73,7 @@ export function newOrchestratorState(cwd: string): OrchestratorState {
     turnActive: false,
     activity: null,
     effort: null,
+    permissionMode: "default",
     startedAt: new Date().toISOString(),
     lastActivity: null,
     pendingRequests: [],
@@ -85,6 +88,7 @@ export type OrchestratorCommand =
   | { type: "permission"; requestId: string; decision: PermissionDecisionRecord }
   | { type: "interrupt" }
   | { type: "effort"; level: string }
+  | { type: "permission_mode"; mode: string }
   | { type: "stop" };
 
 /** Console → monitor. */
@@ -93,6 +97,7 @@ export type OrchestratorControl =
   | { id: string; ts: string; type: "permission"; requestId: string; decision: PermissionDecisionRecord }
   | { id: string; ts: string; type: "interrupt" }
   | { id: string; ts: string; type: "effort"; level: string }
+  | { id: string; ts: string; type: "permission_mode"; mode: string }
   | { id: string; ts: string; type: "stop" };
 
 export type PermissionDecisionRecord =

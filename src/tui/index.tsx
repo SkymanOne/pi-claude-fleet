@@ -24,6 +24,8 @@ export interface TuiArgs {
   budget?: string;
   progressEvents?: boolean;
   maxWorkers?: number;
+  /** How the orchestrator's tool use is approved; the console can change it later. */
+  permissionMode?: string;
 }
 
 function isInteractiveTerminal(): boolean {
@@ -76,6 +78,7 @@ export async function cmdTui(args: TuiArgs): Promise<number> {
     model: args.model,
     budget: args.budget,
     fresh: args.fresh,
+    permissionMode: args.permissionMode,
   });
   const watcher = new FleetWatcher({
     piFleetDir,

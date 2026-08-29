@@ -40,13 +40,19 @@ export interface OrchestratorMonitorArgs {
   model?: string | null;
   budget?: number | null;
   fresh?: boolean;
+  /** Starting permission mode; the console can change it later. */
+  permissionMode?: string | null;
 }
 
 export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Promise<number> {
   const paths = orchestratorPaths(args.piFleetDir);
   fs.mkdirSync(paths.dir, { recursive: true });
 
-  const state: OrchestratorState = { ...newOrchestratorState(args.cwd), pid: process.pid };
+  const state: OrchestratorState = {
+    ...newOrchestratorState(args.cwd),
+    pid: process.pid,
+    permissionMode: args.permissionMode ?? "default",
+  };
   const session = (args.fresh ? null : loadSession(args.piFleetDir)) ?? newSession(args.cwd);
 
   let dirty = false;
@@ -74,6 +80,7 @@ export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Pro
     model: args.model ?? undefined,
     resumeSessionId: args.fresh ? null : session.sessionId,
     maxBudgetUsd: args.budget ?? null,
+    permissionMode: args.permissionMode ?? null,
     logPath: paths.log,
   });
 
@@ -195,6 +202,17 @@ export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Pro
         await proc.interrupt(true);
         writeEvent({ type: "notice", text: "· interrupt requested" });
         return;
+      case "permission_mode": {
+        const response = await proc.setPermissionMode(control.mode as never);
+        if (response === null) {
+          writeEvent({ type: "notice", text: `! claude refused the permission mode ${control.mode}`, error: true });
+          return;
+        }
+        state.permissionMode = control.mode;
+        writeEvent({ type: "notice", text: `· permission mode → ${control.mode}` });
+        writeState();
+        return;
+      }
       case "effort":
         state.effort = control.level;
         writeState();

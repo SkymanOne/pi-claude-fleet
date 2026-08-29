@@ -79,6 +79,13 @@ export const COMMANDS: CommandSpec[] = [
     aliases: ["/t"],
   },
   {
+    name: "/permissions",
+    detail: "how the orchestrator's tool use is approved (auto asks you less)",
+    takesArgument: true,
+    shortcut: "ctrl+o",
+    aliases: ["/perm", "/p"],
+  },
+  {
     name: "/help",
     detail: "keys and commands",
     shortcut: "ctrl+g",
@@ -163,7 +170,8 @@ export interface CompletionContext {
   agentCommands?: AgentCommandOption[];
 }
 
-export const MAX_SUGGESTIONS = 8;
+// the console's own commands must all fit, with room for the agent's
+export const MAX_SUGGESTIONS = 12;
 
 /** What to offer for the current input, or null when nothing applies. */
 export function completionsFor(

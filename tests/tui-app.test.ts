@@ -646,3 +646,30 @@ test(
   },
   { timeout: 60_000 },
 );
+
+test("/permissions reports the mode, rejects nonsense, and sets auto", async () => {
+  const h = setup();
+  const app = renderApp(h);
+  try {
+    await frameMatching(app.lastFrame, /orchestrator > /);
+    await type(app, "/permissions");
+    await frameMatching(app.lastFrame, /permissions: default/);
+    assert.match(squash(app.lastFrame() ?? ""), /every action outside the allowlist asks you/);
+
+    await type(app, "/permissions bypassPermissions");
+    await frameMatching(app.lastFrame, /would skip the approval overlay/);
+    await type(app, "/p nonsense");
+    await frameMatching(app.lastFrame, /usage: \/permissions <default\|auto\|acceptEdits\|dontAsk\|plan>/);
+
+    await type(app, "/p auto");
+    await frameMatching(app.lastFrame, /permissions → auto: a classifier approves routine actions/);
+    await waitFor(
+      () => (loadOrchestratorState(h.piFleetDir)?.permissionMode === "auto" ? true : undefined),
+      { timeoutMs: 15_000 },
+    );
+    // and the status line says so, since it is no longer the default
+    await frameMatching(app.lastFrame, /perms auto/);
+  } finally {
+    await teardown(h, app);
+  }
+}, { timeout: 60_000 });

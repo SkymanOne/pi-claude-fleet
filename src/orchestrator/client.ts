@@ -27,6 +27,8 @@ export interface OrchestratorClientOptions {
   model?: string;
   budget?: string;
   fresh?: boolean;
+  /** Starting permission mode for a monitor this client has to start. */
+  permissionMode?: string;
   pollMs?: number;
 }
 
@@ -96,6 +98,10 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
     await appendOrchestratorControl(this.piFleetDir, { type: "effort", level });
   }
 
+  async setPermissionMode(mode: string): Promise<void> {
+    await appendOrchestratorControl(this.piFleetDir, { type: "permission_mode", mode });
+  }
+
   async allow(requestId: string, updatedPermissions?: PermissionUpdate[]): Promise<void> {
     await this.respond(requestId, { behavior: "allow", updatedPermissions });
   }
@@ -115,6 +121,8 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
 
   private spawnMonitor(): void {
     const paths = orchestratorPaths(this.piFleetDir);
+    // a restarted monitor keeps the mode the last one was running in
+    const mode = this.options.permissionMode ?? loadOrchestratorState(this.piFleetDir)?.permissionMode ?? null;
     const logFd = fs.openSync(paths.monitorLog, "a");
     const args = [
       ...cliSpawnArgs(),
@@ -124,6 +132,7 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
       this.options.cwd,
       ...(this.options.model ? ["--model", this.options.model] : []),
       ...(this.options.budget ? ["--budget", this.options.budget] : []),
+      ...(mode ? ["--permission-mode", mode] : []),
       ...(this.options.fresh ? ["--fresh"] : []),
     ];
     const child = spawn(process.execPath, args, { detached: true, stdio: ["ignore", logFd, logFd] });

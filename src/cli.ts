@@ -183,7 +183,11 @@ const tuiOptions = (cmd: Command): Command =>
     .option("--model <model>", "model for the orchestrator (claude model alias or id)")
     .option("--fresh", "start a new orchestrator session instead of resuming the saved one")
     .option("--budget <usd>", "stop the orchestrator after this much spend")
-    .option("--progress-events", "forward worker progress notes to the orchestrator");
+    .option("--progress-events", "forward worker progress notes to the orchestrator")
+    .option(
+      "--permission-mode <mode>",
+      "how the orchestrator's tool use is approved: default, auto, acceptEdits, dontAsk, plan",
+    );
 
 const runTui = async (rest: string[], options: OptionValues): Promise<void> => {
   // `tui` is the default command, so an unrecognized subcommand lands here as an operand.
@@ -200,6 +204,7 @@ const runTui = async (rest: string[], options: OptionValues): Promise<void> => {
       fresh: options.fresh,
       budget: options.budget,
       progressEvents: options.progressEvents,
+      permissionMode: options.permissionMode,
     }),
   );
 };
@@ -226,6 +231,7 @@ program
   .option("--model <model>", "model for the orchestrator")
   .option("--budget <usd>", "stop after this much spend")
   .option("--fresh", "start a new claude session")
+  .option("--permission-mode <mode>", "starting permission mode")
   .action(async (piFleetDir: string, options: OptionValues) => {
     const { runOrchestratorMonitor } = await import("./orchestrator/monitor.js");
     done(
@@ -235,6 +241,7 @@ program
         model: options.model ?? null,
         budget: options.budget ? Number(options.budget) : null,
         fresh: Boolean(options.fresh),
+        permissionMode: options.permissionMode ?? null,
       }),
     );
   });

@@ -19,6 +19,28 @@ export const DEFAULT_ALLOWED_TOOLS = [
 /** The orchestrator coordinates; it never edits. */
 export const DEFAULT_DISALLOWED_TOOLS = ["Edit", "Write", "NotebookEdit"];
 
+/**
+ * Permission modes worth offering. `bypassPermissions` is deliberately absent:
+ * it needs an extra dangerous flag and would silence the approval overlay.
+ */
+export const PERMISSION_MODES = ["default", "auto", "acceptEdits", "dontAsk", "plan"] as const;
+export type OfferedPermissionMode = (typeof PERMISSION_MODES)[number];
+
+export function describePermissionMode(mode: string): string {
+  switch (mode) {
+    case "auto":
+      return "a classifier approves routine actions; the rest still ask you";
+    case "acceptEdits":
+      return "file edits and common filesystem commands go through without asking";
+    case "dontAsk":
+      return "nothing is asked: anything not already allowed is denied";
+    case "plan":
+      return "read-only planning; no tool may change anything";
+    default:
+      return "every action outside the allowlist asks you";
+  }
+}
+
 export interface ClaudeArgsOptions {
   /** Rendered orchestrator prompt, handed to --append-system-prompt-file. */
   promptFile: string;
@@ -30,6 +52,8 @@ export interface ClaudeArgsOptions {
   maxBudgetUsd?: number | null;
   allowedTools?: string[];
   disallowedTools?: string[];
+  /** Starting permission mode; without one claude uses its own default for -p. */
+  permissionMode?: string | null;
 }
 
 /** The exact argv for the orchestrator child (`claude` itself is the command). */
@@ -46,6 +70,7 @@ export function buildClaudeArgs(o: ClaudeArgsOptions): string[] {
     "--mcp-config", o.mcpConfigJson,
     "--strict-mcp-config",
   ];
+  if (o.permissionMode) args.push("--permission-mode", o.permissionMode);
   if (o.model) args.push("--model", o.model);
   if (o.effort) args.push("--effort", o.effort);
   if (o.resumeSessionId) args.push("--resume", o.resumeSessionId);

@@ -85,6 +85,12 @@ test("StatusLine shows the selected session: the worker's own model, or the orch
   assert.match(statusText({ ...orchestrator, session: { ...orchestrator.session, state: "idle" }, numTurns: 1 }), /1 turn · tab switch/);
   assert.match(statusText({ ...orchestrator, session: { ...orchestrator.session, model: null }, sessionId: null }), /^starting… · no session/);
   assert.match(statusText({ ...orchestrator, pendingApprovals: 2 }), /2 approvals pending/);
+  // the permission mode is only worth a mention when it is not the asking-about-everything one
+  assert.equal(statusText({ ...orchestrator, session: { ...orchestrator.session, permissionMode: "default" } }).includes("perms"), false);
+  assert.match(
+    statusText({ ...orchestrator, session: { ...orchestrator.session, permissionMode: "auto" } }),
+    /perms auto/,
+  );
 
   // a worker is selected: its model is the one that matters, not the orchestrator's
   const worker = {

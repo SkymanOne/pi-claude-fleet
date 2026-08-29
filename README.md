@@ -60,6 +60,7 @@ The composer at the bottom sends to whatever is selected. With the orchestrator 
 | `/stop` | `/s` | `ctrl+x` | aborts it |
 | `/remove` | `/rm` | `ctrl+r` | removes it: worktree, branch and rail row (asks first if that would destroy work) |
 | `/thinking <level>` | `/t` | `ctrl+t` | set the reasoning level: pi's `off…max` for a worker, claude's `low…max` for the orchestrator |
+| `/permissions <mode>` | `/p` | `ctrl+o` | how the orchestrator's tool use is approved; with no argument it says what is in force |
 | `/help` | `/h` | `ctrl+g` | keys and commands |
 | `/quit` | `/q` | `ctrl+d` | leave the console; workers keep running |
 | `/shutdown` | `/sd` | `ctrl+k` | stop the orchestrator and every worker, then exit (asks first; worktrees and branches are kept) |
@@ -70,6 +71,8 @@ The list is not only the console's own commands: it also carries whatever the ag
 
 When the orchestrator wants to run something outside its allowlist, or asks you a question, an overlay appears: `y` allows once, `a` allows it for the session, `n` denies with a reason, and questions get an option picker.
 
+How often that happens is up to you. `/permissions auto` hands routine approvals to a classifier and only escalates what it is unsure about; `acceptEdits` lets file edits and common filesystem commands through; `dontAsk` denies anything not already allowed instead of asking; `plan` makes the orchestrator read-only. `default` asks about everything outside the allowlist. Start in a mode with `pi-fleet --permission-mode auto`; the mode is shown in the status line whenever it is not the default, survives a console restart, and `bypassPermissions` is deliberately not offered — it would skip the overlay altogether.
+
 The transcript separates the parts of a turn: your prompts in cyan, the model's reasoning dimmed and abridged, its answer as rendered markdown (headings, emphasis, inline code, lists, links and tables laid out in columns), tool calls in blue with their results dimmed under them, and fleet events in yellow — each block set off by a blank line.
 
 Workers disappear from the rail when they are done: the orchestrator removes each one after it merges and verifies it, and the console removes any settled worker whose branch is already merged. Nothing unmerged, dirty or still running is ever removed for you — that waits for `/remove`, which tells you exactly what would be lost before it does anything.
@@ -78,7 +81,7 @@ Quitting closes the console, nothing else. The orchestrator and its workers are 
 
 `/shutdown` is the other exit: it stops the orchestrator and every worker, after telling you how many are running. Worktrees and branches are kept.
 
-Options: `--cwd <dir>`, `--model <model>`, `--fresh`, `--budget <usd>`, `--progress-events` (forward workers' progress notes to the orchestrator, off by default because they are chatty).
+Options: `--cwd <dir>`, `--model <model>`, `--permission-mode <mode>`, `--fresh`, `--budget <usd>`, `--progress-events` (forward workers' progress notes to the orchestrator, off by default because they are chatty).
 
 ## What the orchestrator can and cannot do
 

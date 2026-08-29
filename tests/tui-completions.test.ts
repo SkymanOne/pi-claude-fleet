@@ -38,12 +38,12 @@ test("rank puts prefix matches before substring matches", () => {
 
 test("slash commands complete, and worker-only ones are hidden from the orchestrator", () => {
   const all = completionsFor("/", ctx())!;
-  assert.deepEqual(all.items.map((i) => i.label), ["/answer", "/followup", "/stop", "/remove", "/thinking", "/help", "/quit", "/shutdown"]);
+  assert.deepEqual(all.items.map((i) => i.label), ["/answer", "/followup", "/stop", "/remove", "/thinking", "/permissions", "/help", "/quit", "/shutdown"]);
   assert.equal(all.start, 0);
   assert.ok(all.items[0].detail?.includes("ctrl+a"), "the shortcut is advertised");
 
   const orchestrator = completionsFor("/", ctx({ target: "orchestrator" }))!;
-  assert.deepEqual(orchestrator.items.map((i) => i.label), ["/thinking", "/help", "/quit", "/shutdown"]);
+  assert.deepEqual(orchestrator.items.map((i) => i.label), ["/thinking", "/permissions", "/help", "/quit", "/shutdown"]);
 
   const filtered = completionsFor("/an", ctx())!;
   assert.deepEqual(filtered.items.map((i) => i.label), ["/answer"]);
@@ -77,6 +77,7 @@ test("the list is capped", () => {
   const many = Array.from({ length: 40 }, (_, i) => `src/file${i}.ts`);
   const capped = completionsFor("@src", ctx({ files: many, workers: [] }))!;
   assert.equal(capped.items.length, MAX_SUGGESTIONS);
+  assert.ok(MAX_SUGGESTIONS >= COMMANDS.length, "the console's own commands always fit");
 });
 
 test("every command has a distinct ctrl shortcut", () => {
@@ -92,6 +93,7 @@ test("every command has a distinct ctrl shortcut", () => {
   assert.equal(SHORTCUTS.a.takesArgument, true);
   assert.equal(SHORTCUTS.k.name, "/shutdown");
   assert.equal(SHORTCUTS.t.name, "/thinking");
+  assert.equal(SHORTCUTS.o.name, "/permissions");
 });
 
 test("the agent's own commands and skills are offered alongside the console's", () => {
@@ -102,8 +104,8 @@ test("the agent's own commands and skills are offered alongside the console's", 
       { name: "research", description: "Research a topic" },
     ],
   }))!;
-  assert.deepEqual(claude.items.map((i) => i.label), ["/thinking", "/help", "/quit", "/shutdown", "/model", "/research"]);
-  assert.deepEqual(claude.items.map((i) => i.kind), ["command", "command", "command", "command", "agent", "agent"]);
+  assert.deepEqual(claude.items.map((i) => i.label), ["/thinking", "/permissions", "/help", "/quit", "/shutdown", "/model", "/research"]);
+  assert.deepEqual(claude.items.map((i) => i.kind), ["command", "command", "command", "command", "command", "agent", "agent"]);
   const model = claude.items.find((i) => i.label === "/model")!;
   assert.equal(model.value, "/model ", "one that takes an argument leaves the cursor after a space");
   assert.equal(claude.items.find((i) => i.label === "/research")!.value, "/research");
@@ -121,6 +123,7 @@ test("the agent's own commands and skills are offered alongside the console's", 
   // ours still win the ordering, and an agent command never shadows one of ours
   const both = completionsFor("/s", ctx({ agentCommands: [{ name: "session-name", description: "x", source: "extension" }] }))!;
   assert.deepEqual(both.items.map((i) => i.label), ["/stop", "/shutdown", "/session-name"]);
+  assert.deepEqual(completionsFor("/p", ctx())!.items.map((i) => i.label), ["/permissions"]);
   assert.equal(completionsFor("/", ctx({ agentCommands: [] }))!.items.every((i) => i.kind === "command"), true);
 });
 
@@ -133,13 +136,15 @@ test("commands answer to short aliases, and completing one offers the long form"
   assert.equal(resolveCommand("/a")!.name, "/answer");
   assert.equal(resolveCommand("/sd")!.name, "/shutdown");
   assert.equal(resolveCommand("/t")!.name, "/thinking");
+  assert.equal(resolveCommand("/p")!.name, "/permissions");
+  assert.equal(resolveCommand("/perm")!.name, "/permissions");
   assert.equal(resolveCommand("/QUIT")!.name, "/quit", "case does not matter");
   assert.equal(resolveCommand("/nope"), null);
   assert.equal(resolveCommand("quit"), null, "the slash is part of it");
 
   const aliases = COMMANDS.flatMap((c) => c.aliases ?? []);
   assert.equal(new Set(aliases).size, aliases.length, "aliases are unique");
-  for (const alias of aliases) assert.match(alias, /^\/[a-z?]{1,2}$/);
+  for (const alias of aliases) assert.match(alias, /^\/[a-z?]{1,4}$/);
 
   const q = completionsFor("/q", ctx())!;
   assert.deepEqual(q.items.map((i) => i.label), ["/quit"]);

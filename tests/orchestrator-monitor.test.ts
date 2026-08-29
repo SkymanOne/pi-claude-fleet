@@ -11,7 +11,7 @@ import { fakeClaudeEnv, tmpDir, waitFor } from "./helpers.js";
 
 /** The monitor is a detached child, so its fake-claude knobs travel through this process's env. */
 function useFakeClaude(over: Record<string, string> = {}): () => void {
-  const keys = ["PI_FLEET_DEV", "PI_FLEET_CLAUDE_BIN", "PI_FLEET_PI_BIN", "FAKE_CLAUDE_STDIN_LOG", "FAKE_CLAUDE_SESSION_ID"];
+  const keys = ["PI_FLEET_DEV", "PI_FLEET_CLAUDE_BIN", "PI_FLEET_PI_BIN", "FAKE_CLAUDE_STDIN_LOG", "FAKE_CLAUDE_SESSION_ID", "FAKE_CLAUDE_ARGV_FILE"];
   const saved: Record<string, string | undefined> = {};
   for (const key of keys) saved[key] = process.env[key];
   const env = fakeClaudeEnv(over);
@@ -35,6 +35,7 @@ interface Fixture {
 
 function fixture(over: Record<string, string> = {}): Fixture {
   const cwd = tmpDir("pf-orch-");
+  over = { FAKE_CLAUDE_ARGV_FILE: path.join(cwd, "argv.json"), ...over };
   const piFleetDir = path.join(cwd, ".pi-fleet");
   const paths = orchestratorPaths(piFleetDir);
   fs.mkdirSync(paths.dir, { recursive: true });
@@ -124,6 +125,42 @@ test("a permission request waits in the state until some console answers it", as
     await next.allow(pending.requestId);
     await waitFor(() => (records.some((r) => r.type === "result") ? true : undefined), { timeoutMs: 20_000 });
     assert.deepEqual(loadOrchestratorState(f.piFleetDir)!.pendingRequests, [], "answered questions are cleared");
+    next.stop();
+  } finally {
+    await stopMonitor(f);
+    f.restore();
+  }
+}, { timeout: 90_000 });
+
+test("the permission mode is set at launch, changed from a console, and kept across a restart", async () => {
+  const f = fixture();
+  const c = new OrchestratorClient({ piFleetDir: f.piFleetDir, cwd: f.cwd, fresh: true, permissionMode: "auto", pollMs: 30 });
+  try {
+    c.start();
+    await waitFor(() => (c.running() ? true : undefined), { timeoutMs: 20_000 });
+    await waitFor(() => (loadOrchestratorState(f.piFleetDir)?.permissionMode === "auto" ? true : undefined), { timeoutMs: 10_000 });
+    const argv: string[] = JSON.parse(fs.readFileSync(path.join(f.cwd, "argv.json"), "utf8"));
+    assert.equal(argv[argv.indexOf("--permission-mode") + 1], "auto", "claude was started in that mode");
+
+    const records: Record<string, unknown>[] = [];
+    c.on("record", (r) => records.push(r));
+    await c.setPermissionMode("acceptEdits");
+    await waitFor(() => (loadOrchestratorState(f.piFleetDir)?.permissionMode === "acceptEdits" ? true : undefined), { timeoutMs: 10_000 });
+    assert.ok(
+      records.some((r) => r.type === "notice" && String(r.text).includes("acceptEdits")),
+      "the change is reported in the transcript",
+    );
+    c.stop();
+
+    // a console that has to start a fresh monitor keeps the mode the last one was in
+    const pid = loadOrchestratorState(f.piFleetDir)!.pid!;
+    process.kill(pid, "SIGTERM");
+    await waitFor(() => (!isAlive(pid) ? true : undefined), { timeoutMs: 10_000 });
+    const next = new OrchestratorClient({ piFleetDir: f.piFleetDir, cwd: f.cwd, pollMs: 30 });
+    next.start();
+    await waitFor(() => (next.running() ? true : undefined), { timeoutMs: 20_000 });
+    const restarted: string[] = JSON.parse(fs.readFileSync(path.join(f.cwd, "argv.json"), "utf8"));
+    assert.equal(restarted[restarted.indexOf("--permission-mode") + 1], "acceptEdits");
     next.stop();
   } finally {
     await stopMonitor(f);

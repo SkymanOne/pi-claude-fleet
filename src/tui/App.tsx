@@ -20,6 +20,7 @@ import { Suggestions } from "./Suggestions.js";
 import { Approval } from "./Approval.js";
 import { Confirm } from "./Confirm.js";
 import { helpText, HINT } from "./keys.js";
+import { PERMISSION_MODES, describePermissionMode } from "../orchestrator/args.js";
 import { transcriptRows, CHROME_BASE } from "./layout.js";
 import { formatAge } from "../util.js";
 import {
@@ -423,6 +424,30 @@ export function App({
       return;
     }
     // the orchestrator has no worker mailbox: its reasoning level is claude's own /effort
+    if (global?.name === "/permissions") {
+      const mode = text.split(/\s+/).slice(1).join(" ").trim();
+      if (!mode) {
+        const current = client.state?.permissionMode ?? "default";
+        notice(
+          `· permissions: ${current} — ${describePermissionMode(current)}. Set one of ${PERMISSION_MODES.join(", ")}`,
+        );
+        return;
+      }
+      if (!(PERMISSION_MODES as readonly string[]).includes(mode)) {
+        notice(
+          mode === "bypassPermissions"
+            ? "! bypassPermissions is not offered here: it would skip the approval overlay entirely"
+            : `! usage: /permissions <${PERMISSION_MODES.join("|")}>`,
+          true,
+        );
+        return;
+      }
+      void client
+        .setPermissionMode(mode)
+        .then(() => notice(`· permissions → ${mode}: ${describePermissionMode(mode)}`))
+        .catch(() => notice("! orchestrator is not running", true));
+      return;
+    }
     if (global?.name === "/thinking" && target?.kind !== "worker") {
       const level = text.split(/\s+/).slice(1).join(" ").trim().toLowerCase();
       if (!CLAUDE_EFFORT_LEVELS.includes(level)) {
@@ -699,6 +724,7 @@ export function App({
                   state: view.turnActive ? "working" : "idle",
                   model: view.model,
                   thinking: effort,
+                  permissionMode: client.state?.permissionMode ?? null,
                 }
           }
           sessionId={view.sessionId}
