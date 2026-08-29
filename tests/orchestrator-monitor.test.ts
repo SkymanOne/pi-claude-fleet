@@ -53,7 +53,16 @@ async function stopMonitor(f: Fixture): Promise<void> {
   } catch {
     // already gone
   }
+  // both the process and its last state write must be done, or the next client
+  // sees a live pid and thinks there is something to attach to
   await waitFor(() => (!isAlive(state.pid) ? true : undefined), { timeoutMs: 10_000 }).catch(() => undefined);
+  await waitFor(
+    () => {
+      const now = loadOrchestratorState(f.piFleetDir);
+      return !now?.pid || !isAlive(now.pid) ? true : undefined;
+    },
+    { timeoutMs: 10_000 },
+  ).catch(() => undefined);
 }
 
 test("the monitor owns the claude session; the console attaches, detaches and reattaches", async () => {
@@ -162,6 +171,60 @@ test("the permission mode is set at launch, changed from a console, and kept acr
     const restarted: string[] = JSON.parse(fs.readFileSync(path.join(f.cwd, "argv.json"), "utf8"));
     assert.equal(restarted[restarted.indexOf("--permission-mode") + 1], "acceptEdits");
     next.stop();
+  } finally {
+    await stopMonitor(f);
+    f.restore();
+  }
+}, { timeout: 90_000 });
+
+test("a restarted orchestrator keeps the conversation; --fresh is what clears it", async () => {
+  const f = fixture({ FAKE_CLAUDE_SESSION_ID: "sess-restore1" });
+  try {
+    const first = client(f);
+    first.start();
+    await waitFor(() => (first.running() ? true : undefined), { timeoutMs: 20_000 });
+    const said: Record<string, unknown>[] = [];
+    first.on("record", (r) => said.push(r));
+    await first.send("remember this");
+    await waitFor(() => (said.some((r) => r.type === "result") ? true : undefined), { timeoutMs: 20_000 });
+    first.stop();
+
+    // the monitor dies (a reboot, a kill, /shutdown): the console must still
+    // come back to the same conversation
+    await stopMonitor(f);
+
+    const restored: Record<string, unknown>[] = [];
+    const second = client(f, false);
+    second.on("record", (r) => restored.push(r));
+    assert.equal(second.start().attached, false, "there was nothing alive to attach to");
+    await waitFor(() => (second.running() ? true : undefined), { timeoutMs: 20_000 });
+    const replayedUser = restored.filter(
+      (r) => r.type === "user" && JSON.stringify((r as { message?: unknown }).message).includes("remember this"),
+    );
+    assert.equal(replayedUser.length, 1, "what was said before is replayed");
+    assert.ok(
+      restored.some((r) => r.type === "notice" && String(r.text).includes("resumed the orchestrator session")),
+      "and the transcript says where the seam is",
+    );
+    const argv: string[] = JSON.parse(fs.readFileSync(path.join(f.cwd, "argv.json"), "utf8"));
+    assert.equal(argv[argv.indexOf("--resume") + 1], "sess-restore1", "claude resumes the same session");
+    second.stop();
+    await stopMonitor(f);
+
+    // --fresh is the way to start over
+    const third = client(f, true);
+    const fromScratch: Record<string, unknown>[] = [];
+    third.on("record", (r) => fromScratch.push(r));
+    third.start();
+    await waitFor(() => (third.running() ? true : undefined), { timeoutMs: 20_000 });
+    assert.equal(
+      fromScratch.some((r) => JSON.stringify(r).includes("remember this")),
+      false,
+      "a fresh session starts with an empty transcript",
+    );
+    const freshArgv: string[] = JSON.parse(fs.readFileSync(path.join(f.cwd, "argv.json"), "utf8"));
+    assert.equal(freshArgv.includes("--resume"), false);
+    third.stop();
   } finally {
     await stopMonitor(f);
     f.restore();

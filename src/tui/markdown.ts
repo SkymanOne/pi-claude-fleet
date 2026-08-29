@@ -18,7 +18,19 @@ export interface MdLine {
   spans: Span[];
 }
 
-const INLINE = /(\*\*|__)(?=\S)([\s\S]*?\S)\1|(\*|_)(?=\S)([\s\S]*?\S)\3|`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)\)/;
+/**
+ * Bold, italics, inline code and links. Emphasis markers only count at a word
+ * boundary, so a path like `src/tui/*` keeps its asterisk instead of opening an
+ * italic run that swallows the rest of the line.
+ */
+const INLINE = new RegExp(
+  [
+    "(?<strong>\\*\\*|__)(?=\\S)(?<strongText>[\\s\\S]*?\\S)\\k<strong>",
+    "(?<=^|[\\s([{\"'])(?<em>[*_])(?=\\S)(?<emText>[^*_]*?\\S)\\k<em>(?=$|[\\s)\\]}\"'.,;:!?])",
+    "`(?<code>[^`]+)`",
+    "\\[(?<link>[^\\]]+)\\]\\((?<href>[^)\\s]+)\\)",
+  ].join("|"),
+);
 
 /** Split one line into styled spans. Unmatched text stays plain. */
 export function parseInline(text: string): Span[] {
@@ -28,10 +40,11 @@ export function parseInline(text: string): Span[] {
     const m = INLINE.exec(rest);
     if (!m || m.index === undefined) break;
     if (m.index > 0) spans.push({ text: rest.slice(0, m.index) });
-    if (m[2] !== undefined) spans.push({ text: m[2], bold: true });
-    else if (m[4] !== undefined) spans.push({ text: m[4], italic: true });
-    else if (m[5] !== undefined) spans.push({ text: m[5], code: true });
-    else if (m[6] !== undefined) spans.push({ text: m[6], link: true });
+    const g = m.groups ?? {};
+    if (g.strongText !== undefined) spans.push({ text: g.strongText, bold: true });
+    else if (g.emText !== undefined) spans.push({ text: g.emText, italic: true });
+    else if (g.code !== undefined) spans.push({ text: g.code, code: true });
+    else if (g.link !== undefined) spans.push({ text: g.link, link: true });
     rest = rest.slice(m.index + m[0].length);
   }
   if (rest.length > 0) spans.push({ text: rest });
@@ -49,55 +62,101 @@ function cellsOf(line: string): string[] {
 }
 
 interface Cell {
-  spans: Span[];
-  /** Printed width, i.e. after the markdown syntax is gone — what padding must use. */
+  /** One entry per wrapped line; each is the styled content of that line. */
+  lines: Span[][];
+  /** Printed width of the widest line, i.e. after the markdown syntax is gone. */
   width: number;
 }
 
-/** One cell's styled spans, clipped to MAX_CELL printed characters. */
-function renderCell(text: string, bold: boolean): Cell {
-  const spans: Span[] = [];
-  let width = 0;
-  for (const span of parseInline(text)) {
-    if (width >= MAX_CELL) break;
-    const room = MAX_CELL - width - 1;
-    const clipped = span.text.length > room ? `${span.text.slice(0, room)}…` : span.text;
-    spans.push(bold ? { ...span, text: clipped, bold: true } : { ...span, text: clipped });
-    width += clipped.length;
+/** Break a styled cell into lines of at most `max` printed characters, on word boundaries. */
+export function wrapSpans(spans: Span[], max: number): Span[][] {
+  const lines: Span[][] = [];
+  let line: Span[] = [];
+  let used = 0;
+  const push = (): void => {
+    lines.push(line.length > 0 ? line : [{ text: "" }]);
+    line = [];
+    used = 0;
+  };
+  for (const span of spans) {
+    // words carry their trailing space so a wrap point is easy to find
+    const words = span.text.match(/\S+\s*|\s+/g) ?? [];
+    for (const word of words) {
+      const trimmed = word.trimEnd();
+      if (used > 0 && used + trimmed.length > max) push();
+      if (trimmed.length > max) {
+        // a single word longer than the column: break it rather than lose it
+        let rest = word;
+        while (rest.length > max) {
+          line.push({ ...span, text: rest.slice(0, max) });
+          rest = rest.slice(max);
+          used = max;
+          push();
+        }
+        if (rest.length > 0) {
+          line.push({ ...span, text: rest });
+          used += rest.length;
+        }
+        continue;
+      }
+      if (used === 0 && /^\s+$/.test(word)) continue; // no leading space on a fresh line
+      line.push({ ...span, text: word });
+      used += word.length;
+    }
   }
-  return { spans: spans.length > 0 ? spans : [{ text: "" }], width };
+  if (line.length > 0 || lines.length === 0) push();
+  // trailing spaces are padding's business, not content's
+  return lines.map((l) => l.map((sp, i) => (i === l.length - 1 ? { ...sp, text: sp.text.trimEnd() } : sp)));
+}
+
+const printed = (spans: Span[]): number => spans.reduce((n, sp) => n + sp.text.length, 0);
+
+/** One cell's styled spans, wrapped to MAX_CELL printed characters — never truncated. */
+function renderCell(text: string, bold: boolean): Cell {
+  const spans = parseInline(text).map((sp) => (bold ? { ...sp, bold: true } : sp));
+  const lines = wrapSpans(spans, MAX_CELL);
+  return { lines, width: Math.max(...lines.map(printed), 0) };
 }
 
 /**
- * A markdown table as aligned rows. Cells keep their inline styling, columns are
- * padded to the widest printed cell, and the header gets a rule under it.
+ * A markdown table as aligned rows. Cells keep their inline styling and wrap
+ * onto as many lines as they need, so nothing is cut; columns are padded to
+ * the widest printed line and the header gets a rule under it.
  */
 export function renderTable(rows: string[][], header: boolean): MdLine[] {
   const columns = Math.max(...rows.map((r) => r.length));
-  const cells = rows.map((row, i) => Array.from({ length: columns }, (_, c) => renderCell(row[c] ?? "", header && i === 0)));
+  const cells = rows.map((row, i) =>
+    Array.from({ length: columns }, (_, c) => renderCell(row[c] ?? "", header && i === 0)),
+  );
   const widths = Array.from({ length: columns }, (_, c) => Math.max(...cells.map((row) => row[c].width), 1));
   const out: MdLine[] = [];
   cells.forEach((row, i) => {
     const isHeader = header && i === 0;
-    const spans: Span[] = [];
-    row.forEach((cell, c) => {
-      spans.push(...cell.spans);
-      const gap = widths[c] - cell.width;
-      if (gap > 0) spans.push({ text: " ".repeat(gap) });
-      if (c < columns - 1) spans.push({ text: " │ " });
-    });
-    out.push({ kind: isHeader ? "table-header" : "table", spans });
-    if (isHeader) out.push({ kind: "table-rule", spans: [{ text: widths.map((w) => "─".repeat(w)).join("─┼─") }] });
+    const height = Math.max(...row.map((cell) => cell.lines.length));
+    for (let line = 0; line < height; line++) {
+      const spans: Span[] = [];
+      row.forEach((cell, c) => {
+        const content = cell.lines[line] ?? [{ text: "" }];
+        spans.push(...content);
+        const gap = widths[c] - printed(content);
+        if (gap > 0) spans.push({ text: " ".repeat(gap) });
+        if (c < columns - 1) spans.push({ text: " │ " });
+      });
+      out.push({ kind: isHeader ? "table-header" : "table", spans });
+    }
+    if (isHeader) {
+      out.push({ kind: "table-rule", spans: [{ text: widths.map((w) => "─".repeat(w)).join("─┼─") }] });
+    }
   });
   return out;
 }
+
 const HEADING = /^(#{1,6})\s+(.*)$/;
 const BULLET = /^(\s*)[-*+]\s+(.*)$/;
 const NUMBERED = /^(\s*)(\d+[.)])\s+(.*)$/;
 const QUOTE = /^\s*>\s?(.*)$/;
 const RULE = /^\s*(-{3,}|\*{3,}|_{3,})\s*$/;
 
-/** One markdown block (an assistant message, say) as renderable lines. */
 /** Kinds that read as one group; a change between groups earns a blank line. */
 function group(kind: MdLineKind): string {
   if (kind === "table" || kind === "table-header" || kind === "table-rule") return "table";

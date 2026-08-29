@@ -9,6 +9,7 @@ import {
   deriveView,
   modelLabel,
   TERMINAL_STATES,
+  THINKING_LEVELS,
   type RunState,
 } from "../state.js";
 import { Rail } from "./Rail.js";
@@ -68,6 +69,12 @@ type Dispatchable = ClaudeStreamMessage | LocalEvent;
 const TERMINAL_VIEWS: string[] = [...TERMINAL_STATES];
 /** What claude's own /effort accepts. */
 const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+
+/** The next level in a list, wrapping; an unknown current level starts at the front. */
+export function nextLevel(levels: readonly string[], current: string | null): string {
+  const at = current ? levels.indexOf(current) : -1;
+  return levels[(at + 1) % levels.length];
+}
 
 /** reduceOrchestrator mutates; spreading gives React a new reference to render. */
 const reducer = (
@@ -365,6 +372,10 @@ export function App({
     if (key.ctrl && SHORTCUTS[ch]) {
       const spec = SHORTCUTS[ch];
       swallowNextChange.current = true;
+      if (spec.cycles) {
+        cycleThinking();
+        return;
+      }
       if (spec.takesArgument) {
         if (target?.kind !== "worker") {
           notice(`! ${spec.name} needs a worker selected (tab switches)`, true);
@@ -513,6 +524,40 @@ export function App({
       }
     }
     run(value);
+  };
+
+  /**
+   * ctrl+t: step the session that is open to its next reasoning level. The two
+   * sides are independent — a worker cycles pi's levels through its own
+   * mailbox, the orchestrator cycles claude's effort.
+   */
+  const cycleThinking = (): void => {
+    if (target?.kind === "worker") {
+      const run = currentRun;
+      if (!run) {
+        notice("! that worker is gone", true);
+        return;
+      }
+      const next = nextLevel(THINKING_LEVELS, run.state.thinkingLevel ?? null);
+      void workerCommand({
+        runDir: run.runDir,
+        state: run.state,
+        input: `/thinking ${next}`,
+        piFleetDir: watcher.piFleetDir,
+        runId: run.runId,
+      })
+        .then((r) => notice(r.notice, r.error))
+        .catch((err: unknown) =>
+          notice(`! ${err instanceof Error ? err.message : String(err)}`, true),
+        );
+      return;
+    }
+    const next = nextLevel(CLAUDE_EFFORT_LEVELS, effort);
+    setEffort(next);
+    dispatch({ type: "sent", text: `/effort ${next}`, display: `/thinking ${next}` });
+    void client
+      .setEffort(next)
+      .catch(() => notice("! orchestrator is not running", true));
   };
 
   /** Stop everything — the orchestrator and every worker — and leave. */

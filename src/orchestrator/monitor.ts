@@ -56,13 +56,20 @@ export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Pro
   const session = (args.fresh ? null : loadSession(args.piFleetDir)) ?? newSession(args.cwd);
 
   let dirty = false;
+  // Writes are serialized: two concurrent atomic writes can land out of order,
+  // and an older one winning would drop things the console needs to see — a
+  // permission request waiting for an answer, say.
+  let writeChain: Promise<void> = Promise.resolve();
   const writeState = (): void => {
     dirty = false;
-    try {
-      void atomicWriteJson(paths.state, state);
-    } catch {
-      dirty = true;
-    }
+    const snapshot = JSON.parse(JSON.stringify(state)) as OrchestratorState;
+    writeChain = writeChain.then(async () => {
+      try {
+        await atomicWriteJson(paths.state, snapshot);
+      } catch {
+        dirty = true; // the periodic flush will try again
+      }
+    });
   };
   const writeEvent = (event: OrchestratorEvent): void => {
     try {
@@ -158,6 +165,14 @@ export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Pro
   proc.start();
   state.pid = process.pid;
   writeState();
+  writeEvent({
+    type: "notice",
+    text: args.fresh
+      ? "· new orchestrator session"
+      : session.sessionId
+        ? `· resumed the orchestrator session ${session.sessionId.slice(0, 8)}`
+        : "· orchestrator started",
+  });
 
   // What the console shows as "thinking…" is derived here, so it survives a reattach.
   const activityTimer = setInterval(() => {
@@ -243,6 +258,7 @@ export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Pro
   process.on("SIGINT", onSignal);
 
   await exited;
+  await writeChain;
   clearInterval(activityTimer);
   clearInterval(flusher);
   clearInterval(controlTimer);
@@ -251,6 +267,7 @@ export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Pro
   session.pid = null;
   await saveSession(args.piFleetDir, session);
   writeState();
+  await writeChain;
   return 0;
 }
 

@@ -38,6 +38,8 @@ export interface CommandSpec {
   shortcut?: string;
   /** Short forms, e.g. `/q` for `/quit`. */
   aliases?: string[];
+  /** Its shortcut steps through the options rather than prefilling the command. */
+  cycles?: boolean;
 }
 
 export const COMMANDS: CommandSpec[] = [
@@ -73,9 +75,11 @@ export const COMMANDS: CommandSpec[] = [
   },
   {
     name: "/thinking",
-    detail: "set the reasoning level of the selected session",
+    detail: "set the reasoning level of the selected session (ctrl+t cycles it)",
     takesArgument: true,
     shortcut: "ctrl+t",
+    /** ctrl+t steps to the next level instead of prefilling the command. */
+    cycles: true,
     aliases: ["/t"],
   },
   {

@@ -59,7 +59,7 @@ The composer at the bottom sends to whatever is selected. With the orchestrator 
 | `/followup <text>` | `/f` | `ctrl+f` | queues a message for when it finishes its current work |
 | `/stop` | `/s` | `ctrl+x` | aborts it |
 | `/remove` | `/rm` | `ctrl+r` | removes it: worktree, branch and rail row (asks first if that would destroy work) |
-| `/thinking <level>` | `/t` | `ctrl+t` | set the reasoning level: pi's `off…max` for a worker, claude's `low…max` for the orchestrator |
+| `/thinking <level>` | `/t` | `ctrl+t` | set the reasoning level of the open session — pi's `off…max` for a worker, claude's `low…max` for the orchestrator. The key steps to the next level, and each session keeps its own |
 | `/permissions <mode>` | `/p` | `ctrl+o` | how the orchestrator's tool use is approved; with no argument it says what is in force |
 | `/help` | `/h` | `ctrl+g` | keys and commands |
 | `/quit` | `/q` | `ctrl+d` | leave the console; workers keep running |
@@ -77,7 +77,9 @@ The transcript separates the parts of a turn: your prompts in cyan, the model's 
 
 Workers disappear from the rail when they are done: the orchestrator removes each one after it merges and verifies it, and the console removes any settled worker whose branch is already merged. Nothing unmerged, dirty or still running is ever removed for you — that waits for `/remove`, which tells you exactly what would be lost before it does anything.
 
-Quitting closes the console, nothing else. The orchestrator and its workers are detached processes with their state on disk, so `pi-fleet` reopens where you left off: the same claude session, still mid-thought if it was working, with its transcript replayed. A permission prompt raised while no console was open is still waiting for you when you return. `--fresh` starts a new orchestrator instead of attaching.
+Quitting closes the console, nothing else. Reopening restores the conversation: if the orchestrator is still running you attach to it live, and if it is not — after a reboot, or a `/shutdown` — a new one resumes the same claude session under the transcript you already had, with a line marking the seam. `--fresh` is the way to start over.
+
+The orchestrator and its workers are detached processes with their state on disk, so `pi-fleet` reopens where you left off: the same claude session, still mid-thought if it was working, with its transcript replayed. A permission prompt raised while no console was open is still waiting for you when you return. `--fresh` starts a new orchestrator instead of attaching.
 
 `/shutdown` is the other exit: it stops the orchestrator and every worker, after telling you how many are running. Worktrees and branches are kept.
 

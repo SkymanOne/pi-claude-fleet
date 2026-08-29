@@ -21,6 +21,9 @@ export interface OrchestratorClientEvents {
   exit: [{ code: number | null; signal: string | null }];
 }
 
+/** How much of an old transcript is carried into a restarted session. */
+export const MAX_RESTORED_LINES = 2000;
+
 export interface OrchestratorClientOptions {
   piFleetDir: string;
   cwd: string;
@@ -60,13 +63,23 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
     fs.mkdirSync(paths.dir, { recursive: true });
     const attached = this.running() && !this.options.fresh;
     if (!attached) {
-      if (this.options.fresh || !this.running()) {
+      if (this.options.fresh) {
+        // only --fresh throws the conversation away; otherwise the transcript is
+        // the history, and the monitor resumes the same claude session under it
         try {
           fs.rmSync(paths.events, { force: true });
           fs.rmSync(paths.control, { force: true });
         } catch {
-          // a fresh start is best effort
+          // best effort
         }
+      } else {
+        // a control file from a dead monitor would be replayed by the new one
+        try {
+          fs.rmSync(paths.control, { force: true });
+        } catch {
+          // best effort
+        }
+        this.trimTranscript(paths.events);
       }
       this.spawnMonitor();
     }
@@ -117,6 +130,18 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
   private async respond(requestId: string, decision: PermissionDecisionRecord): Promise<void> {
     this.announced.add(requestId);
     await appendOrchestratorControl(this.piFleetDir, { type: "permission", requestId, decision });
+  }
+
+  /** Keep the transcript restorable without letting it grow forever. */
+  private trimTranscript(eventsPath: string): void {
+    try {
+      const raw = fs.readFileSync(eventsPath, "utf8");
+      const lines = raw.split("\n").filter((l) => l.length > 0);
+      if (lines.length <= MAX_RESTORED_LINES) return;
+      fs.writeFileSync(eventsPath, `${lines.slice(-MAX_RESTORED_LINES).join("\n")}\n`);
+    } catch {
+      // no transcript yet, or unreadable: nothing to trim
+    }
   }
 
   private spawnMonitor(): void {

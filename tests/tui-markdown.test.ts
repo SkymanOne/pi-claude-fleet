@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseInline, parseMarkdownBlock, oneLine } from "../src/tui/markdown.js";
+import { parseInline, parseMarkdownBlock, oneLine, wrapSpans, renderTable } from "../src/tui/markdown.js";
 
 const plain = (spans: { text: string }[]) => spans.map((s) => s.text).join("");
 
@@ -11,9 +11,12 @@ test("inline: bold, italic, code, and text that is none of those", () => {
   assert.deepEqual(parseInline("an *emphasis* here"), [{ text: "an " }, { text: "emphasis", italic: true }, { text: " here" }]);
   assert.deepEqual(parseInline("run `git status` now"), [{ text: "run " }, { text: "git status", code: true }, { text: " now" }]);
   assert.deepEqual(parseInline("**a** and `b`"), [{ text: "a", bold: true }, { text: " and " }, { text: "b", code: true }]);
-  // unmatched markers stay literal rather than eating the rest of the line
-  assert.equal(plain(parseInline("2 * 3 * 4 = 24")), "2 * 3 * 4 = 24");
-  assert.equal(plain(parseInline("a ** b")), "a ** b");
+  // markers only count at a word boundary, so paths and arithmetic survive
+  assert.deepEqual(parseInline("2 * 3 * 4 = 24"), [{ text: "2 * 3 * 4 = 24" }]);
+  assert.deepEqual(parseInline("a ** b"), [{ text: "a ** b" }]);
+  assert.deepEqual(parseInline("src/tui/*, src/mcp/* — both"), [{ text: "src/tui/*, src/mcp/* — both" }]);
+  assert.deepEqual(parseInline("snake_case_word here"), [{ text: "snake_case_word here" }]);
+  assert.deepEqual(parseInline("(*parenthesised*)"), [{ text: "(" }, { text: "parenthesised", italic: true }, { text: ")" }]);
 });
 
 test("blocks: headings, bullets, numbered items, quotes, rules, fenced code", () => {
@@ -83,4 +86,45 @@ test("oneLine flattens and bounds runaway tool output", () => {
   assert.equal(long.length, 200);
   assert.ok(long.endsWith("…"));
   assert.equal(oneLine("short", 200), "short");
+});
+
+test("table cells wrap instead of being cut, and columns stay aligned", () => {
+  const long = "src/orchestrator/*, src/mcp/* — claude subprocess, stdio MCP server, stream-json parsing";
+  const lines = parseMarkdownBlock(`| Run | Slice |\n|---|---|\n| review | ${long} |\n| tui | short |`);
+  const table = lines.filter((l) => l.kind === "table" || l.kind === "table-header");
+  const text = table.map((l) => l.spans.map((s) => s.text).join(""));
+
+  // every word of the long cell survives somewhere in the rendered rows
+  const rendered = text.join(" ").replace(/\s+/g, " ");
+  for (const word of long.split(/[\s,]+/)) assert.ok(rendered.includes(word), `lost "${word}"`);
+  assert.equal(rendered.includes("…"), false, "nothing is truncated");
+
+  // the long cell spans several rows, and the columns line up on every one
+  const widths = new Set(text.map((t) => t.indexOf("│")));
+  assert.equal(widths.size, 1, `the separator moved: ${[...widths].join(", ")}`);
+  assert.ok(text.length > 3, "the long cell wrapped onto extra lines");
+  assert.match(text[2], /^ +│/, "a continuation line leaves the first column blank");
+});
+
+test("wrapSpans breaks on words, keeps styling, and never loses a long word", () => {
+  const spans = [{ text: "hello brave " }, { text: "world", bold: true }];
+  assert.deepEqual(
+    wrapSpans(spans, 12).map((l) => l.map((s) => s.text).join("")),
+    ["hello brave", "world"],
+  );
+  assert.equal(wrapSpans(spans, 12)[1][0].bold, true, "styling survives the wrap");
+  assert.deepEqual(
+    wrapSpans([{ text: "supercalifragilistic" }], 8).map((l) => l.map((s) => s.text).join("")),
+    ["supercal", "ifragili", "stic"],
+    "a word longer than the column is broken rather than dropped",
+  );
+  assert.deepEqual(wrapSpans([{ text: "" }], 10), [[{ text: "" }]]);
+});
+
+test("renderTable pads ragged rows and rules the header", () => {
+  const lines = renderTable([["a", "b"], ["only one"]], true);
+  assert.deepEqual(lines.map((l) => l.kind), ["table-header", "table-rule", "table"]);
+  const header = lines[0].spans.map((s) => s.text).join("");
+  const body = lines[2].spans.map((s) => s.text).join("");
+  assert.equal(header.indexOf("│"), body.indexOf("│"), "a missing cell still holds its column");
 });

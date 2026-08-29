@@ -23,6 +23,7 @@ const DOWN = `${ESC}[B`;
 const UP = `${ESC}[A`;
 const CTRL_A = String.fromCharCode(1);
 const CTRL_G = String.fromCharCode(7);
+const CTRL_T = String.fromCharCode(20);
 const squash = (s: string): string => s.replace(/\s+/g, " ");
 
 interface Harness {
@@ -669,6 +670,51 @@ test("/permissions reports the mode, rejects nonsense, and sets auto", async () 
     );
     // and the status line says so, since it is no longer the default
     await frameMatching(app.lastFrame, /perms auto/);
+  } finally {
+    await teardown(h, app);
+  }
+}, { timeout: 60_000 });
+
+test("ctrl+t steps the reasoning level of the session that is open, each on its own levels", async () => {
+  const h = setup();
+  const { runDir } = await addRun(h.piFleetDir, "db", { thinkingLevel: "medium" });
+  const app = renderApp(h);
+  try {
+    // the orchestrator cycles claude's effort levels
+    await frameMatching(app.lastFrame, /orchestrator > /);
+    await press(app, CTRL_T);
+    await frameMatching(app.lastFrame, /> \/thinking low/);
+    await press(app, CTRL_T);
+    await frameMatching(app.lastFrame, /> \/thinking medium/);
+    assert.equal(
+      fs.existsSync(path.join(runDir, "control.jsonl")),
+      false,
+      "cycling the orchestrator does not touch a worker",
+    );
+
+    // the worker cycles pi's, from the level it reports
+    await press(app, "\t");
+    await frameMatching(app.lastFrame, /db \(running\) > /);
+    await press(app, CTRL_T);
+    await frameMatching(app.lastFrame, /db thinking level → high/);
+    const control = await waitFor(
+      () => {
+        try {
+          return fs.readFileSync(path.join(runDir, "control.jsonl"), "utf8").trim() || undefined;
+        } catch {
+          return undefined;
+        }
+      },
+      { timeoutMs: 10_000 },
+    );
+    const line = JSON.parse(control.split("\n")[0]);
+    assert.deepEqual([line.type, line.message, line.source], ["thinking", "high", "console"]);
+
+    // and back on the orchestrator, its own cycle carried on where it was
+    await press(app, "\t");
+    await frameMatching(app.lastFrame, /orchestrator > /);
+    await press(app, CTRL_T);
+    await frameMatching(app.lastFrame, /> \/thinking high/);
   } finally {
     await teardown(h, app);
   }
