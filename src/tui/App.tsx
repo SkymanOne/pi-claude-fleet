@@ -52,7 +52,8 @@ export interface AppProps {
   /** The console's handle on the detached orchestrator; it does not own that process. */
   client: OrchestratorClient;
   watcher: FleetWatcher;
-  onQuit: () => void;
+  /** `shutdown` means the fleet was stopped too, not just this console closed. */
+  onQuit: (reason?: "quit" | "shutdown") => void;
   /** Poll interval for the rail (the watcher has its own). */
   railPollMs?: number;
   /** How often to archive settled workers whose branch is already merged; 0 disables it. */
@@ -499,11 +500,11 @@ export function App({
             ? `■ stopping the orchestrator and ${stopped.join(", ")}`
             : "■ stopping the orchestrator",
         );
-        onQuit();
+        onQuit("shutdown");
       })
       .catch((err: unknown) => {
         notice(`! ${err instanceof Error ? err.message : String(err)}`, true);
-        onQuit();
+        onQuit("shutdown");
       });
   };
 

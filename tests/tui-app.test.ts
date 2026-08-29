@@ -32,7 +32,7 @@ interface Harness {
   piFleetDir: string;
   cwd: string;
   stdinLog: () => string;
-  quit: { called: number };
+  quit: { called: number; reason?: "quit" | "shutdown" };
 }
 
 /** The monitor is a detached child, so fake-claude's knobs travel through this process's env. */
@@ -90,7 +90,7 @@ function setup(over: Record<string, string> = {}): Harness {
         return "";
       }
     },
-    quit: { called: 0 },
+    quit: { called: 0 } as { called: number; reason?: "quit" | "shutdown" },
   };
 }
 
@@ -117,8 +117,9 @@ function renderApp(h: Harness) {
     React.createElement(App, {
       client: h.client,
       watcher: h.watcher,
-      onQuit: () => {
+      onQuit: (reason?: "quit" | "shutdown") => {
         h.quit.called += 1;
+        h.quit.reason = reason;
       },
       railPollMs: 30,
       reapMs: 0,

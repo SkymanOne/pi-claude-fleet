@@ -4,6 +4,8 @@ import { render } from "ink";
 import { resolveFleetDir } from "../spawn.js";
 import { BIN_NAME } from "../paths.js";
 import { OrchestratorClient } from "../orchestrator/client.js";
+import { loadOrchestratorState } from "../orchestrator/monitor.js";
+import { deriveStatus, isAlive, listRuns, loadStateSync, TERMINAL_STATES } from "../state.js";
 import { orchestratorPaths } from "../orchestrator/records.js";
 import { renderOrchestratorPrompt, DEFAULT_MAX_WORKERS } from "../orchestrator/prompt.js";
 import { loadSession, newSession, saveSession, type OrchestratorSession } from "../orchestrator/session.js";
@@ -98,9 +100,24 @@ export async function cmdTui(args: TuiArgs): Promise<number> {
   watcher.start({ snapshot: attached });
   if (attached) console.error("note: attaching to the orchestrator that is already running here");
 
-  const app = render(<App client={client} watcher={watcher} cwd={repoRoot ?? targetDir} onQuit={() => app.unmount()} />, {
-    exitOnCtrlC: true,
-  });
+  // how the console exited decides what is left running, and what we say about it
+  type ExitReason = "quit" | "shutdown";
+  // a holder rather than a plain let: the assignment happens in a callback, and
+  // TypeScript would otherwise narrow the variable to its initial value
+  const exit: { reason: ExitReason } = { reason: "quit" };
+
+  const app = render(
+    <App
+      client={client}
+      watcher={watcher}
+      cwd={repoRoot ?? targetDir}
+      onQuit={(reason: ExitReason | undefined) => {
+        exit.reason = reason ?? "quit";
+        app.unmount();
+      }}
+    />,
+    { exitOnCtrlC: true },
+  );
 
   try {
     await app.waitUntilExit();
@@ -110,9 +127,38 @@ export async function cmdTui(args: TuiArgs): Promise<number> {
     await saveSession(piFleetDir, { ...session, watcher: { cursors } });
     releaseLock();
   }
+  if (exit.reason === "shutdown") {
+    // the monitor is on its way out; wait a moment so what we print is true
+    const stopped = await waitForOrchestratorExit(piFleetDir, 5_000);
+    const workers = listRuns(piFleetDir).filter(({ runDir }) => {
+      try {
+        return !TERMINAL_STATES.includes(deriveStatus(loadStateSync(runDir)) as never);
+      } catch {
+        return false;
+      }
+    }).length;
+    console.log(
+      stopped
+        ? `Orchestrator stopped${workers > 0 ? `; ${workers} worker(s) still winding down` : " and every worker with it"}. ` +
+            `Worktrees and branches are kept — \`${BIN_NAME} status\` shows what is left.`
+        : `Shutdown requested; the orchestrator is still stopping. \`${BIN_NAME} status\` shows the workers.`,
+    );
+    return 0;
+  }
   console.log(
     `The orchestrator and its workers keep running. \`${BIN_NAME}\` reopens this console where you left it; ` +
       `\`${BIN_NAME} status\` lists the workers. \`/shutdown\` inside the console stops everything.`,
   );
   return 0;
+}
+
+/** Wait for the orchestrator monitor to actually go away, so the exit line is honest. */
+async function waitForOrchestratorExit(piFleetDir: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const state = loadOrchestratorState(piFleetDir);
+    if (!state?.pid || !isAlive(state.pid)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 100));
+  }
 }
