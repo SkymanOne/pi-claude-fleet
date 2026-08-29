@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command, CommanderError, type OptionValues } from "commander";
+import { BIN_NAME } from "./paths.js";
 import {
   cmdSpawn,
   cmdStatus,
@@ -14,9 +15,9 @@ import {
   cmdDiff,
   cmdMerge,
   cmdCleanup,
+  printResult,
   type SpawnOpts,
 } from "./commands.js";
-import { cmdOpen, cmdAttach } from "./console/index.js";
 
 let exitCode = 0;
 const done = (n: number): void => {
@@ -167,16 +168,14 @@ program
   );
 
 program
-  .command("open")
-  .description("interactive run menu → attach to a worker")
-  .option(...cwdOption)
-  .action(async (options: OptionValues) => done(await cmdOpen({ cwd: options.cwd })));
-
-program
   .command("attach <name>")
-  .description("live view + steering console for one worker (non-TTY: prints the captured tail)")
+  .description("print the tail of one worker's transcript (the live console is `pi-fleet`)")
   .option(...cwdOption)
-  .action(async (name: string, options: OptionValues) => done(await cmdAttach({ name, cwd: options.cwd })));
+  .option("--tail <n>", "lines to print (default 40)")
+  .action(async (name: string, options: OptionValues) => {
+    const { attachCore } = await import("./console/attach.js");
+    done(printResult(await attachCore({ name, cwd: options.cwd, tail: options.tail })));
+  });
 
 const tuiOptions = (cmd: Command): Command =>
   cmd
@@ -186,7 +185,13 @@ const tuiOptions = (cmd: Command): Command =>
     .option("--budget <usd>", "stop the orchestrator after this much spend")
     .option("--progress-events", "forward worker progress notes to the orchestrator");
 
-const runTui = async (options: OptionValues): Promise<void> => {
+const runTui = async (rest: string[], options: OptionValues): Promise<void> => {
+  // `tui` is the default command, so an unrecognized subcommand lands here as an operand.
+  if (rest.length > 0) {
+    console.error(`error: unknown command '${rest[0]}'\nRun \`${BIN_NAME} --help\` for the command list.`);
+    done(1);
+    return;
+  }
   const { cmdTui } = await import("./tui/index.js");
   done(
     await cmdTui({
@@ -199,7 +204,12 @@ const runTui = async (options: OptionValues): Promise<void> => {
   );
 };
 
-tuiOptions(program.command("tui", { isDefault: true }).description("open the fleet console (default)")).action(runTui);
+tuiOptions(
+  program
+    .command("tui", { isDefault: true })
+    .description("open the fleet console (default)")
+    .argument("[unknown...]"),
+).action(runTui);
 
 program
   .command("mcp")

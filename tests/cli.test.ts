@@ -24,6 +24,7 @@ test("spawn without a brief exits 1 with guidance", async () => {
 test("the Claude Code skill installer is gone; mcp and answer are advertised", async () => {
   const gone = await runCli(["install-claude-skill"]);
   assert.equal(gone.code, 1);
+  assert.match(gone.stderr, /unknown command 'install-claude-skill'/);
   const help = await runCli(["--help"]);
   assert.match(help.stdout, /\bmcp\b/);
   assert.match(help.stdout, /\banswer\b/);
