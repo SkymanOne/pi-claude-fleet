@@ -6,6 +6,8 @@ import React from "react";
 import { render } from "ink-testing-library";
 import { App } from "../src/tui/App.js";
 import { OrchestratorClient } from "../src/orchestrator/client.js";
+import { loadPrefs } from "../src/tui/prefs.js";
+import { helpLines } from "../src/tui/keys.js";
 import { loadOrchestratorState } from "../src/orchestrator/monitor.js";
 import { orchestratorPaths } from "../src/orchestrator/records.js";
 import { FleetWatcher } from "../src/fleet/watcher.js";
@@ -25,6 +27,7 @@ const CTRL_A = String.fromCharCode(1);
 const CTRL_G = String.fromCharCode(7);
 const CTRL_T = String.fromCharCode(20);
 const CTRL_O = String.fromCharCode(15);
+const CTRL_B = String.fromCharCode(2);
 const squash = (s: string): string => s.replace(/\s+/g, " ");
 
 interface Harness {
@@ -373,11 +376,16 @@ test(
         app.lastFrame,
         /tab \/ shift-tab next \/ previous session/,
       );
+      // this window is 100x24: what does not fit is counted, never dropped in silence
       assert.match(
         squash(app.lastFrame() ?? ""),
-        /allow once/,
-        "the approval keys are documented too",
+        /… \d+ more lines — a taller window shows them all/,
+        "a short window says how much of the help it could not show",
       );
+      // and a window with room shows all of it, approvals included
+      const whole = helpLines(100, 60).join("\n");
+      assert.match(whole, /allow once/, "the approval keys are documented too");
+      assert.equal(whole.includes("more lines"), false);
       await press(app, ESC);
       await waitFor(
         () =>
@@ -792,5 +800,36 @@ test("reopening the console shows the conversation that is already there", async
     second.unmount();
     client.stop();
     await teardown(h, null);
+  }
+}, { timeout: 60_000 });
+
+test("ctrl+b widens the session list, and the choice outlives the console", async () => {
+  const h = setup();
+  const app = renderApp(h);
+  try {
+    await frameMatching(app.lastFrame, /orchestrator > /);
+    const auto = app.lastFrame() ?? "";
+    assert.match(auto, /orchestrator/, "the transcript pane is beside the list");
+
+    await press(app, CTRL_B); // auto → wide
+    await frameMatching(app.lastFrame, /· session list wide/);
+    await press(app, CTRL_B); // wide → full
+    const full = await frameMatching(app.lastFrame, /session list at full width/);
+    assert.match(full, /ctrl\+b again to bring the transcript back/);
+    assert.equal(loadPrefs(h.piFleetDir).railMode, "full", "and it is remembered");
+
+    // a long line in the list is no longer clipped at a narrow width
+    await press(app, CTRL_B); // full → compact
+    await frameMatching(app.lastFrame, /· session list compact/);
+    assert.equal(loadPrefs(h.piFleetDir).railMode, "compact");
+
+    // typed exactly rather than cycled
+    await type(app, "/rail nonsense");
+    await frameMatching(app.lastFrame, /usage: \/rail <compact\|auto\|wide\|full>/);
+    await type(app, "/rail auto");
+    await frameMatching(app.lastFrame, /· session list auto/);
+    assert.equal(loadPrefs(h.piFleetDir).railMode, "auto");
+  } finally {
+    await teardown(h, app);
   }
 }, { timeout: 60_000 });

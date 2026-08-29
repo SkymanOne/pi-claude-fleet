@@ -39,6 +39,9 @@ export function nameLine(
  * reads as selected even where the terminal's inverse is subtle.
  */
 export function Rail({ items, selectedIndex, width = 26 }: RailProps) {
+  // At full width the age would sit a hundred columns from the name, so the
+  // name line keeps a readable width and only the detail uses the whole row.
+  const nameWidth = Math.min(width, 60);
   return (
     <Box flexDirection="column">
       {items.map((item, i) => {
@@ -54,13 +57,13 @@ export function Rail({ items, selectedIndex, width = 26 }: RailProps) {
                 item.attention ? "yellow" : isOrchestrator ? "cyan" : undefined
               }
             >
-              {nameLine(item.glyph, item.name, item.age, selected, width)}
+              {nameLine(item.glyph, item.name, item.age, selected, nameWidth)}
             </Text>
             <Text
               dimColor
             >{`   ${clip(item.detail, Math.max(4, width - 3))}`}</Text>
             {isOrchestrator && items.length > 1 ? (
-              <Text dimColor>{"─".repeat(Math.max(4, width - 1))}</Text>
+              <Text dimColor>{"─".repeat(Math.max(4, nameWidth - 1))}</Text>
             ) : null}
           </Box>
         );

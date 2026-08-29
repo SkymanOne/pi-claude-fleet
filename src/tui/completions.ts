@@ -95,6 +95,15 @@ export const COMMANDS: CommandSpec[] = [
     takesArgument: true,
   },
   {
+    name: "/rail",
+    detail: "width of the session list: compact, auto, wide, full (ctrl+b cycles it)",
+    takesArgument: true,
+    shortcut: "ctrl+b",
+    /** ctrl+b steps to the next width instead of prefilling the command. */
+    cycles: true,
+    aliases: ["/rw"],
+  },
+  {
     name: "/help",
     detail: "keys and commands",
     shortcut: "ctrl+g",

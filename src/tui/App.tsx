@@ -20,7 +20,7 @@ import { Composer } from "./Composer.js";
 import { Suggestions } from "./Suggestions.js";
 import { Approval } from "./Approval.js";
 import { Confirm } from "./Confirm.js";
-import { helpText, HINT } from "./keys.js";
+import { helpLines, HINT } from "./keys.js";
 import { PERMISSION_MODES, describePermissionMode } from "../orchestrator/args.js";
 import { transcriptRows, CHROME_BASE } from "./layout.js";
 import { formatAge } from "../util.js";
@@ -34,6 +34,7 @@ import {
   SHORTCUTS,
   type CompletionState,
 } from "./completions.js";
+import { loadPrefs, savePrefs, railWidthFor, nextRailMode, RAIL_MODES, type RailMode } from "./prefs.js";
 import {
   workerCommand,
   removeWorker,
@@ -137,6 +138,7 @@ export function App({
   } | null>(null);
   /** Optimistic until the monitor writes it to the orchestrator's state. */
   const [pendingEffort, setPendingEffort] = useState<string | null>(null);
+  const [railMode, setRailMode] = useState<RailMode>(() => loadPrefs(client.piFleetDir).railMode);
   // The last notice, shown above the composer: worker actions happen while a
   // worker pane is selected, so the orchestrator transcript alone would hide them.
   const [flash, setFlash] = useState<{ text: string; error: boolean } | null>(
@@ -154,6 +156,18 @@ export function App({
     columns: stdout?.columns ?? 80,
   });
   const orchestratorCommands = client.state?.commands ?? [];
+
+  /** Remembered, so the window comes back the way it was left. */
+  const setRail = (mode: RailMode): void => {
+    setRailMode(mode);
+    savePrefs(client.piFleetDir, { railMode: mode });
+    notice(
+      mode === "full"
+        ? "· session list at full width; ctrl+b again to bring the transcript back"
+        : `· session list ${mode}`,
+    );
+  };
+  const cycleRail = (): void => setRail(nextRailMode(railMode));
   // the monitor records the level, so it is still there when a console reattaches
   const effort = pendingEffort ?? client.state?.effort ?? null;
   const busy = useRef(false);
@@ -428,7 +442,8 @@ export function App({
       swallowNextChange.current = true;
       let desired = input;
       if (spec.cycles) {
-        cycleThinking();
+        if (spec.name === "/rail") cycleRail();
+        else cycleThinking();
       } else if (spec.takesArgument) {
         if (spec.workerOnly && target?.kind !== "worker") {
           notice(`! ${spec.name} needs a worker selected (tab switches)`, true);
@@ -518,6 +533,19 @@ export function App({
         .catch((err: unknown) =>
           notice(`! could not turn Remote Control on: ${err instanceof Error ? err.message : String(err)}`, true),
         );
+      return;
+    }
+    if (global?.name === "/rail") {
+      const want = text.split(/\s+/).slice(1).join(" ").trim().toLowerCase();
+      if (!want) {
+        notice(`· session list ${railMode}. Set one of ${RAIL_MODES.join(", ")}`);
+        return;
+      }
+      if (!(RAIL_MODES as readonly string[]).includes(want)) {
+        notice(`! usage: /rail <${RAIL_MODES.join("|")}>`, true);
+        return;
+      }
+      setRail(want as RailMode);
       return;
     }
     if (global?.name === "/permissions") {
@@ -698,12 +726,10 @@ export function App({
         : null
       : activityLine(view.activity, now);
 
-  const railWidth = Math.min(
-    Math.max(longestName + 4, 18),
-    Math.max(18, Math.floor(size.columns * 0.34)),
-    40,
-  );
-  const paneWidth = Math.max(20, size.columns - railWidth - 2);
+  const railWidth = railWidthFor(railMode, size.columns, longestName);
+  // at full width the rail is the window: there is no pane beside it
+  const railIsWindow = railMode === "full";
+  const paneWidth = railIsWindow ? Math.max(20, size.columns - 2) : Math.max(20, size.columns - railWidth - 2);
   const suggestionRows = completion ? completion.items.length + 1 : 0;
   const overlayRows = approval ? 8 : confirm ? 4 : 0;
   const paneRows = transcriptRows(size.rows, {
@@ -725,7 +751,12 @@ export function App({
     // previous, taller frame's rows on screen.
     <Box flexDirection="column" height={Math.max(6, size.rows - 1)}>
       <Box flexGrow={1} overflow="hidden">
-        <Box flexDirection="column" width={railWidth} flexShrink={0}>
+        <Box
+          flexDirection="column"
+          width={railWidth}
+          flexShrink={0}
+          justifyContent={railIsWindow ? "flex-start" : undefined}
+        >
           <Rail
             items={railItems}
             selectedIndex={Math.min(index, railItems.length - 1)}
@@ -740,9 +771,10 @@ export function App({
           flexGrow={1}
           paddingLeft={1}
           justifyContent="flex-end"
+          display={railIsWindow ? "none" : "flex"}
         >
           {showHelp ? (
-            <Text>{helpText()}</Text>
+            <Text>{helpLines(paneWidth, paneRows).join("\n")}</Text>
           ) : target?.kind === "worker" ? (
             <WorkerTranscript
               runDir={target.runDir}

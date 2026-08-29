@@ -66,6 +66,7 @@ The composer at the bottom sends to whatever is selected. With the orchestrator 
 | `/thinking <level>` | `/t` | `ctrl+t` | set the reasoning level of the open session — pi's `off…max` for a worker, claude's `low…max` for the orchestrator. The key steps to the next level, each session keeps its own, and the change is a passing note rather than a turn in the conversation |
 | `/permissions <mode>` | `/p` | `ctrl+o` | how the orchestrator's tool use is approved; with no argument it says what is in force |
 | `/rc [name]` | | | put the orchestrator on Claude Code Remote Control so you can watch it from elsewhere |
+| `/rail <mode>` | `/rw` | `ctrl+b` | width of the session list: `compact`, `auto`, `wide`, or `full`. The key steps through them, `full` gives the list the whole window with nothing clipped, and the choice is remembered |
 | `/help` | `/h` | `ctrl+g` | keys and commands |
 | `/quit` | `/q` | `ctrl+d` | leave the console; workers keep running |
 | `/shutdown` | `/sd` | `ctrl+k` | stop the orchestrator and every worker, then exit (asks first; worktrees and branches are kept) |

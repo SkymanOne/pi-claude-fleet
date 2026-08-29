@@ -34,6 +34,10 @@ export const COMPOSER_KEYS: KeyHelp[] = [
   keys: "/thinking /t ctrl+t",
   what: "set the reasoning level of the selected session",
  },
+ {
+  keys: "/rail /rw ctrl+b",
+  what: "widen or compact the session list: compact, auto, wide, full",
+ },
  { keys: "/help /h ctrl+g", what: "this help" },
  { keys: "/quit /q ctrl+d", what: "leave the console; workers keep running" },
  {
@@ -68,15 +72,46 @@ export const HINT = "tab switch · esc interrupt · ctrl+g help · ctrl+d quit";
  * Compact on purpose: the help shares the pane with everything else, and a
  * reference that scrolls off the top of a short terminal helps nobody.
  */
+export interface HelpSection {
+  title: string;
+  rows: KeyHelp[];
+}
+
+/** The help as sections, so it can be laid out in columns and always fit. */
+export function helpSections(): HelpSection[] {
+  return [
+    { title: "Keys", rows: GLOBAL_KEYS },
+    { title: "Composer", rows: COMPOSER_KEYS },
+    { title: "Suggestions", rows: COMPLETION_KEYS },
+    { title: "Approvals", rows: APPROVAL_KEYS },
+  ];
+}
+
+export function renderSection(section: HelpSection): string {
+  return [`${section.title}:`, ...section.rows.map((r) => `  ${r.keys.padEnd(18)} ${r.what}`)].join("\n");
+}
+
+/**
+ * The help as lines that fit `width`, capped at `maxRows`. It shares a
+ * fixed-height pane and has outgrown it as commands were added, so what does
+ * not fit is counted rather than silently cut off the bottom.
+ */
+export function helpLines(width: number, maxRows: number): string[] {
+  const lines = helpSections().flatMap((section, i) => (i === 0 ? [] : [""]).concat(renderSection(section).split("\n")));
+  const rows = (line: string): number => Math.max(1, Math.ceil(line.length / Math.max(1, width)));
+  const shown: string[] = [];
+  let used = 0;
+  for (const line of lines) {
+    // keep a row for the notice when there is more after this one
+    if (used + rows(line) > maxRows - 1 && shown.length < lines.length) break;
+    shown.push(line);
+    used += rows(line);
+  }
+  const hidden = lines.length - shown.length;
+  if (hidden > 0) shown.push(`… ${hidden} more lines — a taller window shows them all`);
+  return shown;
+}
+
 export function helpText(): string {
- const section = (title: string, rows: KeyHelp[]): string =>
-  [`${title}:`, ...rows.map((r) => `  ${r.keys.padEnd(18)} ${r.what}`)].join(
-   "\n",
-  );
- return [
-  section("Keys", GLOBAL_KEYS),
-  section("Composer", COMPOSER_KEYS),
-  section("Suggestions", COMPLETION_KEYS),
-  section("Approvals", APPROVAL_KEYS),
- ].join("\n");
+  return helpSections().map(renderSection).join("\n");
 }
