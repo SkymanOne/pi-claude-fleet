@@ -30,29 +30,37 @@ pi-fleet
 Then talk to the orchestrator: *"Add token refresh to the auth module and update the tests."* It writes briefs, spawns workers, and reports back as they finish.
 
 ```text
-┌ ○ orchestrator        > add token refresh, then tests ─────────────┐
+┌ ○ orchestrator          > add token refresh, then tests ───────────┐
 │ ● add-auth              ⚙ mcp__fleet__fleet_spawn add-auth        │
 │ ? add-tests             ↳ Spawned add-auth-20260829120000         │
-│                       I started add-auth. add-tests is asking     │
-│ blocked 2m            which fixture style to use.                 │
-│                       orchestrator >                              │
+│                         I started add-auth. add-tests is asking   │
+│ blocked 2m ·            which fixture style to use.               │
+│ glm-5.3-flash           add-tests (blocked) >                     │
 ├ sonnet · a1b2c3d4 · $0.12 · 3 turns · tab switch · esc interrupt ─┤
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-Keys: `tab` / `shift-tab` or the arrow keys switch between the orchestrator and the workers, `esc` interrupts the orchestrator's turn (or closes help), `ctrl-c` quits. Only non-printable keys are bound, so a message that starts with "q" does not quit the app.
+The rail's detail line shows the selected session's state, age and model: the orchestrator's comes from Claude Code, and a worker's is what pi actually resolved, so a worker spawned without `--model` still tells you what it is running.
+
+Keys: `tab` / `shift-tab` (or `ctrl+n` / `ctrl+p`) switch between the orchestrator and the workers, `esc` interrupts the orchestrator's turn, `ctrl-c` quits. Only non-printable keys are bound, so a message that starts with "q" does not quit the app.
 
 The composer at the bottom sends to whatever is selected. With the orchestrator selected it is a normal message. With a worker selected:
 
-| You type | What happens |
-|---|---|
-| any text | steers that worker (delivered after its current tool call) |
-| `/answer <text>` | answers the question it is blocked on (`/answer <questionId> <text>` to pick one) |
-| `/followup <text>` | queues a message for when it finishes its current work |
-| `/stop` | aborts it |
-| `/help`, `/quit` | this help, and quit |
+| You type | Short | Key | What happens |
+|---|---|---|---|
+| any text | | | steers that worker (delivered after its current tool call) |
+| `/answer <text>` | `/a` | `ctrl+a` | answers the question it is blocked on (`/answer <questionId> <text>` to pick one) |
+| `/followup <text>` | `/f` | `ctrl+f` | queues a message for when it finishes its current work |
+| `/stop` | `/s` | `ctrl+x` | aborts it |
+| `/remove` | `/rm` | `ctrl+r` | removes it: worktree, branch and rail row (asks first if that would destroy work) |
+| `/help` | `/h` | `ctrl+g` | keys and commands |
+| `/quit` | `/q` | `ctrl+d` | quit |
+
+Typing `/` lists the commands available for the selected session, and `@` lists the workers and then the repository's files. `tab` accepts the highlighted suggestion, `up` and `down` move through them, and with no suggestions open `up` recalls what you sent to that session before.
 
 When the orchestrator wants to run something outside its allowlist, or asks you a question, an overlay appears: `y` allows once, `a` allows it for the session, `n` denies with a reason, and questions get an option picker.
+
+Workers disappear from the rail when they are done: the orchestrator removes each one after it merges and verifies it, and the console removes any settled worker whose branch is already merged. Nothing unmerged, dirty or still running is ever removed for you — that waits for `/remove`, which tells you exactly what would be lost before it does anything.
 
 Quitting stops the orchestrator but leaves workers running; they are detached processes with their state on disk. `pi-fleet` reopens the console and resumes the same orchestrator session (`--fresh` starts a new one).
 
@@ -101,6 +109,7 @@ The TUI is one client; the same fleet is driveable from scripts.
 | `output <name> [--tail n]` | last assistant text, or the last n tool results |
 | `logs <name> [--tail n]` | tail of the raw RPC log |
 | `send`, `followup`, `answer`, `stop` | steer, queue a follow-up, answer a question, abort |
+| `status --json` | includes each run's `activeModel` and `pendingQuestion` |
 | `report <name>` | the final report with the steering log appended; exit 2 if there is none |
 | `diff <name> [--name-only]` | what the worker changed against its base commit |
 | `merge <name> [--no-commit]` | merge the worker's branch; exit 5 on conflicts |
