@@ -7,6 +7,7 @@ import { OrchestratorProcess } from "../orchestrator/process.js";
 import { fleetMcpConfig } from "../orchestrator/mcpConfig.js";
 import { writeRenderedPrompt, DEFAULT_MAX_WORKERS } from "../orchestrator/prompt.js";
 import { loadSession, newSession, saveSession, type OrchestratorSession } from "../orchestrator/session.js";
+import { checkClaudeVersion, reapOrphanOrchestrator } from "../orchestrator/health.js";
 import { FleetWatcher, type Cursors } from "../fleet/watcher.js";
 import { readActiveLock, startLockHeartbeat } from "../console/lock.js";
 import { App } from "./App.js";
@@ -47,8 +48,18 @@ export async function cmdTui(args: TuiArgs): Promise<number> {
   }
   const releaseLock = startLockHeartbeat(piFleetDir, 5000, TUI_LOCK);
 
-  const saved = args.fresh ? null : loadSession(piFleetDir);
+  const version = await checkClaudeVersion();
+  if (version.warning) console.error(`warning: ${version.warning}`);
+
+  const previous = loadSession(piFleetDir);
+  // A console that crashed leaves its claude child running; the lock above proves
+  // no live console owns it, so it is an orphan.
+  const reaped = reapOrphanOrchestrator(previous?.pid);
+  if (reaped.reason) console.error(`${reaped.reaped ? "note" : "warning"}: ${reaped.reason}`);
+
+  const saved = args.fresh ? null : previous;
   const session: OrchestratorSession = saved ?? newSession(targetDir);
+  session.claudeVersion = version.version;
   const promptFile = writeRenderedPrompt(piFleetDir, {
     fleetDir: piFleetDir,
     repoRoot: repoRoot ?? targetDir,
@@ -81,9 +92,35 @@ export async function cmdTui(args: TuiArgs): Promise<number> {
   watcher.start({ snapshot: Boolean(saved?.sessionId) });
 
   const app = render(<App proc={proc} watcher={watcher} onQuit={() => app.unmount()} />, { exitOnCtrlC: true });
+
+  // The orchestrator must not outlive us, however we go down.
+  const killChild = (): void => {
+    const pid = proc.pid;
+    if (pid && proc.running) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  };
+  const onSignal = (signal: NodeJS.Signals) => (): void => {
+    killChild();
+    releaseLock();
+    process.exit(signal === "SIGINT" ? 130 : 143);
+  };
+  const handlers: [NodeJS.Signals, () => void][] = [
+    ["SIGTERM", onSignal("SIGTERM")],
+    ["SIGHUP", onSignal("SIGHUP")],
+  ];
+  for (const [signal, handler] of handlers) process.on(signal, handler);
+  process.on("exit", killChild);
+
   try {
     await app.waitUntilExit();
   } finally {
+    for (const [signal, handler] of handlers) process.off(signal, handler);
+    process.off("exit", killChild);
     watcher.stop();
     await proc.stop();
     session.pid = null;

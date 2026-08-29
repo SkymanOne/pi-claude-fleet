@@ -14,6 +14,10 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 
 const argv = process.argv.slice(2);
+if (argv.includes("--version")) {
+  process.stdout.write(`${process.env.FAKE_CLAUDE_VERSION || "2.1.251"} (Claude Code)\n`);
+  process.exit(0);
+}
 if (process.env.FAKE_CLAUDE_ARGV_FILE) fs.writeFileSync(process.env.FAKE_CLAUDE_ARGV_FILE, JSON.stringify(argv));
 const replay = argv.includes("--replay-user-messages");
 const sessionId = process.env.FAKE_CLAUDE_SESSION_ID || randomUUID();
