@@ -76,8 +76,25 @@ function renderApp(h: Harness) {
 
 // each test drives a real claude child and a git subprocess for file completion,
 // so the whole file runs under load; be patient before calling a frame missing
-const frameMatching = (lastFrame: () => string | undefined, re: RegExp, timeoutMs = 20_000): Promise<string> =>
-  waitFor(() => (re.test(squash(lastFrame() ?? "")) ? squash(lastFrame() as string) : undefined), { timeoutMs, intervalMs: 20 });
+/**
+ * Keys must not land in the same stdin chunk: ink parses a chunk as one
+ * keypress, so "down" + "enter" written together become a single escape
+ * sequence and neither takes effect.
+ */
+async function press(app: { stdin: { write: (data: string) => void } }, keys: string): Promise<void> {
+  await new Promise((r) => setTimeout(r, 40));
+  app.stdin.write(keys);
+  await new Promise((r) => setTimeout(r, 40));
+}
+
+async function frameMatching(lastFrame: () => string | undefined, re: RegExp, timeoutMs = 20_000): Promise<string> {
+  try {
+    return await waitFor(() => (re.test(squash(lastFrame() ?? "")) ? squash(lastFrame() as string) : undefined), { timeoutMs, intervalMs: 20 });
+  } catch (err) {
+    // the frame at the moment of failure is the only useful thing here
+    throw new Error(`${String(err)} waiting for ${re}\nlast frame: ${JSON.stringify(lastFrame())}`);
+  }
+}
 
 type Rendered = ReturnType<typeof renderApp>;
 
@@ -86,10 +103,10 @@ type Rendered = ReturnType<typeof renderApp>;
  * tick: TextInput would still hold the old (empty) value when Enter arrives.
  */
 async function type(app: Rendered, text: string): Promise<void> {
-  app.stdin.write(text);
+  await press(app, text);
   const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   await frameMatching(app.lastFrame, new RegExp(`> ${escaped}`));
-  app.stdin.write("\r");
+  await press(app, "\r");
 }
 
 async function teardown(h: Harness, app: { unmount: () => void }): Promise<void> {
@@ -125,7 +142,7 @@ test("a permission request opens the overlay; y allows it", async () => {
     assert.match(overlay, /y allow once . a allow for this session . n deny/);
     assert.match(overlay, /1 approval pending/);
     assert.match(overlay, /\? orchestrator/, "the rail flags the approval");
-    app.stdin.write("y");
+    await press(app, "y");
     await frameMatching(app.lastFrame, /allowed:touch a\.txt/);
     assert.match(squash(app.lastFrame() ?? ""), /orchestrator > /, "the composer is back");
   } finally {
@@ -142,9 +159,9 @@ test("an AskUserQuestion is answered with the picker", async () => {
     const overlay = await frameMatching(app.lastFrame, /question 1\/1/);
     assert.match(overlay, /Which hash\?/);
     assert.match(overlay, /bcrypt/);
-    app.stdin.write(DOWN);
+    await press(app, DOWN);
     await frameMatching(app.lastFrame, /argon2/);
-    app.stdin.write("\r");
+    await press(app, "\r");
     await frameMatching(app.lastFrame, /answers:\{"Which hash\?":"argon2"\}/);
   } finally {
     await teardown(h, app);
@@ -174,7 +191,7 @@ test("a worker question reaches the rail and the orchestrator; the human can ans
     assert.match(line.message.content, /question: bcrypt or argon2\?/);
     assert.match(line.message.content, /next: fleet_answer name="db"/);
 
-    app.stdin.write("\t");
+    await press(app, "\t");
     await frameMatching(app.lastFrame, /db \(running\) > /);
     await frameMatching(app.lastFrame, /bcrypt or argon2/);
     await type(app, "/answer use argon2");
@@ -190,7 +207,7 @@ test("a worker question reaches the rail and the orchestrator; the human can ans
     );
     const answer = JSON.parse(control.split("\n")[0]);
     assert.deepEqual([answer.type, answer.message, answer.source, answer.questionId], ["answer", "use argon2", "console", "q_1"]);
-    app.stdin.write("\t");
+    await press(app, "\t");
     await frameMatching(app.lastFrame, /answered db \(q_1\): use argon2/);
   } finally {
     await teardown(h, app);
@@ -205,7 +222,7 @@ test("/help shows the bindings, esc closes it, /quit asks the app to exit", asyn
     await type(app, "/help");
     await frameMatching(app.lastFrame, /tab \/ shift-tab next \/ previous session/);
     assert.match(squash(app.lastFrame() ?? ""), /y allow once/, "the approval keys are documented too");
-    app.stdin.write(ESC);
+    await press(app, ESC);
     await waitFor(() => (squash(app.lastFrame() ?? "").includes("Composer type + enter") ? undefined : true), { timeoutMs: 5000, intervalMs: 20 });
     assert.equal(h.quit.called, 0);
     await type(app, "/quit");
@@ -222,7 +239,7 @@ test("esc interrupts a running turn", async () => {
     await frameMatching(app.lastFrame, /orchestrator > /);
     await type(app, "slow:");
     await frameMatching(app.lastFrame, /tick0/);
-    app.stdin.write(ESC);
+    await press(app, ESC);
     await frameMatching(app.lastFrame, /interrupted/);
   } finally {
     await teardown(h, app);
@@ -235,20 +252,20 @@ test("/remove on a running worker asks first, and the confirmation removes it", 
   const app = renderApp(h);
   try {
     await frameMatching(app.lastFrame, /. db/);
-    app.stdin.write("\t");
+    await press(app, "\t");
     await frameMatching(app.lastFrame, /db \(running\) > /);
     await type(app, "/remove");
     const asked = await frameMatching(app.lastFrame, /Abort it and remove/);
     assert.match(asked, /y remove . n or esc cancel/);
     assert.equal(fs.existsSync(path.join(runDir, "state.json")), true);
 
-    app.stdin.write("n");
+    await press(app, "n");
     await frameMatching(app.lastFrame, /removal cancelled/);
     assert.equal(JSON.parse(fs.readFileSync(path.join(runDir, "state.json"), "utf8")).status, "running");
 
     await type(app, "/remove");
     await frameMatching(app.lastFrame, /Abort it and remove/);
-    app.stdin.write("y");
+    await press(app, "y");
     await waitFor(
       () => (JSON.parse(fs.readFileSync(path.join(runDir, "state.json"), "utf8")).status === "archived" ? true : undefined),
       { timeoutMs: 15_000 },
@@ -272,22 +289,22 @@ test("typing / offers commands, tab accepts one, and up recalls what you sent", 
     await frameMatching(app.lastFrame, /echo: first message/);
 
     // the orchestrator only gets the global commands
-    app.stdin.write("/");
+    await press(app, "/");
     const popup = await frameMatching(app.lastFrame, /tab or enter to accept/);
     assert.match(popup, /\/help/);
     assert.equal(popup.includes("/answer"), false, "worker-only commands are hidden here");
     assert.match(popup, /tab or enter to accept/);
 
     // narrowing by alias, then accepting with tab
-    app.stdin.write("q");
+    await press(app, "q");
     await frameMatching(app.lastFrame, /orchestrator > \/q/);
-    app.stdin.write("\t");
+    await press(app, "\t");
     await frameMatching(app.lastFrame, /> \/quit/);
     assert.equal(h.quit.called, 0, "accepting a suggestion does not run it");
-    app.stdin.write(ESC);
+    await press(app, ESC);
 
     // history recall
-    app.stdin.write(UP);
+    await press(app, UP);
     await frameMatching(app.lastFrame, /> first message/);
   } finally {
     await teardown(h, app);
@@ -300,19 +317,19 @@ test("ctrl shortcuts run commands: ctrl+a prefills an answer, ctrl+g opens help"
   const app = renderApp(h);
   try {
     await frameMatching(app.lastFrame, /. db/);
-    app.stdin.write(CTRL_G);
+    await press(app, CTRL_G);
     await frameMatching(app.lastFrame, /tab \/ shift-tab next \/ previous session/);
-    app.stdin.write(ESC);
+    await press(app, ESC);
     // ESC immediately followed by another key would arrive as one escape
     // sequence, so wait for the help to actually close first
     await waitFor(() => (squash(app.lastFrame() ?? "").includes("Composer type + enter") ? undefined : true), { timeoutMs: 5000, intervalMs: 20 });
 
     // a worker command needs a worker selected
-    app.stdin.write(CTRL_A);
+    await press(app, CTRL_A);
     await frameMatching(app.lastFrame, /needs a worker selected/);
-    app.stdin.write("\t");
+    await press(app, "\t");
     await frameMatching(app.lastFrame, /db \(running\) > /);
-    app.stdin.write(CTRL_A);
+    await press(app, CTRL_A);
     const prefilled = await frameMatching(app.lastFrame, /db \(running\) > \/answer/);
     assert.equal(/> \/answer\s*a/.test(prefilled), false, "the ctrl keypress itself is not typed into the composer");
   } finally {
