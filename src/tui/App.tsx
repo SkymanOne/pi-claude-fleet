@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { Box, Text, useInput } from "ink";
+import { Box, Text, useInput, useStdout } from "ink";
 import { OrchestratorProcess, type PermissionRequest } from "../orchestrator/process.js";
 import { FleetWatcher } from "../fleet/watcher.js";
 import { formatFleetBatch, type FleetEvent } from "../fleet/events.js";
@@ -13,6 +13,7 @@ import { Suggestions } from "./Suggestions.js";
 import { Approval } from "./Approval.js";
 import { Confirm } from "./Confirm.js";
 import { helpText, HINT } from "./keys.js";
+import { transcriptRows, CHROME_BASE } from "./layout.js";
 import { completionsFor, applySuggestion, listRepoFiles, resolveCommand, SHORTCUTS, type CompletionState } from "./completions.js";
 import { workerCommand, removeWorker } from "./workerActions.js";
 import { reapMergedRuns } from "../fleet/reap.js";
@@ -61,6 +62,8 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
   // Sent messages, newest last, per session; -1 means "not browsing".
   const historyRef = useRef<Record<string, string[]>>({});
   const [historyAt, setHistoryAt] = useState(-1);
+  const { stdout } = useStdout();
+  const [size, setSize] = useState({ rows: stdout?.rows ?? 24, columns: stdout?.columns ?? 80 });
   const busy = useRef(false);
   // ink-text-input also receives the ctrl keypress and would insert it as text;
   // a shortcut sets this so the next change from the input is dropped.
@@ -129,6 +132,17 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
       clearInterval(timer);
     };
   }, [watcher, reapMs]);
+
+  // The frame must fit the terminal, or it scrolls and takes the rail with it.
+  useEffect(() => {
+    if (!stdout) return;
+    const onResize = (): void => setSize({ rows: stdout.rows ?? 24, columns: stdout.columns ?? 80 });
+    onResize();
+    stdout.on("resize", onResize);
+    return () => {
+      stdout.off("resize", onResize);
+    };
+  }, [stdout]);
 
   useEffect(() => {
     if (!cwd) return;
@@ -312,17 +326,34 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
 
   const workerLabel = currentRun ? `${currentRun.state.name} (${deriveStatus(currentRun.state)})` : "worker";
 
+  const railWidth = 22;
+  const paneWidth = Math.max(20, size.columns - railWidth - 2);
+  const suggestionRows = completion ? completion.items.length + 1 : 0;
+  const overlayRows = approval ? 8 : confirm ? 4 : 0;
+  const paneRows = transcriptRows(size.rows, {
+    base: CHROME_BASE,
+    flash: flash ? 1 : 0,
+    suggestions: suggestionRows,
+    overlay: overlayRows,
+  });
+  // the rail never pushes the transcript out of view
+  const railItems = items.length > paneRows ? items.slice(0, Math.max(1, paneRows - 1)) : items;
+  const railOverflow = items.length - railItems.length;
+
   return (
     <Box flexDirection="column">
       <Box>
-        <Rail items={items} selectedIndex={index} />
+        <Box flexDirection="column" width={railWidth} flexShrink={0}>
+          <Rail items={railItems} selectedIndex={Math.min(index, railItems.length - 1)} width={railWidth} />
+          {railOverflow > 0 ? <Text dimColor>{`+${railOverflow} more`}</Text> : null}
+        </Box>
         <Box flexDirection="column" flexGrow={1} paddingLeft={1}>
           {showHelp ? (
             <Text>{helpText()}</Text>
           ) : target?.kind === "worker" ? (
-            <WorkerTranscript runDir={target.runDir} />
+            <WorkerTranscript runDir={target.runDir} maxRows={paneRows} width={paneWidth} />
           ) : (
-            <Transcript lines={view.lines} partial={view.partial} />
+            <Transcript lines={view.lines} partial={view.partial} maxRows={paneRows} width={paneWidth} />
           )}
         </Box>
       </Box>

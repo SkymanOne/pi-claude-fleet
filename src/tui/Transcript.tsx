@@ -1,11 +1,14 @@
 import { Box, Text } from "ink";
 import type { OrchestratorLine, OrchestratorLineKind } from "./model.js";
 import type { MdLine, Span } from "./markdown.js";
+import { visibleTail } from "./layout.js";
 
 export interface TranscriptProps {
   lines: OrchestratorLine[];
   partial?: string | null;
-  maxLines?: number;
+  /** Rows the pane may occupy; the tail that fits is shown. */
+  maxRows?: number;
+  width?: number;
 }
 
 export function colorFor(kind: OrchestratorLineKind): { color?: string; dimColor?: boolean; bold?: boolean } {
@@ -61,10 +64,12 @@ function LineView({ line }: { line: OrchestratorLine }) {
   );
 }
 
-export function Transcript({ lines, partial, maxLines = 200 }: TranscriptProps) {
-  const shown = lines.length > maxLines ? lines.slice(lines.length - maxLines) : lines;
+export function Transcript({ lines, partial, maxRows = 200, width = 80 }: TranscriptProps) {
+  const partialRows = partial ? Math.max(1, Math.ceil(partial.length / Math.max(1, width))) : 0;
+  const { lines: shown, hidden } = visibleTail(lines, Math.max(1, maxRows - partialRows), width, (l) => l.text);
   return (
     <Box flexDirection="column" flexGrow={1}>
+      {hidden > 0 ? <Text dimColor>{`… ${hidden} earlier line${hidden === 1 ? "" : "s"}`}</Text> : null}
       {shown.map((line, i) => (
         <LineView key={i} line={line} />
       ))}

@@ -336,3 +336,30 @@ test("ctrl shortcuts run commands: ctrl+a prefills an answer, ctrl+g opens help"
     await teardown(h, app);
   }
 }, { timeout: 60_000 });
+
+test("a long transcript never pushes the rail off the screen", async () => {
+  const h = setup();
+  const { runDir } = await addRun(h.piFleetDir, "chatty");
+  // a worker with far more output than the terminal has rows
+  const events = Array.from({ length: 200 }, (_, i) =>
+    JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command: `step ${i} ${"x".repeat(60)}` } }),
+  ).join("\n");
+  fs.writeFileSync(path.join(runDir, "events.jsonl"), events + "\n");
+  const app = renderApp(h);
+  try {
+    await frameMatching(app.lastFrame, /. chatty/);
+    await press(app, "\t");
+    await frameMatching(app.lastFrame, /chatty \(running\) > /);
+    await frameMatching(app.lastFrame, /step 199/);
+    const frame = app.lastFrame() ?? "";
+    const rows = frame.split("\n").length;
+    assert.ok(rows <= (process.stdout.rows || 24) + 2, `frame is ${rows} rows, terminal is ${process.stdout.rows || 24}`);
+    // the rail and the status line survive alongside the transcript
+    assert.match(squash(frame), /orchestrator/);
+    assert.match(squash(frame), /chatty/);
+    assert.match(squash(frame), /tab switch/);
+    assert.match(squash(frame), /earlier lines/);
+  } finally {
+    await teardown(h, app);
+  }
+}, { timeout: 60_000 });

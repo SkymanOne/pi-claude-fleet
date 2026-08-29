@@ -1,6 +1,7 @@
 import path from "node:path";
 import { useEffect, useRef, useState } from "react";
 import { Box, Text } from "ink";
+import { visibleTail } from "./layout.js";
 import {
   applyEvent,
   partialText,
@@ -15,6 +16,9 @@ export interface WorkerTranscriptProps {
   runDir: string;
   pollMs?: number;
   tailLines?: number;
+  /** Rows the pane may occupy; the tail that fits is shown. */
+  maxRows?: number;
+  width?: number;
 }
 
 function colorFor(kind: LineKind): { color?: string; dimColor?: boolean } {
@@ -35,7 +39,7 @@ function colorFor(kind: LineKind): { color?: string; dimColor?: boolean } {
 }
 
 /** Follows one worker's events.jsonl, the way the old attach console did. */
-export function WorkerTranscript({ runDir, pollMs = 250, tailLines = 200 }: WorkerTranscriptProps) {
+export function WorkerTranscript({ runDir, pollMs = 250, tailLines = 400, maxRows = 200, width = 80 }: WorkerTranscriptProps) {
   const eventsPath = path.join(runDir, "events.jsonl");
   const transcriptRef = useRef<TranscriptState | null>(null);
   const offsetRef = useRef(0);
@@ -63,10 +67,13 @@ export function WorkerTranscript({ runDir, pollMs = 250, tailLines = 200 }: Work
     return () => clearInterval(timer);
   }, [eventsPath, pollMs, tailLines]);
 
+  const partialRows = partial ? Math.max(1, Math.ceil(partial.length / Math.max(1, width))) : 0;
+  const { lines: shown, hidden } = visibleTail(lines, Math.max(1, maxRows - partialRows), width, (l) => l.text);
   return (
     <Box flexDirection="column" flexGrow={1}>
       {lines.length === 0 ? <Text dimColor>(no events captured yet)</Text> : null}
-      {lines.map((line, i) => (
+      {hidden > 0 ? <Text dimColor>{`… ${hidden} earlier line${hidden === 1 ? "" : "s"}`}</Text> : null}
+      {shown.map((line, i) => (
         <Text key={i} {...colorFor(line.kind)}>
           {line.text}
         </Text>

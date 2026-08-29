@@ -32,16 +32,29 @@ test("Rail lists sessions with glyphs and shows the selected row's detail", () =
   }
 });
 
-test("Transcript renders lines and the streaming cursor, keeping only the tail", () => {
+test("Transcript keeps the tail that fits the pane and says what it hid", () => {
   const lines = Array.from({ length: 5 }, (_, i) => ({ kind: "text" as const, text: `line${i}` }));
-  const { lastFrame, unmount } = render(React.createElement(Transcript, { lines, partial: "typing", maxLines: 3 }));
+  // 4 rows: one for the streaming partial, three for lines
+  const { lastFrame, unmount } = render(React.createElement(Transcript, { lines, partial: "typing", maxRows: 4, width: 40 }));
   try {
     const frame = lastFrame() ?? "";
     assert.equal(frame.includes("line1"), false, "older lines are dropped");
     assert.match(frame, /line2[\s\S]*line4/);
     assert.match(frame, /typing/);
+    assert.match(frame, /… 2 earlier lines/);
   } finally {
     unmount();
+  }
+  // a long line wraps, so fewer of them fit
+  const wide = [{ kind: "text" as const, text: "x".repeat(90) }, { kind: "text" as const, text: "short" }];
+  const narrow = render(React.createElement(Transcript, { lines: wide, maxRows: 2, width: 30 }));
+  try {
+    const frame = narrow.lastFrame() ?? "";
+    assert.match(frame, /short/);
+    assert.equal(frame.includes("xxx"), false, "the wrapped line would not fit");
+    assert.match(frame, /… 1 earlier line$/m);
+  } finally {
+    narrow.unmount();
   }
   assert.deepEqual(colorFor("user"), { color: "cyan", bold: true });
   assert.deepEqual(colorFor("error"), { color: "red" });

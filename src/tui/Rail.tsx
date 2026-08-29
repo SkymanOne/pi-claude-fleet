@@ -11,7 +11,7 @@ const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n -
 
 export function Rail({ items, selectedIndex, width = 22 }: RailProps) {
   return (
-    <Box flexDirection="column" width={width} flexShrink={0}>
+    <Box flexDirection="column">
       {items.map((item, i) => {
         const selected = i === selectedIndex;
         return (
