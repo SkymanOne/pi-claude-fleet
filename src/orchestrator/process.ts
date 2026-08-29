@@ -25,6 +25,7 @@ import {
   askUserQuestionResponse,
   interruptRequest,
   setPermissionModeRequest,
+  applyFlagSettingsRequest,
   initializeRequest,
   serialize,
   newRequestId,
@@ -263,6 +264,12 @@ export class OrchestratorProcess extends EventEmitter<OrchestratorProcessEvents>
   setPermissionMode(mode: PermissionMode): Promise<Record<string, unknown> | null> {
     const id = newRequestId();
     return this.control(id, setPermissionModeRequest(id, mode));
+  }
+
+  /** Change session settings (effort, thinking) without saying anything to the model. */
+  applyFlagSettings(settings: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+    const id = newRequestId();
+    return this.control(id, applyFlagSettingsRequest(id, settings));
   }
 
   initialize(extra: Record<string, unknown> = {}): Promise<Record<string, unknown> | null> {

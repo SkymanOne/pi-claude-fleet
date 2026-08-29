@@ -54,6 +54,8 @@ export interface ClaudeArgsOptions {
   disallowedTools?: string[];
   /** Starting permission mode; without one claude uses its own default for -p. */
   permissionMode?: string | null;
+  /** Register the session with Claude Code's Remote Control, optionally under a name. */
+  remoteControl?: string | null;
 }
 
 /** The exact argv for the orchestrator child (`claude` itself is the command). */
@@ -71,6 +73,10 @@ export function buildClaudeArgs(o: ClaudeArgsOptions): string[] {
     "--strict-mcp-config",
   ];
   if (o.permissionMode) args.push("--permission-mode", o.permissionMode);
+  // an empty name means "on, name it yourself"
+  if (o.remoteControl !== null && o.remoteControl !== undefined) {
+    args.push("--remote-control", ...(o.remoteControl ? [o.remoteControl] : []));
+  }
   if (o.model) args.push("--model", o.model);
   if (o.effort) args.push("--effort", o.effort);
   if (o.resumeSessionId) args.push("--resume", o.resumeSessionId);

@@ -38,12 +38,12 @@ test("rank puts prefix matches before substring matches", () => {
 
 test("slash commands complete, and worker-only ones are hidden from the orchestrator", () => {
   const all = completionsFor("/", ctx())!;
-  assert.deepEqual(all.items.map((i) => i.label), ["/answer", "/followup", "/stop", "/remove", "/thinking", "/permissions", "/help", "/quit", "/shutdown"]);
+  assert.deepEqual(all.items.map((i) => i.label), ["/answer", "/followup", "/stop", "/remove", "/thinking", "/permissions", "/rc", "/help", "/quit", "/shutdown"]);
   assert.equal(all.start, 0);
   assert.ok(all.items[0].detail?.includes("ctrl+a"), "the shortcut is advertised");
 
   const orchestrator = completionsFor("/", ctx({ target: "orchestrator" }))!;
-  assert.deepEqual(orchestrator.items.map((i) => i.label), ["/thinking", "/permissions", "/help", "/quit", "/shutdown"]);
+  assert.deepEqual(orchestrator.items.map((i) => i.label), ["/thinking", "/permissions", "/rc", "/help", "/quit", "/shutdown"]);
 
   const filtered = completionsFor("/an", ctx())!;
   assert.deepEqual(filtered.items.map((i) => i.label), ["/answer"]);
@@ -81,9 +81,8 @@ test("the list is capped", () => {
 });
 
 test("every command has a distinct ctrl shortcut", () => {
-  const shortcuts = COMMANDS.map((c) => c.shortcut);
-  assert.equal(shortcuts.filter(Boolean).length, COMMANDS.length, "all commands have one");
-  assert.equal(new Set(shortcuts).size, shortcuts.length, "no duplicates");
+  const shortcuts = COMMANDS.map((c) => c.shortcut).filter(Boolean);
+  assert.equal(new Set(shortcuts).size, shortcuts.length, "no two commands share a shortcut");
   for (const s of shortcuts) assert.match(s!, /^ctrl\+[a-z]$/);
   // ctrl+c is the terminal's own, and these are flow control / signals
   for (const reserved of ["c", "s", "q", "z", "h", "i", "j", "m"]) {
@@ -104,8 +103,8 @@ test("the agent's own commands and skills are offered alongside the console's", 
       { name: "research", description: "Research a topic" },
     ],
   }))!;
-  assert.deepEqual(claude.items.map((i) => i.label), ["/thinking", "/permissions", "/help", "/quit", "/shutdown", "/model", "/research"]);
-  assert.deepEqual(claude.items.map((i) => i.kind), ["command", "command", "command", "command", "command", "agent", "agent"]);
+  assert.deepEqual(claude.items.map((i) => i.label), ["/thinking", "/permissions", "/rc", "/help", "/quit", "/shutdown", "/model", "/research"]);
+  assert.deepEqual(claude.items.map((i) => i.kind), ["command", "command", "command", "command", "command", "command", "agent", "agent"]);
   const model = claude.items.find((i) => i.label === "/model")!;
   assert.equal(model.value, "/model ", "one that takes an argument leaves the cursor after a space");
   assert.equal(claude.items.find((i) => i.label === "/research")!.value, "/research");

@@ -14,6 +14,11 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 
 const argv = process.argv.slice(2);
+if (process.env.FAKE_CLAUDE_SETTINGS_FILE) {
+  process.on("exit", () => {
+    try { fs.writeFileSync(process.env.FAKE_CLAUDE_SETTINGS_FILE, JSON.stringify(settings)); } catch {}
+  });
+}
 if (argv.includes("--version")) {
   process.stdout.write(`${process.env.FAKE_CLAUDE_VERSION || "2.1.251"} (Claude Code)\n`);
   process.exit(0);
@@ -25,6 +30,7 @@ const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let initialized = false;
+let settings = {};
 let initSent = false;
 let numTurns = 0;
 let interrupted = false;
@@ -163,6 +169,11 @@ process.stdin.on("data", (chunk) => {
       const sub = msg.request?.subtype;
       if (sub === "initialize") initialized = true;
       if (sub === "interrupt") interrupted = true;
+      if (sub === "apply_flag_settings") settings = { ...settings, ...(msg.request.settings ?? {}) };
+      if (sub === "apply_flag_settings" && process.env.FAKE_CLAUDE_NO_FLAG_SETTINGS === "1") {
+        send({ type: "control_response", response: { subtype: "error", request_id: msg.request_id, error: "unknown subtype" } });
+        continue;
+      }
       const response =
         sub === "interrupt"
           ? { still_queued: [] }

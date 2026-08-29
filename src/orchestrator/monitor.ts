@@ -42,6 +42,8 @@ export interface OrchestratorMonitorArgs {
   fresh?: boolean;
   /** Starting permission mode; the console can change it later. */
   permissionMode?: string | null;
+  /** Register with Claude Code's Remote Control under this name ("" for an automatic one). */
+  remoteControl?: string | null;
 }
 
 export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Promise<number> {
@@ -52,6 +54,7 @@ export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Pro
     ...newOrchestratorState(args.cwd),
     pid: process.pid,
     permissionMode: args.permissionMode ?? "default",
+    remoteControl: args.remoteControl ?? null,
   };
   const session = (args.fresh ? null : loadSession(args.piFleetDir)) ?? newSession(args.cwd);
 
@@ -88,6 +91,7 @@ export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Pro
     resumeSessionId: args.fresh ? null : session.sessionId,
     maxBudgetUsd: args.budget ?? null,
     permissionMode: args.permissionMode ?? null,
+    remoteControl: args.remoteControl ?? null,
     logPath: paths.log,
   });
 
@@ -228,11 +232,18 @@ export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Pro
         writeState();
         return;
       }
-      case "effort":
+      case "effort": {
+        // a settings merge, not a message: the conversation is left alone
+        const response = await proc.applyFlagSettings({ effort: control.level });
+        if (response === null) {
+          // older CLIs may not know the setting; fall back to the slash command
+          writeEvent({ type: "notice", text: `· effort set through /effort (this claude has no settings merge)` });
+          proc.send(`/effort ${control.level}`);
+        }
         state.effort = control.level;
         writeState();
-        proc.send(`/effort ${control.level}`);
         return;
+      }
       case "stop":
         writeEvent({ type: "notice", text: "· shutting down" });
         await proc.stop();

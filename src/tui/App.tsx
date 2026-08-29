@@ -69,6 +69,8 @@ type Dispatchable = ClaudeStreamMessage | LocalEvent;
 const TERMINAL_VIEWS: string[] = [...TERMINAL_STATES];
 /** What claude's own /effort accepts. */
 const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+/** How long a toolbar note stays up. */
+const FLASH_MS = 6_000;
 
 /** The next level in a list, wrapping; an unknown current level starts at the front. */
 export function nextLevel(levels: readonly string[], current: string | null): string {
@@ -103,8 +105,8 @@ export function App({
     action: "remove" | "shutdown";
     run?: RailRun;
   } | null>(null);
-  /** The reasoning level asked of the orchestrator, since claude does not report one. */
-  const [effort, setEffort] = useState<string | null>(null);
+  /** Optimistic until the monitor writes it to the orchestrator's state. */
+  const [pendingEffort, setPendingEffort] = useState<string | null>(null);
   // The last notice, shown above the composer: worker actions happen while a
   // worker pane is selected, so the orchestrator transcript alone would hide them.
   const [flash, setFlash] = useState<{ text: string; error: boolean } | null>(
@@ -122,6 +124,8 @@ export function App({
     columns: stdout?.columns ?? 80,
   });
   const orchestratorCommands = client.state?.commands ?? [];
+  // the monitor records the level, so it is still there when a console reattaches
+  const effort = pendingEffort ?? client.state?.effort ?? null;
   const busy = useRef(false);
   // ink-text-input also receives the ctrl keypress and would insert it as text;
   // a shortcut sets this so the next change from the input is dropped.
@@ -219,6 +223,13 @@ export function App({
     };
   }, [watcher, reapMs]);
 
+  // A toolbar note is passing: it goes on its own after a few seconds.
+  useEffect(() => {
+    if (!flash) return;
+    const timer = setTimeout(() => setFlash(null), FLASH_MS);
+    return () => clearTimeout(timer);
+  }, [flash]);
+
   // The frame must fit the terminal, or it scrolls and takes the rail with it.
   useEffect(() => {
     if (!stdout) return;
@@ -308,10 +319,20 @@ export function App({
   const selectedCompletion =
     completion?.items[Math.min(completionIndex, completion.items.length - 1)];
 
+  /** A passing note above the composer, and a line in the transcript to look back at. */
   const notice = (text: string, error = false): void => {
     if (!text) return;
     setFlash({ text, error });
     dispatch(error ? { type: "error", text } : { type: "notice", text });
+  };
+
+  /**
+   * A note that belongs in the toolbar and nowhere else: a setting change is
+   * not part of the conversation, and it clears itself after a few seconds.
+   */
+  const toast = (text: string, error = false): void => {
+    if (!text) return;
+    setFlash({ text, error });
   };
 
   const move = (delta: number): void =>
@@ -371,21 +392,29 @@ export function App({
     }
     if (key.ctrl && SHORTCUTS[ch]) {
       const spec = SHORTCUTS[ch];
+      // ink-text-input gets the same keypress and would type it as text. The
+      // flag catches that when our handler runs first; re-asserting the value on
+      // the next tick catches it when it does not.
       swallowNextChange.current = true;
+      let desired = input;
       if (spec.cycles) {
         cycleThinking();
-        return;
-      }
-      if (spec.takesArgument) {
+      } else if (spec.takesArgument) {
         if (target?.kind !== "worker") {
           notice(`! ${spec.name} needs a worker selected (tab switches)`, true);
-          return;
+        } else {
+          desired = `${spec.name} `;
+          setDismissed(true);
         }
-        setInput(`${spec.name} `);
-        setDismissed(true);
-        return;
+      } else {
+        run(spec.name);
+        desired = "";
       }
-      run(spec.name);
+      setInput(desired);
+      setTimeout(() => {
+        swallowNextChange.current = false;
+        setInput((current) => (current === desired ? current : desired));
+      }, 0);
       return;
     }
     if (approvals.length > 0 || confirm) return;
@@ -435,6 +464,28 @@ export function App({
       return;
     }
     // the orchestrator has no worker mailbox: its reasoning level is claude's own /effort
+    if (global?.name === "/rc") {
+      const name = text.split(/\s+/).slice(1).join(" ").trim();
+      const current = client.state?.remoteControl;
+      if (current !== null && current !== undefined && !name) {
+        toast(`· Remote Control is on${current ? ` as "${current}"` : ""}`);
+        return;
+      }
+      // the flag only applies at launch, so the session moves to a new claude
+      // process: same conversation, resumed, with Remote Control registered
+      toast(`· restarting the orchestrator with Remote Control${name ? ` as "${name}"` : ""}…`);
+      void client
+        .enableRemoteControl(name)
+        .then(() =>
+          notice(
+            `· Remote Control is on${name ? ` as "${name}"` : ""}; the session was resumed under it. Find it in Claude Code's remote sessions.`,
+          ),
+        )
+        .catch((err: unknown) =>
+          notice(`! could not turn Remote Control on: ${err instanceof Error ? err.message : String(err)}`, true),
+        );
+      return;
+    }
     if (global?.name === "/permissions") {
       const mode = text.split(/\s+/).slice(1).join(" ").trim();
       if (!mode) {
@@ -465,13 +516,7 @@ export function App({
         notice(`! usage: /thinking <${CLAUDE_EFFORT_LEVELS.join("|")}>`, true);
         return;
       }
-      setEffort(level);
-      dispatch({
-        type: "sent",
-        text: `/effort ${level}`,
-        display: `/thinking ${level}`,
-      });
-      void client.setEffort(level).catch(() => notice("! orchestrator is not running", true));
+      setOrchestratorEffort(level);
       return;
     }
     if (target?.kind === "worker") {
@@ -546,17 +591,25 @@ export function App({
         piFleetDir: watcher.piFleetDir,
         runId: run.runId,
       })
-        .then((r) => notice(r.notice, r.error))
+        .then((r) => toast(r.notice, r.error))
         .catch((err: unknown) =>
-          notice(`! ${err instanceof Error ? err.message : String(err)}`, true),
+          toast(`! ${err instanceof Error ? err.message : String(err)}`, true),
         );
       return;
     }
-    const next = nextLevel(CLAUDE_EFFORT_LEVELS, effort);
-    setEffort(next);
-    dispatch({ type: "sent", text: `/effort ${next}`, display: `/thinking ${next}` });
+    setOrchestratorEffort(nextLevel(CLAUDE_EFFORT_LEVELS, effort));
+  };
+
+  /**
+   * Set the orchestrator's reasoning level. It is a settings change, not
+   * something said to the model, so it shows as a passing note above the
+   * composer and leaves the transcript alone.
+   */
+  const setOrchestratorEffort = (level: string): void => {
+    setPendingEffort(level);
+    toast(`· thinking ${level}`);
     void client
-      .setEffort(next)
+      .setEffort(level)
       .catch(() => notice("! orchestrator is not running", true));
   };
 

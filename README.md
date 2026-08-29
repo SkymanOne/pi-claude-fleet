@@ -46,6 +46,8 @@ Each rail row carries what that session is doing — the tool a worker is in, `n
 
 The status line describes whatever is selected: for a worker its state, model, reasoning level and branch, so you always see the model that worker is actually running (what pi resolved, not just the pattern you asked for); for the orchestrator its model, session, spend and turns.
 
+Remote Control is a launch flag rather than something the session can be told mid-conversation, so `/rc` gives the orchestrator a new claude process with the flag set: same conversation, resumed under it, transcript kept. `pi-fleet --remote-control [name]` starts that way, and the choice is remembered if the orchestrator restarts.
+
 A line above the composer says what the selected session is doing while it works — `✻ thinking… 12s`, `✎ replying…`, or the tool it is in — and the rail says the same for every session at a glance.
 
 Keys: `tab` / `shift-tab` (or `ctrl+n` / `ctrl+p`) switch between the orchestrator and the workers, `esc` interrupts the orchestrator's turn, `ctrl-c` quits. Only non-printable keys are bound, so a message that starts with "q" does not quit the app.
@@ -59,8 +61,9 @@ The composer at the bottom sends to whatever is selected. With the orchestrator 
 | `/followup <text>` | `/f` | `ctrl+f` | queues a message for when it finishes its current work |
 | `/stop` | `/s` | `ctrl+x` | aborts it |
 | `/remove` | `/rm` | `ctrl+r` | removes it: worktree, branch and rail row (asks first if that would destroy work) |
-| `/thinking <level>` | `/t` | `ctrl+t` | set the reasoning level of the open session — pi's `off…max` for a worker, claude's `low…max` for the orchestrator. The key steps to the next level, and each session keeps its own |
+| `/thinking <level>` | `/t` | `ctrl+t` | set the reasoning level of the open session — pi's `off…max` for a worker, claude's `low…max` for the orchestrator. The key steps to the next level, each session keeps its own, and the change is a passing note rather than a turn in the conversation |
 | `/permissions <mode>` | `/p` | `ctrl+o` | how the orchestrator's tool use is approved; with no argument it says what is in force |
+| `/rc [name]` | | | put the orchestrator on Claude Code Remote Control so you can watch it from elsewhere |
 | `/help` | `/h` | `ctrl+g` | keys and commands |
 | `/quit` | `/q` | `ctrl+d` | leave the console; workers keep running |
 | `/shutdown` | `/sd` | `ctrl+k` | stop the orchestrator and every worker, then exit (asks first; worktrees and branches are kept) |
@@ -83,7 +86,7 @@ The orchestrator and its workers are detached processes with their state on disk
 
 `/shutdown` is the other exit: it stops the orchestrator and every worker, after telling you how many are running. Worktrees and branches are kept.
 
-Options: `--cwd <dir>`, `--model <model>`, `--permission-mode <mode>`, `--fresh`, `--budget <usd>`, `--progress-events` (forward workers' progress notes to the orchestrator, off by default because they are chatty).
+Options: `--cwd <dir>`, `--model <model>`, `--permission-mode <mode>`, `--remote-control [name]`, `--fresh`, `--budget <usd>`, `--progress-events` (forward workers' progress notes to the orchestrator, off by default because they are chatty).
 
 ## What the orchestrator can and cannot do
 

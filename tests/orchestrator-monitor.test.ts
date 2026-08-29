@@ -231,6 +231,52 @@ test("a restarted orchestrator keeps the conversation; --fresh is what clears it
   }
 }, { timeout: 90_000 });
 
+test("/rc restarts the session with Remote Control, keeping the conversation", async () => {
+  const f = fixture({ FAKE_CLAUDE_SESSION_ID: "sess-remote01" });
+  const c = client(f);
+  try {
+    c.start();
+    await waitFor(() => (c.running() ? true : undefined), { timeoutMs: 20_000 });
+    const said: Record<string, unknown>[] = [];
+    c.on("record", (r) => said.push(r));
+    await c.send("before remote control");
+    await waitFor(() => (said.some((r) => r.type === "result") ? true : undefined), { timeoutMs: 20_000 });
+    const firstArgv: string[] = JSON.parse(fs.readFileSync(path.join(f.cwd, "argv.json"), "utf8"));
+    assert.equal(firstArgv.includes("--remote-control"), false, "off until asked for");
+    const firstPid = loadOrchestratorState(f.piFleetDir)!.pid!;
+
+    await c.enableRemoteControl("my-fleet");
+    await waitFor(() => (c.running() && loadOrchestratorState(f.piFleetDir)!.pid !== firstPid ? true : undefined), { timeoutMs: 20_000 });
+    // the new claude writes its argv when it starts, a moment after the monitor
+    const argv: string[] = await waitFor(
+      () => {
+        try {
+          const read = JSON.parse(fs.readFileSync(path.join(f.cwd, "argv.json"), "utf8")) as string[];
+          return read.includes("--remote-control") ? read : undefined;
+        } catch {
+          return undefined;
+        }
+      },
+      { timeoutMs: 15_000 },
+    );
+    assert.equal(argv[argv.indexOf("--remote-control") + 1], "my-fleet");
+    assert.equal(argv[argv.indexOf("--resume") + 1], "sess-remote01", "the same conversation, resumed");
+    await waitFor(() => (loadOrchestratorState(f.piFleetDir)?.remoteControl === "my-fleet" ? true : undefined), { timeoutMs: 10_000 });
+
+    // the transcript survived the restart, and the session still works
+    const events = fs.readFileSync(path.join(f.piFleetDir, "orchestrator", "events.jsonl"), "utf8");
+    assert.match(events, /before remote control/);
+    const after: Record<string, unknown>[] = [];
+    c.on("record", (r) => after.push(r));
+    await c.send("after");
+    await waitFor(() => (after.some((r) => r.type === "result") ? true : undefined), { timeoutMs: 20_000 });
+    c.stop();
+  } finally {
+    await stopMonitor(f);
+    f.restore();
+  }
+}, { timeout: 90_000 });
+
 test("shutdown ends the orchestrator for good", async () => {
   const f = fixture();
   const c = client(f);

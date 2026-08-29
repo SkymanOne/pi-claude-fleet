@@ -32,6 +32,8 @@ export interface OrchestratorClientOptions {
   fresh?: boolean;
   /** Starting permission mode for a monitor this client has to start. */
   permissionMode?: string;
+  /** Remote Control name for a monitor this client has to start. */
+  remoteControl?: string | null;
   pollMs?: number;
 }
 
@@ -42,6 +44,8 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
   private timer: NodeJS.Timeout | null = null;
   private readonly announced = new Set<string>();
   private lastStateJson = "";
+  /** Set by enableRemoteControl, for the monitor this client starts next. */
+  private remoteControl: string | null = null;
 
   constructor(private readonly options: OrchestratorClientOptions) {
     super();
@@ -115,6 +119,24 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
     await appendOrchestratorControl(this.piFleetDir, { type: "permission_mode", mode });
   }
 
+  /**
+   * Remote Control is a launch flag, so turning it on means giving the session a
+   * new claude process: the monitor stops, and a new one resumes the same
+   * session with the flag set. The transcript is kept.
+   */
+  async enableRemoteControl(name: string): Promise<void> {
+    this.remoteControl = name;
+    await this.shutdown();
+    const state = loadOrchestratorState(this.piFleetDir);
+    const pid = state?.pid ?? null;
+    const deadline = Date.now() + 10_000;
+    while (pid && isAlive(pid) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    this.announced.clear();
+    this.spawnMonitor(false);
+  }
+
   async allow(requestId: string, updatedPermissions?: PermissionUpdate[]): Promise<void> {
     await this.respond(requestId, { behavior: "allow", updatedPermissions });
   }
@@ -144,10 +166,14 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
     }
   }
 
-  private spawnMonitor(): void {
+  /** `fresh` only ever comes from the launch flag; a restart must resume. */
+  private spawnMonitor(fresh: boolean = Boolean(this.options.fresh)): void {
     const paths = orchestratorPaths(this.piFleetDir);
     // a restarted monitor keeps the mode the last one was running in
-    const mode = this.options.permissionMode ?? loadOrchestratorState(this.piFleetDir)?.permissionMode ?? null;
+    const previous = loadOrchestratorState(this.piFleetDir);
+    const mode = this.options.permissionMode ?? previous?.permissionMode ?? null;
+    // undefined means "leave it off"; "" means on with an automatic name
+    const remote = this.remoteControl ?? this.options.remoteControl ?? previous?.remoteControl ?? null;
     const logFd = fs.openSync(paths.monitorLog, "a");
     const args = [
       ...cliSpawnArgs(),
@@ -158,7 +184,8 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
       ...(this.options.model ? ["--model", this.options.model] : []),
       ...(this.options.budget ? ["--budget", this.options.budget] : []),
       ...(mode ? ["--permission-mode", mode] : []),
-      ...(this.options.fresh ? ["--fresh"] : []),
+      ...(remote !== null ? ["--remote-control", ...(remote ? [remote] : [])] : []),
+      ...(fresh ? ["--fresh"] : []),
     ];
     const child = spawn(process.execPath, args, { detached: true, stdio: ["ignore", logFd, logFd] });
     child.unref();

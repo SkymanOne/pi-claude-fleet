@@ -242,6 +242,14 @@ export function setPermissionModeRequest(requestId: string, mode: PermissionMode
   return controlRequest(requestId, { subtype: "set_permission_mode", mode });
 }
 
+/**
+ * Merge settings into the running session — `effort`, say. Unlike sending
+ * `/effort` as a message, this changes nothing in the conversation.
+ */
+export function applyFlagSettingsRequest(requestId: string, settings: Record<string, unknown>): ControlRequestMessage {
+  return controlRequest(requestId, { subtype: "apply_flag_settings", settings });
+}
+
 /** The SDK's session handshake; every field is optional, so a bare one is valid. */
 export function initializeRequest(requestId: string, extra: Record<string, unknown> = {}): ControlRequestMessage {
   return controlRequest(requestId, { subtype: "initialize", ...extra });

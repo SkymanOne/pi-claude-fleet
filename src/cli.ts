@@ -187,7 +187,8 @@ const tuiOptions = (cmd: Command): Command =>
     .option(
       "--permission-mode <mode>",
       "how the orchestrator's tool use is approved: default, auto, acceptEdits, dontAsk, plan",
-    );
+    )
+    .option("--remote-control [name]", "put the orchestrator on Claude Code Remote Control");
 
 const runTui = async (rest: string[], options: OptionValues): Promise<void> => {
   // `tui` is the default command, so an unrecognized subcommand lands here as an operand.
@@ -205,6 +206,7 @@ const runTui = async (rest: string[], options: OptionValues): Promise<void> => {
       budget: options.budget,
       progressEvents: options.progressEvents,
       permissionMode: options.permissionMode,
+      remoteControl: options.remoteControl === true ? "" : options.remoteControl,
     }),
   );
 };
@@ -232,6 +234,7 @@ program
   .option("--budget <usd>", "stop after this much spend")
   .option("--fresh", "start a new claude session")
   .option("--permission-mode <mode>", "starting permission mode")
+  .option("--remote-control [name]", "register with Claude Code Remote Control")
   .action(async (piFleetDir: string, options: OptionValues) => {
     const { runOrchestratorMonitor } = await import("./orchestrator/monitor.js");
     done(
@@ -242,6 +245,7 @@ program
         budget: options.budget ? Number(options.budget) : null,
         fresh: Boolean(options.fresh),
         permissionMode: options.permissionMode ?? null,
+        remoteControl: options.remoteControl === true ? "" : (options.remoteControl ?? null),
       }),
     );
   });

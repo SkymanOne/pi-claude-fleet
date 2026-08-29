@@ -26,6 +26,8 @@ export interface TuiArgs {
   maxWorkers?: number;
   /** How the orchestrator's tool use is approved; the console can change it later. */
   permissionMode?: string;
+  /** Register the orchestrator with Claude Code Remote Control ("" for an automatic name). */
+  remoteControl?: string | null;
 }
 
 function isInteractiveTerminal(): boolean {
@@ -79,6 +81,7 @@ export async function cmdTui(args: TuiArgs): Promise<number> {
     budget: args.budget,
     fresh: args.fresh,
     permissionMode: args.permissionMode,
+    remoteControl: args.remoteControl,
   });
   const watcher = new FleetWatcher({
     piFleetDir,

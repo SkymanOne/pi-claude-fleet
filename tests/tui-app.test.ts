@@ -619,34 +619,27 @@ test(
   { timeout: 60_000 },
 );
 
-test(
-  "/thinking sets the orchestrator's effort and shows it in the status line",
-  async () => {
-    const h = setup();
-    const app = renderApp(h);
-    try {
-      await frameMatching(app.lastFrame, /orchestrator > /);
-      await type(app, "/thinking nonsense");
-      await frameMatching(
-        app.lastFrame,
-        /usage: \/thinking <low\|medium\|high\|xhigh\|max>/,
-      );
-      await type(app, "/thinking high");
-      // the console shows what you typed, and claude receives its own /effort
-      await frameMatching(app.lastFrame, /> \/thinking high/);
-      await frameMatching(app.lastFrame, /thinking high/);
-      const sent = await waitFor(
-        () =>
-          h.stdinLog().includes("/effort high") ? h.stdinLog() : undefined,
-        { timeoutMs: 8000 },
-      );
-      assert.match(sent, /"content":"\/effort high"/);
-    } finally {
-      await teardown(h, app);
-    }
-  },
-  { timeout: 60_000 },
-);
+test("/thinking sets the orchestrator's effort without saying anything to it", async () => {
+  const h = setup();
+  const app = renderApp(h);
+  try {
+    await frameMatching(app.lastFrame, /orchestrator > /);
+    await type(app, "/thinking nonsense");
+    await frameMatching(app.lastFrame, /usage: \/thinking <low\|medium\|high\|xhigh\|max>/);
+
+    await type(app, "/thinking high");
+    const frame = await frameMatching(app.lastFrame, /· thinking high/);
+    assert.match(frame, /thinking high · tab switch/, "the status line carries the level");
+    assert.equal(frame.includes("/effort"), false, "it is a settings change, not a message");
+    await waitFor(
+      () => (loadOrchestratorState(h.piFleetDir)?.effort === "high" ? true : undefined),
+      { timeoutMs: 15_000 },
+    );
+    assert.equal(h.stdinLog().includes('"/effort'), false, "nothing was said to the model");
+  } finally {
+    await teardown(h, app);
+  }
+}, { timeout: 60_000 });
 
 test("/permissions reports the mode, rejects nonsense, and sets auto", async () => {
   const h = setup();
@@ -675,7 +668,7 @@ test("/permissions reports the mode, rejects nonsense, and sets auto", async () 
   }
 }, { timeout: 60_000 });
 
-test("ctrl+t steps the reasoning level of the session that is open, each on its own levels", async () => {
+test("ctrl+t steps the level of the open session, as a toolbar note rather than a chat turn", async () => {
   const h = setup();
   const { runDir } = await addRun(h.piFleetDir, "db", { thinkingLevel: "medium" });
   const app = renderApp(h);
@@ -683,9 +676,15 @@ test("ctrl+t steps the reasoning level of the session that is open, each on its 
     // the orchestrator cycles claude's effort levels
     await frameMatching(app.lastFrame, /orchestrator > /);
     await press(app, CTRL_T);
-    await frameMatching(app.lastFrame, /> \/thinking low/);
+    await frameMatching(app.lastFrame, /· thinking low/);
     await press(app, CTRL_T);
-    await frameMatching(app.lastFrame, /> \/thinking medium/);
+    const second = await frameMatching(app.lastFrame, /· thinking medium/);
+    // nothing about it is said to the model, and the composer is untouched
+    assert.equal(second.includes("/effort"), false, "the level change is not a message");
+    assert.equal(/> \/thinking/.test(second), false, "nor a prompt in the transcript");
+    assert.match(second, /orchestrator > \/help/, "the composer is still empty");
+    assert.match(second, /thinking medium · tab switch/, "and the status line carries it");
+    assert.equal(h.stdinLog().includes("/effort"), false, "claude was told through a settings merge");
     assert.equal(
       fs.existsSync(path.join(runDir, "control.jsonl")),
       false,
@@ -710,11 +709,11 @@ test("ctrl+t steps the reasoning level of the session that is open, each on its 
     const line = JSON.parse(control.split("\n")[0]);
     assert.deepEqual([line.type, line.message, line.source], ["thinking", "high", "console"]);
 
-    // and back on the orchestrator, its own cycle carried on where it was
+    // back on the orchestrator, its own cycle carried on where it was
     await press(app, "\t");
     await frameMatching(app.lastFrame, /orchestrator > /);
     await press(app, CTRL_T);
-    await frameMatching(app.lastFrame, /> \/thinking high/);
+    await frameMatching(app.lastFrame, /· thinking high/);
   } finally {
     await teardown(h, app);
   }

@@ -90,6 +90,11 @@ export const COMMANDS: CommandSpec[] = [
     aliases: ["/perm", "/p"],
   },
   {
+    name: "/rc",
+    detail: "hand the orchestrator to Claude Code Remote Control so you can watch it from elsewhere",
+    takesArgument: true,
+  },
+  {
     name: "/help",
     detail: "keys and commands",
     shortcut: "ctrl+g",

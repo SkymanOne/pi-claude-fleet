@@ -50,6 +50,8 @@ export interface OrchestratorState {
   effort: string | null;
   /** How permission prompts are handled: default, auto, acceptEdits, dontAsk, plan. */
   permissionMode: string;
+  /** Remote Control name this session was started with, or null when it is off. */
+  remoteControl: string | null;
   startedAt: string;
   lastActivity: string | null;
   pendingRequests: PendingRequestRecord[];
@@ -74,6 +76,7 @@ export function newOrchestratorState(cwd: string): OrchestratorState {
     activity: null,
     effort: null,
     permissionMode: "default",
+    remoteControl: null,
     startedAt: new Date().toISOString(),
     lastActivity: null,
     pendingRequests: [],
