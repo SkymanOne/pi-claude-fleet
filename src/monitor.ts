@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { splitJsonLines, parseLineSafe, nowIso, readNewLines } from "./util.js";
+import { parseEnvelope } from "./fleet/envelope.js";
 import { FLEET_EXTENSION_PATH, FLEET_SKILL_PATH } from "./paths.js";
 import {
   loadState,
@@ -210,6 +211,7 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
       settledHandled = true;
       state.status = pendingAbort ? "stopped" : "settled";
       state.settledAt = nowIso();
+      state.pendingQuestion = null;
       void flushNow();
       send({ id: "fleet-last", type: "get_last_assistant_text" });
       lastTextTimer = setTimeout(beginShutdown, LAST_TEXT_TIMEOUT_MS);
@@ -260,6 +262,23 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
   const controlPath = path.join(runDir, "control.jsonl");
   let controlOffset = 0;
   const handleControl = (msg: ControlMessage): void => {
+    if (msg.type === "answer") {
+      // The worker's fleet_ask reads the answer from control.jsonl itself; we only record it.
+      if (typeof msg.message !== "string") return;
+      const source = msg.source ?? "unknown";
+      if (settledHandled) {
+        writeEvent({ type: "control_dropped", control: msg.type, source, reason: "run already settled" });
+        return;
+      }
+      const questionId = msg.questionId ?? null;
+      writeEvent({ type: "answer_delivered", questionId, source, message: msg.message });
+      recordSteering(state, { source, message: `answer(${questionId ?? "?"}): ${msg.message}`, ts: nowIso() });
+      if (state.pendingQuestion && (questionId === null || state.pendingQuestion.id === questionId)) {
+        state.pendingQuestion = null;
+      }
+      void flushNow();
+      return;
+    }
     if (msg.type === "steer" || msg.type === "follow_up") {
       if (typeof msg.message !== "string") return;
       if (settledHandled) {
@@ -276,8 +295,35 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
       requestAbort();
     }
   };
-  const controlTimer = setInterval(() => {
-    if (finished || !promptSent) return;
+  // Outbox: the worker's fleet_ask / fleet_progress write envelopes here; we
+  // mirror them into events.jsonl and state so observers never read the outbox.
+  const outboxPath = path.join(runDir, "outbox.jsonl");
+  let outboxOffset = 0;
+  const handleOutbox = (env: { id: string; ts: string; type: string; payload: unknown }): void => {
+    const payload = (env.payload ?? {}) as Record<string, unknown>;
+    if (env.type === "question") {
+      const question = typeof payload.question === "string" ? payload.question : "";
+      const options = Array.isArray(payload.options) ? payload.options.map(String) : null;
+      const context = typeof payload.context === "string" ? payload.context : null;
+      writeEvent({ type: "worker_question", questionId: env.id, question, options, context });
+      state.pendingQuestion = { id: env.id, question, options, context, askedAt: env.ts };
+      state.lastActivity = nowIso();
+      void flushNow();
+    } else if (env.type === "progress") {
+      const message = typeof payload.message === "string" ? payload.message : "";
+      writeEvent({ type: "worker_progress", message });
+      state.lastProgress = message;
+      state.lastActivity = nowIso();
+      dirty = true;
+    } else if (env.type === "question_resolved") {
+      const questionId = typeof payload.questionId === "string" ? payload.questionId : null;
+      const how = typeof payload.how === "string" ? payload.how : "unknown";
+      writeEvent({ type: "worker_question_resolved", questionId, how });
+      if (state.pendingQuestion && state.pendingQuestion.id === questionId) state.pendingQuestion = null;
+      void flushNow();
+    }
+  };
+  const pollMailboxes = (): void => {
     const { lines, offset } = readNewLines(controlPath, controlOffset);
     controlOffset = offset;
     for (const line of lines) {
@@ -286,6 +332,17 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
         handleControl(parsed.value);
       }
     }
+    const out = readNewLines(outboxPath, outboxOffset);
+    outboxOffset = out.offset;
+    for (const line of out.lines) {
+      const parsed = parseLineSafe<unknown>(line);
+      const env = parsed.ok ? parseEnvelope(parsed.value) : null;
+      if (env) handleOutbox(env);
+    }
+  };
+  const controlTimer = setInterval(() => {
+    if (finished || !promptSent) return;
+    pollMailboxes();
   }, CONTROL_POLL_MS);
 
   return await new Promise<number>((resolve) => {
@@ -295,6 +352,9 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
       finished = true;
       clearInterval(flusher);
       clearInterval(controlTimer);
+      // Lines written in the last poll interval (e.g. question_resolved right before
+      // settling) must still land in events.jsonl.
+      if (promptSent) pollMailboxes();
       clearTimeout(promptTimer);
       if (lastTextTimer) clearTimeout(lastTextTimer);
       for (const t of shutdownTimers) clearTimeout(t);
@@ -308,6 +368,7 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
         state.error = state.error ?? (tail ? `${reason}\n${tail}` : reason);
       }
       if (!state.settledAt) state.settledAt = nowIso();
+      state.pendingQuestion = null;
       await flushNow();
       resolve(0);
     };
