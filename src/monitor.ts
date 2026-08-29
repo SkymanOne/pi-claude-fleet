@@ -181,6 +181,15 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
 
   const handleEvent = (ev: RpcEvent): void => {
     if (ev.type === "response") {
+      if (ev.command === "get_state" && ev.success) {
+        const model = ev.data?.model;
+        if (model && typeof model === "object") {
+          state.activeModel = typeof model.id === "string" ? model.id : (typeof model.name === "string" ? model.name : null);
+          state.activeProvider = typeof model.provider === "string" ? model.provider : null;
+          dirty = true;
+        }
+        return;
+      }
       if (ev.command === "get_last_assistant_text" && ev.success) {
         state.lastAssistantText = ev.data?.text ?? state.lastAssistantText;
         void flushNow();
@@ -248,6 +257,8 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
 
   const promptTimer = setTimeout(() => {
     if (finished) return;
+    // ask pi what it actually resolved, so the console can show the worker's real model
+    send({ id: "fleet-state", type: "get_state" });
     writeEvent({ type: "task_prompt", brief: state.taskBrief });
     send({
       id: "fleet-init",

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { newRunState, deriveView, appendControl } from "../src/state.js";
+import { newRunState, deriveView, appendControl, modelLabel } from "../src/state.js";
 import { tmpDir } from "./helpers.js";
 
 const base = {
@@ -14,6 +14,13 @@ test("new run state has no pending question or progress", () => {
   const s = newRunState(base);
   assert.equal(s.pendingQuestion, null);
   assert.equal(s.lastProgress, null);
+});
+
+test("modelLabel prefers the model pi resolved over the requested pattern", () => {
+  assert.equal(modelLabel({ activeModel: "glm-5.3-flash", model: "glm" }), "glm-5.3-flash");
+  assert.equal(modelLabel({ activeModel: null, model: "glm" }), "glm");
+  assert.equal(modelLabel({ activeModel: null, model: null }), null);
+  assert.equal(modelLabel({}), null, "state files written before the field existed");
 });
 
 test("deriveView is blocked only while running with a pending question", () => {

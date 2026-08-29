@@ -3,7 +3,7 @@
  * Everything here is a function of messages already received, so the components
  * stay presentational and the reducer is testable without a process.
  */
-import { deriveView, type DerivedView, type RunState } from "../state.js";
+import { deriveView, modelLabel, type DerivedView, type RunState } from "../state.js";
 import { summarizeArgs } from "../console/transcript.js";
 import { firstLine, formatAge } from "../util.js";
 import type { FleetEvent } from "../fleet/events.js";
@@ -217,29 +217,32 @@ export interface RailRun {
 }
 
 export function buildRail(args: {
-  orchestrator: { turnActive: boolean; exited: boolean; pendingApprovals: number };
+  orchestrator: { turnActive: boolean; exited: boolean; pendingApprovals: number; model?: string | null };
   runs: RailRun[];
   now?: number;
 }): RailItem[] {
   const now = args.now ?? Date.now();
   const o = args.orchestrator;
+  const orchestratorState = o.exited ? "exited" : o.pendingApprovals > 0 ? `${o.pendingApprovals} to approve` : o.turnActive ? "working" : "idle";
   const items: RailItem[] = [
     {
       key: "orchestrator",
       glyph: o.exited ? "!" : o.pendingApprovals > 0 ? "?" : o.turnActive ? "●" : "○",
       name: "orchestrator",
-      detail: o.exited ? "exited" : o.pendingApprovals > 0 ? `${o.pendingApprovals} to approve` : o.turnActive ? "working" : "idle",
+      detail: o.model ? `${orchestratorState} · ${o.model}` : orchestratorState,
       target: { kind: "orchestrator" },
       attention: o.pendingApprovals > 0 || o.exited,
     },
   ];
   for (const run of args.runs) {
     const view = deriveView(run.state, undefined, now);
+    const model = modelLabel(run.state);
+    const age = formatAge(Math.max(0, now - Date.parse(run.state.createdAt)));
     items.push({
       key: run.runId,
       glyph: WORKER_GLYPHS[view] ?? "·",
       name: run.state.name,
-      detail: `${view} ${formatAge(Math.max(0, now - Date.parse(run.state.createdAt)))}`,
+      detail: model ? `${view} ${age} · ${model}` : `${view} ${age}`,
       target: { kind: "worker", runId: run.runId, runDir: run.runDir },
       attention: view === "blocked",
     });

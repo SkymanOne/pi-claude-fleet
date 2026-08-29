@@ -70,6 +70,9 @@ export interface RunState {
   error: string | null;
   /** Set while the worker waits in `fleet_ask`; absent in state files written before this field existed. */
   pendingQuestion?: PendingQuestion | null;
+  /** The model pi actually resolved (from its `get_state`), as opposed to the `--model` pattern asked for. */
+  activeModel?: string | null;
+  activeProvider?: string | null;
   /** Last `fleet_progress` message. */
   lastProgress?: string | null;
 }
@@ -134,6 +137,8 @@ export function newRunState(input: {
     error: null,
     pendingQuestion: null,
     lastProgress: null,
+    activeModel: null,
+    activeProvider: null,
   };
 }
 
@@ -216,6 +221,11 @@ export function deriveView(
 ): DerivedView {
   const status = deriveStatus(state, liveness, now);
   return status === "running" && state.pendingQuestion ? "blocked" : status;
+}
+
+/** What to show as a run's model: what pi resolved, else the requested pattern. */
+export function modelLabel(state: Pick<RunState, "activeModel" | "model">): string | null {
+  return state.activeModel ?? state.model ?? null;
 }
 
 export function recordToolActivity(

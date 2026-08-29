@@ -163,6 +163,19 @@ process.stdin.on("data", (chunk) => {
       aborted = true;
       send({ type: "response", command: "abort", success: true });
       settle();
+    } else if (msg.type === "get_state") {
+      send({
+        id: msg.id,
+        type: "response",
+        command: "get_state",
+        success: true,
+        data: {
+          model: { id: process.env.FAKE_PI_MODEL_ID || "fake/model-1", name: "Fake Model", provider: process.env.FAKE_PI_PROVIDER || "fakeprovider" },
+          thinkingLevel: "medium",
+          isStreaming: false,
+          sessionId: "fake-session",
+        },
+      });
     } else if (msg.type === "get_last_assistant_text") {
       send({ id: msg.id, type: "response", command: "get_last_assistant_text", success: true, data: { text: "Working: wrote hello.txt" } });
     }

@@ -13,6 +13,18 @@ const settledState = (root: string) =>
     return TERMINAL.includes(s.status) ? s : undefined;
   }, { timeoutMs: 30_000 });
 
+test("the monitor records the model pi resolved", async () => {
+  const root = initRepo("pf-model-");
+  const r = await runCli(["spawn", "w", "--cwd", root, "--no-worktree", "--", "t"],
+    { env: fakePiEnv({ FAKE_PI_MODEL_ID: "vendor/model-9", FAKE_PI_PROVIDER: "vendorco" }) });
+  assert.equal(r.code, 0, r.stderr);
+  const state = await waitFor(() => (readState(root).activeModel ? readState(root) : undefined), { timeoutMs: 20_000 });
+  assert.equal(state.activeModel, "vendor/model-9");
+  assert.equal(state.activeProvider, "vendorco");
+  const status = await runCli(["status", "w", "--cwd", root]);
+  assert.equal(JSON.parse(status.stdout).activeModel, "vendor/model-9");
+}, { timeout: 60_000 });
+
 test("full run: spawn → settled → lastAssistantText + report + events captured; monitor exits", async () => {
   const root = initRepo("pf-mon-");
   const r = await runCli(["spawn", "auth", "--cwd", root, "--no-worktree", "--", "create hello.txt"],

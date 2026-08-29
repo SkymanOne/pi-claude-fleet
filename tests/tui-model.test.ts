@@ -114,6 +114,11 @@ test("the rail glyphs the orchestrator and every worker, and flags what needs th
   const idle = buildRail({ orchestrator: { turnActive: false, exited: false, pendingApprovals: 0 }, runs, now });
   assert.deepEqual(idle.map((i) => `${i.glyph}${i.name}`), ["○orchestrator", "●add-auth", "?db", "✓docs", "!gone"]);
   assert.deepEqual(idle.map((i) => i.detail), ["idle", "running 10m", "blocked 10m", "settled 10m", "dead 10m"]);
+  assert.deepEqual(
+    buildRail({ orchestrator: { turnActive: false, exited: false, pendingApprovals: 0, model: "sonnet" }, runs: [mk("m1", { status: "running", activeModel: "glm-5.3-flash" }), mk("m2", { status: "running", model: "requested-pattern" })], now }).map((i) => i.detail),
+    ["idle · sonnet", "running 10m · glm-5.3-flash", "running 10m · requested-pattern"],
+    "the resolved model wins over the requested pattern, and both beat nothing",
+  );
   assert.deepEqual(idle.map((i) => i.attention), [false, false, true, false, false]);
   assert.deepEqual(idle[1].target, { kind: "worker", runId: "add-auth-1", runDir: "/f/runs/add-auth-1" });
   assert.deepEqual(idle[0].target, { kind: "orchestrator" });

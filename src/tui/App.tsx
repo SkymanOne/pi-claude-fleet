@@ -86,8 +86,8 @@ export function App({ proc, watcher, onQuit, railPollMs = 500 }: AppProps) {
   }, [watcher, railPollMs]);
 
   const items = useMemo(
-    () => buildRail({ orchestrator: { turnActive: view.turnActive, exited: view.exited, pendingApprovals: approvals.length }, runs, now }),
-    [view.turnActive, view.exited, approvals.length, runs, now],
+    () => buildRail({ orchestrator: { turnActive: view.turnActive, exited: view.exited, pendingApprovals: approvals.length, model: view.model }, runs, now }),
+    [view.turnActive, view.exited, approvals.length, view.model, runs, now],
   );
   const index = Math.min(selected, items.length - 1);
   const current = items[index];
