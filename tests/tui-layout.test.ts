@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { rowsFor, visibleTail, transcriptRows, MIN_TRANSCRIPT_ROWS, CHROME_BASE } from "../src/tui/layout.js";
+import { rowsFor, visibleTail, visibleTailWithNotice, transcriptRows, MIN_TRANSCRIPT_ROWS, CHROME_BASE } from "../src/tui/layout.js";
 
 const line = (text: string) => ({ text });
 const texts = (r: { lines: { text: string }[] }) => r.lines.map((l) => l.text);
@@ -30,6 +30,15 @@ test("visibleTail keeps the newest lines that fit and reports the rest", () => {
   // one line taller than the whole budget is still shown rather than a blank pane
   assert.deepEqual(texts(visibleTail([line("y".repeat(500))], 2, 80, (l) => l.text)), ["y".repeat(500)]);
   assert.deepEqual(visibleTail(lines, 0, 80, (l) => l.text), { lines: [], hidden: 4 });
+});
+
+test("visibleTailWithNotice reserves a row for the notice it will print", () => {
+  const lines = ["a", "b", "c", "d"].map(line);
+  const plain = visibleTailWithNotice(lines, 4, 80, (l) => l.text);
+  assert.deepEqual(texts(plain), ["a", "b", "c", "d"], "nothing hidden, nothing reserved");
+  const clipped = visibleTailWithNotice(lines, 3, 80, (l) => l.text);
+  assert.deepEqual(texts(clipped), ["c", "d"], "one of the three rows goes to the notice");
+  assert.equal(clipped.hidden, 2);
 });
 
 test("transcriptRows leaves room for the chrome and never collapses", () => {

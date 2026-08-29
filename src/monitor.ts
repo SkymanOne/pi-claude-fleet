@@ -186,8 +186,15 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
         if (model && typeof model === "object") {
           state.activeModel = typeof model.id === "string" ? model.id : (typeof model.name === "string" ? model.name : null);
           state.activeProvider = typeof model.provider === "string" ? model.provider : null;
-          dirty = true;
         }
+        if (typeof ev.data?.thinkingLevel === "string") state.thinkingLevel = ev.data.thinkingLevel;
+        dirty = true;
+        return;
+      }
+      if (ev.command === "set_thinking_level") {
+        // the level we asked for is only real once pi confirms it
+        if (ev.success) send({ id: "fleet-state", type: "get_state" });
+        else writeEvent({ type: "thinking_rejected", error: ev.error ?? "unknown error" });
         return;
       }
       if (ev.command === "get_commands" && ev.success) {
@@ -309,6 +316,12 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
         state.pendingQuestion = null;
       }
       void flushNow();
+      return;
+    }
+    if (msg.type === "thinking") {
+      if (typeof msg.message !== "string") return;
+      if (!send({ id: "fleet-thinking", type: "set_thinking_level", level: msg.message })) return;
+      writeEvent({ type: "thinking_requested", source: msg.source ?? "unknown", level: msg.message });
       return;
     }
     if (msg.type === "command") {

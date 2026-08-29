@@ -35,6 +35,25 @@ test("the monitor records the commands the worker offers, and forwards one as a 
   await runCli(["wait", "w", "--cwd", root, "--timeout", "15"]);
 }, { timeout: 60_000 });
 
+test("the monitor reports and changes the worker's thinking level", async () => {
+  const root = initRepo("pf-think-");
+  assert.equal((await runCli(["spawn", "w", "--cwd", root, "--no-worktree", "--", "t"], { env: fakePiEnv({ FAKE_PI_DELAY_MS: "20000", FAKE_PI_THINKING: "low" }) })).code, 0);
+  const runId = firstRunId(root);
+  const runDir = path.join(fleetDirOf(root), "runs", runId);
+  await waitFor(() => (readState(root, runId).thinkingLevel ? true : undefined), { timeoutMs: 20_000 });
+  assert.equal(readState(root, runId).thinkingLevel, "low");
+
+  fs.appendFileSync(path.join(runDir, "control.jsonl"), JSON.stringify({ id: "t1", type: "thinking", message: "xhigh", source: "console", ts: new Date().toISOString() }) + "\n");
+  await waitFor(() => (readState(root, runId).thinkingLevel === "xhigh" ? true : undefined), { timeoutMs: 20_000 });
+  assert.match(fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8"), /thinking_requested/);
+
+  fs.appendFileSync(path.join(runDir, "control.jsonl"), JSON.stringify({ id: "t2", type: "thinking", message: "ludicrous", source: "console", ts: new Date().toISOString() }) + "\n");
+  await waitFor(() => (fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").includes("thinking_rejected") ? true : undefined), { timeoutMs: 20_000 });
+  assert.equal(readState(root, runId).thinkingLevel, "xhigh", "a rejected level does not stick");
+  await runCli(["stop", "w", "--cwd", root]);
+  await runCli(["wait", "w", "--cwd", root, "--timeout", "15"]);
+}, { timeout: 60_000 });
+
 test("the monitor records the model pi resolved", async () => {
   const root = initRepo("pf-model-");
   const r = await runCli(["spawn", "w", "--cwd", root, "--no-worktree", "--", "t"],

@@ -45,8 +45,10 @@ export const COMMANDS: CommandSpec[] = [
   { name: "/followup", detail: "queue a message for after its current work", takesArgument: true, workerOnly: true, shortcut: "ctrl+f", aliases: ["/f"] },
   { name: "/stop", detail: "abort the worker", workerOnly: true, shortcut: "ctrl+x", aliases: ["/s"] },
   { name: "/remove", detail: "remove the worker: worktree, branch, rail row", workerOnly: true, shortcut: "ctrl+r", aliases: ["/rm", "/r"] },
+  { name: "/thinking", detail: "set the reasoning level of the selected session", takesArgument: true, shortcut: "ctrl+t", aliases: ["/t"] },
   { name: "/help", detail: "keys and commands", shortcut: "ctrl+g", aliases: ["/h", "/?"] },
   { name: "/quit", detail: "close the console (workers keep running)", shortcut: "ctrl+d", aliases: ["/q"] },
+  { name: "/shutdown", detail: "stop the orchestrator and every worker, then exit", shortcut: "ctrl+k", aliases: ["/sd"] },
 ];
 
 /** Resolve a typed command word, long form or alias, to its spec. */

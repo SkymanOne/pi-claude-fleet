@@ -1,7 +1,7 @@
 import path from "node:path";
 import { useEffect, useRef, useState } from "react";
 import { Box, Text } from "ink";
-import { visibleTail } from "./layout.js";
+import { visibleTailWithNotice } from "./layout.js";
 import {
   applyEvent,
   partialText,
@@ -68,7 +68,7 @@ export function WorkerTranscript({ runDir, pollMs = 250, tailLines = 400, maxRow
   }, [eventsPath, pollMs, tailLines]);
 
   const partialRows = partial ? Math.max(1, Math.ceil(partial.length / Math.max(1, width))) : 0;
-  const { lines: shown, hidden } = visibleTail(lines, Math.max(1, maxRows - partialRows), width, (l) => l.text);
+  const { lines: shown, hidden } = visibleTailWithNotice(lines, Math.max(1, maxRows - partialRows), width, (l) => l.text);
   return (
     <Box flexDirection="column" flexGrow={1}>
       {lines.length === 0 ? <Text dimColor>(no events captured yet)</Text> : null}

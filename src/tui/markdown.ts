@@ -98,6 +98,32 @@ const QUOTE = /^\s*>\s?(.*)$/;
 const RULE = /^\s*(-{3,}|\*{3,}|_{3,})\s*$/;
 
 /** One markdown block (an assistant message, say) as renderable lines. */
+/** Kinds that read as one group; a change between groups earns a blank line. */
+function group(kind: MdLineKind): string {
+  if (kind === "table" || kind === "table-header" || kind === "table-rule") return "table";
+  if (kind === "bullet") return "list";
+  if (kind === "code") return "code";
+  if (kind === "heading") return "heading";
+  return "prose";
+}
+
+/** A blank line between groups, and after a heading, so a block is not a wall. */
+function spaced(lines: MdLine[]): MdLine[] {
+  const out: MdLine[] = [];
+  let previous: MdLine | undefined;
+  for (const line of lines) {
+    const blank = line.spans.every((s) => s.text.trim() === "");
+    if (previous && !blank) {
+      const previousBlank = previous.spans.every((s) => s.text.trim() === "");
+      const changed = group(previous.kind) !== group(line.kind) || previous.kind === "heading";
+      if (changed && !previousBlank) out.push({ kind: "text", spans: [{ text: "" }] });
+    }
+    out.push(line);
+    previous = line;
+  }
+  return out;
+}
+
 export function parseMarkdownBlock(text: string): MdLine[] {
   const out: MdLine[] = [];
   let inFence = false;
@@ -150,7 +176,7 @@ export function parseMarkdownBlock(text: string): MdLine[] {
     }
     out.push({ kind: "text", spans: parseInline(raw) });
   }
-  return out;
+  return spaced(out);
 }
 
 /** A one-line, length-bounded version of arbitrary text (tool results, JSON blobs). */

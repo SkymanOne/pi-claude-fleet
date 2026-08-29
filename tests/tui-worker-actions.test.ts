@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { workerCommand, parseAnswer, removeWorker } from "../src/tui/workerActions.js";
+import { workerCommand, parseAnswer, removeWorker, stopAllWorkers } from "../src/tui/workerActions.js";
 import { newRunState, type RunState } from "../src/state.js";
 import { initRepo, runCli, fakePiEnv, readState, firstRunId, fleetDirOf, waitFor, tmpDir, TERMINAL } from "./helpers.js";
 
@@ -169,3 +169,45 @@ test("a command the worker itself offers is sent to pi; an unknown one lists wha
   assert.match(late.notice, /is settled/);
   assert.deepEqual(control(finished.runDir), []);
 });
+
+test("/thinking sets a worker's reasoning level, and rejects anything else", async () => {
+  const { runDir, state } = mk();
+  const ok = await workerCommand({ runDir, state, input: "/thinking high" });
+  assert.deepEqual(ok, { notice: "→ db thinking level → high", error: false });
+  await workerCommand({ runDir, state, input: "/t OFF" });
+  assert.deepEqual(control(runDir).map((c) => [c.type, c.message, c.source]), [
+    ["thinking", "high", "console"],
+    ["thinking", "off", "console"],
+  ]);
+
+  const bad = await workerCommand({ runDir, state, input: "/thinking ludicrous" });
+  assert.equal(bad.error, true);
+  assert.match(bad.notice, /usage: \/thinking <off\|minimal\|low\|medium\|high\|xhigh\|max>/);
+  assert.equal((await workerCommand({ runDir, state, input: "/thinking" })).error, true);
+
+  const settled = mk({ status: "settled" });
+  const late = await workerCommand({ runDir: settled.runDir, state: settled.state, input: "/thinking high" });
+  assert.equal(late.error, true);
+  assert.match(late.notice, /no longer matters/);
+});
+
+test("stopAllWorkers aborts everything still going, and leaves finished runs alone", async () => {
+  const root = initRepo("pf-shutdown-");
+  const fleetDir = fleetDirOf(root);
+  assert.equal((await runCli(["spawn", "one", "--cwd", root, "--no-worktree", "--", "t"], { env: fakePiEnv({ FAKE_PI_DELAY_MS: "20000" }) })).code, 0);
+  assert.equal((await runCli(["spawn", "two", "--cwd", root, "--no-worktree", "--", "t"], { env: fakePiEnv({ FAKE_PI_DELAY_MS: "100" }) })).code, 0);
+  const ids = fs.readdirSync(path.join(fleetDir, "runs"));
+  assert.equal(ids.length, 2);
+  await waitFor(() => (ids.every((id) => readState(root, id).pid) ? true : undefined), { timeoutMs: 20_000 });
+  // "two" settles quickly; "one" is still running
+  const settledId = await waitFor(() => ids.find((id) => TERMINAL.includes(readState(root, id).status)), { timeoutMs: 20_000 });
+  const runningId = ids.find((id) => id !== settledId)!;
+
+  const stopped = await stopAllWorkers(fleetDir);
+  assert.deepEqual(stopped, [readState(root, runningId).name], "only the live one is aborted");
+  const control = fs.readFileSync(path.join(fleetDir, "runs", runningId, "control.jsonl"), "utf8");
+  assert.match(control, /"type":"abort"/);
+  assert.match(control, /"source":"console"/);
+  assert.equal(fs.existsSync(path.join(fleetDir, "runs", settledId!, "control.jsonl")), false);
+  await waitFor(() => (TERMINAL.includes(readState(root, runningId).status) ? true : undefined), { timeoutMs: 20_000 });
+}, { timeout: 60_000 });

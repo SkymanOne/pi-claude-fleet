@@ -82,6 +82,8 @@ export interface RunState {
   activeProvider?: string | null;
   /** Commands, skills and prompt templates this worker offers (pi's `get_commands`). */
   commands?: WorkerCommand[];
+  /** The reasoning level pi is running at, as it reports it. */
+  thinkingLevel?: string | null;
   /** Last `fleet_progress` message. */
   lastProgress?: string | null;
 }
@@ -149,6 +151,7 @@ export function newRunState(input: {
     activeModel: null,
     activeProvider: null,
     commands: [],
+    thinkingLevel: null,
   };
 }
 
@@ -234,6 +237,9 @@ export function deriveView(
 }
 
 /** What to show as a run's model: what pi resolved, else the requested pattern. */
+/** pi's reasoning levels, lowest to highest; the last two need a model that supports them. */
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
 export function modelLabel(state: Pick<RunState, "activeModel" | "model">): string | null {
   return state.activeModel ?? state.model ?? null;
 }
@@ -262,7 +268,7 @@ export function recordSteering(
 }
 
 /** `command` carries a slash command for pi to expand (skills, prompt templates, extension commands). */
-export type ControlType = "steer" | "follow_up" | "abort" | "answer" | "command";
+export type ControlType = "steer" | "follow_up" | "abort" | "answer" | "command" | "thinking";
 
 /** One line of `control.jsonl` (orchestrator/console → monitor and the worker's `fleet_ask`). */
 export interface ControlMessage {

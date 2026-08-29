@@ -242,6 +242,27 @@ test("the handshake goes out before the first turn, so prompts arrive even when 
   }
 }, { timeout: 20_000 });
 
+test("stop() ends a running turn before closing the child", async () => {
+  const root = tmpDir("pf-proc-stopturn-");
+  const proc = startProc(root);
+  try {
+    const firstDelta = once(proc, "text_delta");
+    proc.send("slow:");
+    await firstDelta;
+    assert.equal(proc.turnActive, true);
+    await proc.stop();
+    // the interrupt went out before the child was closed, so the turn is not
+    // left half-finished for the next session to resume into
+    const log = fs.readFileSync(path.join(root, "orchestrator.log"), "utf8");
+    const interruptAt = log.indexOf('"subtype":"interrupt"');
+    assert.ok(interruptAt > 0, "an interrupt was sent");
+    assert.match(log.slice(interruptAt), /"result"/, "and the turn ended before we closed the child");
+    assert.equal(proc.turnActive, false);
+  } finally {
+    await proc.stopNow();
+  }
+}, { timeout: 20_000 });
+
 test("stop() escalates to SIGTERM/SIGKILL for a child that ignores stdin closing", async () => {
   const root = tmpDir("pf-proc-6-");
   const promptFile = path.join(root, "p.md");

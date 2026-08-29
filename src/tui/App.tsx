@@ -1,9 +1,18 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { Box, Text, useInput, useStdout } from "ink";
-import { OrchestratorProcess, type PermissionRequest } from "../orchestrator/process.js";
-import { FleetWatcher } from "../fleet/watcher.js";
+import type {
+  OrchestratorProcess,
+  PermissionRequest,
+} from "../orchestrator/process.js";
+import type { FleetWatcher } from "../fleet/watcher.js";
 import { formatFleetBatch, type FleetEvent } from "../fleet/events.js";
-import { deriveStatus, deriveView, modelLabel, type RunState } from "../state.js";
+import {
+  deriveStatus,
+  deriveView,
+  modelLabel,
+  TERMINAL_STATES,
+  type RunState,
+} from "../state.js";
 import { Rail } from "./Rail.js";
 import { Transcript } from "./Transcript.js";
 import { WorkerTranscript } from "./WorkerTranscript.js";
@@ -14,8 +23,19 @@ import { Approval } from "./Approval.js";
 import { Confirm } from "./Confirm.js";
 import { helpText, HINT } from "./keys.js";
 import { transcriptRows, CHROME_BASE } from "./layout.js";
-import { completionsFor, applySuggestion, listRepoFiles, resolveCommand, SHORTCUTS, type CompletionState } from "./completions.js";
-import { workerCommand, removeWorker } from "./workerActions.js";
+import {
+  completionsFor,
+  applySuggestion,
+  listRepoFiles,
+  resolveCommand,
+  SHORTCUTS,
+  type CompletionState,
+} from "./completions.js";
+import {
+  workerCommand,
+  removeWorker,
+  stopAllWorkers,
+} from "./workerActions.js";
 import { reapMergedRuns } from "../fleet/reap.js";
 import {
   buildRail,
@@ -41,10 +61,24 @@ export interface AppProps {
 
 type Dispatchable = ClaudeStreamMessage | LocalEvent;
 
-/** reduceOrchestrator mutates; spreading gives React a new reference to render. */
-const reducer = (state: OrchestratorViewState, msg: Dispatchable): OrchestratorViewState => ({ ...reduceOrchestrator(state, msg) });
+const TERMINAL_VIEWS: string[] = [...TERMINAL_STATES];
+/** What claude's own /effort accepts. */
+const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 
-export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, cwd }: AppProps) {
+/** reduceOrchestrator mutates; spreading gives React a new reference to render. */
+const reducer = (
+  state: OrchestratorViewState,
+  msg: Dispatchable,
+): OrchestratorViewState => ({ ...reduceOrchestrator(state, msg) });
+
+export function App({
+  proc,
+  watcher,
+  onQuit,
+  railPollMs = 500,
+  reapMs = 15_000,
+  cwd,
+}: AppProps) {
   const [view, dispatch] = useReducer(reducer, undefined, initialViewState);
   const [runs, setRuns] = useState<RailRun[]>(() => watcher.runs());
   const [selected, setSelected] = useState(0);
@@ -52,10 +86,18 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
   const [input, setInput] = useState("");
   const [showHelp, setShowHelp] = useState(false);
   const [now, setNow] = useState(() => Date.now());
-  const [confirm, setConfirm] = useState<{ message: string; run: RailRun } | null>(null);
+  const [confirm, setConfirm] = useState<{
+    message: string;
+    action: "remove" | "shutdown";
+    run?: RailRun;
+  } | null>(null);
+  /** The reasoning level asked of the orchestrator, since claude does not report one. */
+  const [effort, setEffort] = useState<string | null>(null);
   // The last notice, shown above the composer: worker actions happen while a
   // worker pane is selected, so the orchestrator transcript alone would hide them.
-  const [flash, setFlash] = useState<{ text: string; error: boolean } | null>(null);
+  const [flash, setFlash] = useState<{ text: string; error: boolean } | null>(
+    null,
+  );
   const [completionIndex, setCompletionIndex] = useState(0);
   const [dismissed, setDismissed] = useState(false);
   const [files, setFiles] = useState<string[]>([]);
@@ -63,8 +105,13 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
   const historyRef = useRef<Record<string, string[]>>({});
   const [historyAt, setHistoryAt] = useState(-1);
   const { stdout } = useStdout();
-  const [size, setSize] = useState({ rows: stdout?.rows ?? 24, columns: stdout?.columns ?? 80 });
-  const [orchestratorCommands, setOrchestratorCommands] = useState(proc.slashCommands);
+  const [size, setSize] = useState({
+    rows: stdout?.rows ?? 24,
+    columns: stdout?.columns ?? 80,
+  });
+  const [orchestratorCommands, setOrchestratorCommands] = useState(
+    proc.slashCommands,
+  );
   const busy = useRef(false);
   // ink-text-input also receives the ctrl keypress and would insert it as text;
   // a shortcut sets this so the next change from the input is dropped.
@@ -72,11 +119,17 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
 
   useEffect(() => {
     const onMessage = (msg: ClaudeStreamMessage): void => dispatch(msg);
-    const onPermission = (req: PermissionRequest): void => setApprovals((q) => [...q, req]);
-    const onExit = (info: { code: number | null; signal: NodeJS.Signals | null }): void =>
+    const onPermission = (req: PermissionRequest): void =>
+      setApprovals((q) => [...q, req]);
+    const onExit = (info: {
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }): void =>
       dispatch({ type: "exit", code: info.code, signal: info.signal });
-    const onError = (err: Error): void => dispatch({ type: "error", text: `! orchestrator: ${err.message}` });
-    const onCommands = (commands: typeof proc.slashCommands): void => setOrchestratorCommands(commands);
+    const onError = (err: Error): void =>
+      dispatch({ type: "error", text: `! orchestrator: ${err.message}` });
+    const onCommands = (commands: typeof proc.slashCommands): void =>
+      setOrchestratorCommands(commands);
     proc.on("commands", onCommands);
     proc.on("message", onMessage);
     proc.on("permission_request", onPermission);
@@ -95,7 +148,11 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
     const onBatch = (events: FleetEvent[]): void => {
       const text = formatFleetBatch(events, watcher.batchLimit);
       dispatch({ type: "fleet", events, text });
-      if (!proc.send(text)) dispatch({ type: "error", text: "! could not deliver fleet events (orchestrator not running)" });
+      if (!proc.send(text))
+        dispatch({
+          type: "error",
+          text: "! could not deliver fleet events (orchestrator not running)",
+        });
     };
     watcher.on("batch", onBatch);
     return () => {
@@ -122,7 +179,11 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
       void reapMergedRuns(watcher.piFleetDir)
         .then(({ reaped }) => {
           if (stopped || reaped.length === 0) return;
-          for (const run of reaped) dispatch({ type: "notice", text: `· removed ${run.name} (merged into the repository)` });
+          for (const run of reaped)
+            dispatch({
+              type: "notice",
+              text: `· removed ${run.name} (merged into the repository)`,
+            });
           setRuns(watcher.runs());
         })
         .catch(() => {
@@ -140,7 +201,8 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
   // The frame must fit the terminal, or it scrolls and takes the rail with it.
   useEffect(() => {
     if (!stdout) return;
-    const onResize = (): void => setSize({ rows: stdout.rows ?? 24, columns: stdout.columns ?? 80 });
+    const onResize = (): void =>
+      setSize({ rows: stdout.rows ?? 24, columns: stdout.columns ?? 80 });
     onResize();
     stdout.on("resize", onResize);
     return () => {
@@ -164,29 +226,66 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
   }, [cwd]);
 
   const items = useMemo(
-    () => buildRail({ orchestrator: { turnActive: view.turnActive, exited: view.exited, pendingApprovals: approvals.length, model: view.model }, runs, now }),
+    () =>
+      buildRail({
+        orchestrator: {
+          turnActive: view.turnActive,
+          exited: view.exited,
+          pendingApprovals: approvals.length,
+          model: view.model,
+        },
+        runs,
+        now,
+      }),
     [view.turnActive, view.exited, approvals.length, view.model, runs, now],
   );
   const index = Math.min(selected, items.length - 1);
   const current = items[index];
   const target = current?.target;
-  const currentRun: RailRun | undefined = target?.kind === "worker" ? runs.find((r) => r.runId === target.runId) : undefined;
+  const currentRun: RailRun | undefined =
+    target?.kind === "worker"
+      ? runs.find((r) => r.runId === target.runId)
+      : undefined;
 
   const historyKey = target?.kind === "worker" ? target.runId : "orchestrator";
   const completion: CompletionState | null = useMemo(() => {
     if (dismissed || approvals.length > 0 || confirm || showHelp) return null;
     const agentCommands =
       target?.kind === "worker"
-        ? (runs.find((r) => r.runId === target.runId)?.state.commands ?? []).map((c) => ({ name: c.name, description: c.description, source: c.source }))
-        : orchestratorCommands.map((c) => ({ name: c.name, description: c.description, argumentHint: c.argumentHint }));
+        ? (
+            runs.find((r) => r.runId === target.runId)?.state.commands ?? []
+          ).map((c) => ({
+            name: c.name,
+            description: c.description,
+            source: c.source,
+          }))
+        : orchestratorCommands.map((c) => ({
+            name: c.name,
+            description: c.description,
+            argumentHint: c.argumentHint,
+          }));
     return completionsFor(input, {
       target: target?.kind === "worker" ? "worker" : "orchestrator",
-      workers: runs.map((r) => ({ name: r.state.name, detail: deriveStatus(r.state) })),
+      workers: runs.map((r) => ({
+        name: r.state.name,
+        detail: deriveStatus(r.state),
+      })),
       files,
       agentCommands,
     });
-  }, [input, dismissed, approvals.length, confirm, showHelp, target, runs, files, orchestratorCommands]);
-  const selectedCompletion = completion?.items[Math.min(completionIndex, completion.items.length - 1)];
+  }, [
+    input,
+    dismissed,
+    approvals.length,
+    confirm,
+    showHelp,
+    target,
+    runs,
+    files,
+    orchestratorCommands,
+  ]);
+  const selectedCompletion =
+    completion?.items[Math.min(completionIndex, completion.items.length - 1)];
 
   const notice = (text: string, error = false): void => {
     if (!text) return;
@@ -194,12 +293,20 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
     dispatch(error ? { type: "error", text } : { type: "notice", text });
   };
 
-  const move = (delta: number): void => setSelected((i) => (items.length === 0 ? 0 : (i + delta + items.length) % items.length));
+  const move = (delta: number): void =>
+    setSelected((i) =>
+      items.length === 0 ? 0 : (i + delta + items.length) % items.length,
+    );
 
   const recallHistory = (delta: number): void => {
     const entries = historyRef.current[historyKey] ?? [];
     if (entries.length === 0) return;
-    const next = historyAt === -1 ? (delta < 0 ? entries.length - 1 : -1) : historyAt + (delta < 0 ? -1 : 1);
+    const next =
+      historyAt === -1
+        ? delta < 0
+          ? entries.length - 1
+          : -1
+        : historyAt + (delta < 0 ? -1 : 1);
     if (next < 0 || next >= entries.length) {
       setHistoryAt(-1);
       setInput("");
@@ -259,7 +366,9 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
     if (approvals.length > 0 || confirm) return;
     if (completion && (key.downArrow || key.upArrow)) {
       const size = completion.items.length;
-      setCompletionIndex((i) => (key.downArrow ? (i + 1) % size : (i - 1 + size) % size));
+      setCompletionIndex((i) =>
+        key.downArrow ? (i + 1) % size : (i - 1 + size) % size,
+      );
       return;
     }
     if (key.downArrow) recallHistory(1);
@@ -279,13 +388,42 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
     if (entries[entries.length - 1] !== text) entries.push(text);
     if (entries.length > 100) entries.shift();
     // long form or alias: /q, /h, /rm all resolve here
-    const global = text.startsWith("/") ? resolveCommand(text.split(/\s+/)[0]) : null;
+    const global = text.startsWith("/")
+      ? resolveCommand(text.split(/\s+/)[0])
+      : null;
     if (global?.name === "/quit") {
       onQuit();
       return;
     }
     if (global?.name === "/help") {
       setShowHelp(true);
+      return;
+    }
+    if (global?.name === "/shutdown") {
+      const live = runs.filter(
+        (r) => !TERMINAL_VIEWS.includes(deriveStatus(r.state)),
+      ).length;
+      setConfirm({
+        message: `Stop the orchestrator and ${live} running worker${live === 1 ? "" : "s"}? Worktrees and branches are kept.`,
+        action: "shutdown",
+      });
+      return;
+    }
+    // the orchestrator has no worker mailbox: its reasoning level is claude's own /effort
+    if (global?.name === "/thinking" && target?.kind !== "worker") {
+      const level = text.split(/\s+/).slice(1).join(" ").trim().toLowerCase();
+      if (!CLAUDE_EFFORT_LEVELS.includes(level)) {
+        notice(`! usage: /thinking <${CLAUDE_EFFORT_LEVELS.join("|")}>`, true);
+        return;
+      }
+      setEffort(level);
+      dispatch({
+        type: "sent",
+        text: `/effort ${level}`,
+        display: `/thinking ${level}`,
+      });
+      if (!proc.send(`/effort ${level}`))
+        notice("! orchestrator is not running", true);
       return;
     }
     if (target?.kind === "worker") {
@@ -295,12 +433,21 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
         return;
       }
       busy.current = true;
-      void workerCommand({ runDir: run.runDir, state: run.state, input: text, piFleetDir: watcher.piFleetDir, runId: run.runId })
+      void workerCommand({
+        runDir: run.runDir,
+        state: run.state,
+        input: text,
+        piFleetDir: watcher.piFleetDir,
+        runId: run.runId,
+      })
         .then((r) => {
-          if (r.confirm) setConfirm({ message: r.confirm.message, run });
+          if (r.confirm)
+            setConfirm({ message: r.confirm.message, action: "remove", run });
           else notice(r.notice, r.error);
         })
-        .catch((err: unknown) => notice(`! ${err instanceof Error ? err.message : String(err)}`, true))
+        .catch((err: unknown) =>
+          notice(`! ${err instanceof Error ? err.message : String(err)}`, true),
+        )
         .finally(() => {
           busy.current = false;
         });
@@ -315,7 +462,11 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
    * nothing — a fully typed command or mention then runs instead of sticking.
    */
   const submit = (value: string): void => {
-    if (completion && selectedCompletion) {
+    // a command typed in full — long form or alias — runs; the popup only
+    // completes what is still partial, or "/q" would expand instead of quitting
+    const first = value.trim().split(/\s+/)[0];
+    const exact = first.startsWith("/") && resolveCommand(first) !== null;
+    if (completion && selectedCompletion && !exact) {
       const completed = applySuggestion(value, completion, selectedCompletion);
       if (completed !== value) {
         setInput(completed);
@@ -327,17 +478,41 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
     run(value);
   };
 
+  /** Stop everything — the orchestrator and every worker — and leave. */
+  const shutdown = (): void => {
+    setConfirm(null);
+    void stopAllWorkers(watcher.piFleetDir)
+      .then((stopped) => {
+        notice(
+          stopped.length > 0
+            ? `■ stopping ${stopped.join(", ")}`
+            : "■ shutting down",
+        );
+        onQuit();
+      })
+      .catch((err: unknown) => {
+        notice(`! ${err instanceof Error ? err.message : String(err)}`, true);
+        onQuit();
+      });
+  };
+
   const approval = approvals[0];
   const resolve = (fn: () => boolean): void => {
     fn();
     setApprovals((q) => q.slice(1));
   };
 
-  const workerLabel = currentRun ? `${currentRun.state.name} (${deriveStatus(currentRun.state)})` : "worker";
+  const workerLabel = currentRun
+    ? `${currentRun.state.name} (${deriveStatus(currentRun.state)})`
+    : "worker";
 
   // wide enough for the longest name, but never more than a third of the screen
   const longestName = Math.max(12, ...items.map((i) => i.name.length));
-  const railWidth = Math.min(Math.max(longestName + 4, 18), Math.max(18, Math.floor(size.columns * 0.34)), 40);
+  const railWidth = Math.min(
+    Math.max(longestName + 4, 18),
+    Math.max(18, Math.floor(size.columns * 0.34)),
+    40,
+  );
   const paneWidth = Math.max(20, size.columns - railWidth - 2);
   const suggestionRows = completion ? completion.items.length + 1 : 0;
   const overlayRows = approval ? 8 : confirm ? 4 : 0;
@@ -349,101 +524,168 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
   });
   // two rows per session (name and what it is doing), plus the separator row
   const railCapacity = Math.max(1, Math.floor((paneRows - 1) / 2));
-  const railItems = items.length > railCapacity ? items.slice(0, railCapacity) : items;
+  const railItems =
+    items.length > railCapacity ? items.slice(0, railCapacity) : items;
   const railOverflow = items.length - railItems.length;
 
   return (
-    <Box flexDirection="column">
-      <Box>
+    // A fixed height keeps every frame the same size: ink redraws the whole
+    // frame, and one that grows and shrinks with the content leaves the
+    // previous, taller frame's rows on screen.
+    <Box flexDirection="column" height={Math.max(6, size.rows - 1)}>
+      <Box flexGrow={1} overflow="hidden">
         <Box flexDirection="column" width={railWidth} flexShrink={0}>
-          <Rail items={railItems} selectedIndex={Math.min(index, railItems.length - 1)} width={railWidth} />
-          {railOverflow > 0 ? <Text dimColor>{`+${railOverflow} more`}</Text> : null}
+          <Rail
+            items={railItems}
+            selectedIndex={Math.min(index, railItems.length - 1)}
+            width={railWidth}
+          />
+          {railOverflow > 0 ? (
+            <Text dimColor>{`+${railOverflow} more`}</Text>
+          ) : null}
         </Box>
-        <Box flexDirection="column" flexGrow={1} paddingLeft={1}>
+        <Box
+          flexDirection="column"
+          flexGrow={1}
+          paddingLeft={1}
+          justifyContent="flex-end"
+        >
           {showHelp ? (
             <Text>{helpText()}</Text>
           ) : target?.kind === "worker" ? (
-            <WorkerTranscript runDir={target.runDir} maxRows={paneRows} width={paneWidth} />
+            <WorkerTranscript
+              runDir={target.runDir}
+              maxRows={paneRows}
+              width={paneWidth}
+            />
           ) : (
-            <Transcript lines={view.lines} partial={view.partial} maxRows={paneRows} width={paneWidth} />
+            <Transcript
+              lines={view.lines}
+              partial={view.partial}
+              maxRows={paneRows}
+              width={paneWidth}
+            />
           )}
         </Box>
       </Box>
-      {confirm ? (
-        <Confirm
-          message={confirm.message}
-          onYes={() => {
-            const run = confirm.run;
-            setConfirm(null);
-            void removeWorker({ piFleetDir: watcher.piFleetDir, runId: run.runId, name: run.state.name, force: true })
-              .then((r) => {
-                notice(r.notice, r.error);
-                setRuns(watcher.runs());
-              })
-              .catch((err: unknown) => notice(`! ${err instanceof Error ? err.message : String(err)}`, true));
-          }}
-          onNo={() => {
-            setConfirm(null);
-            notice("· removal cancelled");
-          }}
-        />
-      ) : approval ? (
-        <Approval
-          request={approval}
-          queued={approvals.length - 1}
-          onAllow={(updatedPermissions) => resolve(() => proc.allow(approval.requestId, updatedPermissions))}
-          onDeny={(reason) => resolve(() => proc.deny(approval.requestId, reason))}
-          onAnswer={(answers) => resolve(() => proc.answerQuestion(approval.requestId, answers))}
-        />
-      ) : (
-        <>
-          {flash ? (
-            <Text color={flash.error ? "red" : undefined} dimColor={!flash.error}>
-              {flash.text}
-            </Text>
-          ) : null}
-          {completion ? <Suggestions items={completion.items} selectedIndex={Math.min(completionIndex, completion.items.length - 1)} /> : null}
-          <Composer
-            value={input}
-            onChange={(next: string) => {
-              if (swallowNextChange.current) {
-                swallowNextChange.current = false;
+      <Box flexDirection="column" flexShrink={0}>
+        {confirm ? (
+          <Confirm
+            message={confirm.message}
+            onYes={() => {
+              const run = confirm.run;
+              if (confirm.action === "shutdown" || !run) {
+                shutdown();
                 return;
               }
-              setInput(next);
-              setDismissed(false);
-              setCompletionIndex(0);
-              setHistoryAt(-1);
+              setConfirm(null);
+              void removeWorker({
+                piFleetDir: watcher.piFleetDir,
+                runId: run.runId,
+                name: run.state.name,
+                force: true,
+              })
+                .then((r) => {
+                  notice(r.notice, r.error);
+                  setRuns(watcher.runs());
+                })
+                .catch((err: unknown) =>
+                  notice(
+                    `! ${err instanceof Error ? err.message : String(err)}`,
+                    true,
+                  ),
+                );
             }}
-            onSubmit={submit}
-            target={target?.kind === "worker" ? workerLabel : "orchestrator"}
-            hint={target?.kind === "worker" ? "type to steer · /answer · /followup · /stop · /remove · /help · /quit" : "/help · /quit"}
+            onNo={() => {
+              setConfirm(null);
+              notice(
+                confirm.action === "shutdown"
+                  ? "· shutdown cancelled"
+                  : "· removal cancelled",
+              );
+            }}
           />
-        </>
-      )}
-      <StatusLine
-        session={
-          currentRun
-            ? {
-                kind: "worker",
-                name: currentRun.state.name,
-                state: deriveView(currentRun.state),
-                model: modelLabel(currentRun.state),
-                branch: currentRun.state.branch,
+        ) : approval ? (
+          <Approval
+            request={approval}
+            queued={approvals.length - 1}
+            onAllow={(updatedPermissions) =>
+              resolve(() => proc.allow(approval.requestId, updatedPermissions))
+            }
+            onDeny={(reason) =>
+              resolve(() => proc.deny(approval.requestId, reason))
+            }
+            onAnswer={(answers) =>
+              resolve(() => proc.answerQuestion(approval.requestId, answers))
+            }
+          />
+        ) : (
+          <>
+            {flash ? (
+              <Text
+                color={flash.error ? "red" : undefined}
+                dimColor={!flash.error}
+              >
+                {flash.text}
+              </Text>
+            ) : null}
+            {completion ? (
+              <Suggestions
+                items={completion.items}
+                selectedIndex={Math.min(
+                  completionIndex,
+                  completion.items.length - 1,
+                )}
+              />
+            ) : null}
+            <Composer
+              value={input}
+              onChange={(next: string) => {
+                if (swallowNextChange.current) {
+                  swallowNextChange.current = false;
+                  return;
+                }
+                setInput(next);
+                setDismissed(false);
+                setCompletionIndex(0);
+                setHistoryAt(-1);
+              }}
+              onSubmit={submit}
+              target={target?.kind === "worker" ? workerLabel : "orchestrator"}
+              hint={
+                target?.kind === "worker"
+                  ? "type to steer · /answer · /followup · /stop · /remove · /help · /quit"
+                  : "/help · /quit"
               }
-            : {
-                kind: "orchestrator",
-                name: "orchestrator",
-                state: view.turnActive ? "working" : "idle",
-                model: view.model,
-              }
-        }
-        sessionId={view.sessionId}
-        costUsd={view.costUsd}
-        numTurns={view.numTurns}
-        pendingApprovals={approvals.length}
-        hint={showHelp ? "esc closes help" : HINT}
-      />
+            />
+          </>
+        )}
+        <StatusLine
+          session={
+            currentRun
+              ? {
+                  kind: "worker",
+                  name: currentRun.state.name,
+                  state: deriveView(currentRun.state),
+                  model: modelLabel(currentRun.state),
+                  thinking: currentRun.state.thinkingLevel ?? null,
+                  branch: currentRun.state.branch,
+                }
+              : {
+                  kind: "orchestrator",
+                  name: "orchestrator",
+                  state: view.turnActive ? "working" : "idle",
+                  model: view.model,
+                  thinking: effort,
+                }
+          }
+          sessionId={view.sessionId}
+          costUsd={view.costUsd}
+          numTurns={view.numTurns}
+          pendingApprovals={approvals.length}
+          hint={showHelp ? "esc closes help" : HINT}
+        />
+      </Box>
     </Box>
   );
 }

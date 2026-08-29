@@ -38,12 +38,12 @@ test("rank puts prefix matches before substring matches", () => {
 
 test("slash commands complete, and worker-only ones are hidden from the orchestrator", () => {
   const all = completionsFor("/", ctx())!;
-  assert.deepEqual(all.items.map((i) => i.label), ["/answer", "/followup", "/stop", "/remove", "/help", "/quit"]);
+  assert.deepEqual(all.items.map((i) => i.label), ["/answer", "/followup", "/stop", "/remove", "/thinking", "/help", "/quit", "/shutdown"]);
   assert.equal(all.start, 0);
   assert.ok(all.items[0].detail?.includes("ctrl+a"), "the shortcut is advertised");
 
   const orchestrator = completionsFor("/", ctx({ target: "orchestrator" }))!;
-  assert.deepEqual(orchestrator.items.map((i) => i.label), ["/help", "/quit"]);
+  assert.deepEqual(orchestrator.items.map((i) => i.label), ["/thinking", "/help", "/quit", "/shutdown"]);
 
   const filtered = completionsFor("/an", ctx())!;
   assert.deepEqual(filtered.items.map((i) => i.label), ["/answer"]);
@@ -90,6 +90,8 @@ test("every command has a distinct ctrl shortcut", () => {
   }
   assert.equal(SHORTCUTS.r.name, "/remove");
   assert.equal(SHORTCUTS.a.takesArgument, true);
+  assert.equal(SHORTCUTS.k.name, "/shutdown");
+  assert.equal(SHORTCUTS.t.name, "/thinking");
 });
 
 test("the agent's own commands and skills are offered alongside the console's", () => {
@@ -100,11 +102,12 @@ test("the agent's own commands and skills are offered alongside the console's", 
       { name: "research", description: "Research a topic" },
     ],
   }))!;
-  assert.deepEqual(claude.items.map((i) => i.label), ["/help", "/quit", "/model", "/research"]);
-  assert.deepEqual(claude.items.map((i) => i.kind), ["command", "command", "agent", "agent"]);
-  assert.equal(claude.items[2].value, "/model ", "one that takes an argument leaves the cursor after a space");
-  assert.equal(claude.items[3].value, "/research");
-  assert.match(claude.items[2].detail!, /Set the model/);
+  assert.deepEqual(claude.items.map((i) => i.label), ["/thinking", "/help", "/quit", "/shutdown", "/model", "/research"]);
+  assert.deepEqual(claude.items.map((i) => i.kind), ["command", "command", "command", "command", "agent", "agent"]);
+  const model = claude.items.find((i) => i.label === "/model")!;
+  assert.equal(model.value, "/model ", "one that takes an argument leaves the cursor after a space");
+  assert.equal(claude.items.find((i) => i.label === "/research")!.value, "/research");
+  assert.match(model.detail!, /Set the model/);
 
   const pi = completionsFor("/sk", ctx({
     agentCommands: [
@@ -117,7 +120,7 @@ test("the agent's own commands and skills are offered alongside the console's", 
 
   // ours still win the ordering, and an agent command never shadows one of ours
   const both = completionsFor("/s", ctx({ agentCommands: [{ name: "session-name", description: "x", source: "extension" }] }))!;
-  assert.deepEqual(both.items.map((i) => i.label), ["/stop", "/session-name"]);
+  assert.deepEqual(both.items.map((i) => i.label), ["/stop", "/shutdown", "/session-name"]);
   assert.equal(completionsFor("/", ctx({ agentCommands: [] }))!.items.every((i) => i.kind === "command"), true);
 });
 
@@ -128,6 +131,8 @@ test("commands answer to short aliases, and completing one offers the long form"
   assert.equal(resolveCommand("/rm")!.name, "/remove");
   assert.equal(resolveCommand("/r")!.name, "/remove");
   assert.equal(resolveCommand("/a")!.name, "/answer");
+  assert.equal(resolveCommand("/sd")!.name, "/shutdown");
+  assert.equal(resolveCommand("/t")!.name, "/thinking");
   assert.equal(resolveCommand("/QUIT")!.name, "/quit", "case does not matter");
   assert.equal(resolveCommand("/nope"), null);
   assert.equal(resolveCommand("quit"), null, "the slash is part of it");

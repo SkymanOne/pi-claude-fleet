@@ -1,7 +1,7 @@
 import { Box, Text } from "ink";
 import type { OrchestratorLine, OrchestratorLineKind } from "./model.js";
 import type { MdLine, Span } from "./markdown.js";
-import { visibleTail } from "./layout.js";
+import { visibleTailWithNotice } from "./layout.js";
 
 export interface TranscriptProps {
   lines: OrchestratorLine[];
@@ -76,7 +76,7 @@ function LineView({ line }: { line: OrchestratorLine }) {
 
 export function Transcript({ lines, partial, maxRows = 200, width = 80 }: TranscriptProps) {
   const partialRows = partial ? Math.max(1, Math.ceil(partial.length / Math.max(1, width))) : 0;
-  const { lines: shown, hidden } = visibleTail(lines, Math.max(1, maxRows - partialRows), width, (l) => l.text);
+  const { lines: shown, hidden } = visibleTailWithNotice(lines, Math.max(1, maxRows - partialRows), width, (l) => l.text);
   return (
     <Box flexDirection="column" flexGrow={1}>
       {hidden > 0 ? <Text dimColor>{`… ${hidden} earlier line${hidden === 1 ? "" : "s"}`}</Text> : null}

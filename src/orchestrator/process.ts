@@ -5,7 +5,7 @@
  * (session id, cost, whether a turn is running, pending permission requests).
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import fs from "node:fs";
 import { splitJsonLines, nowIso } from "../util.js";
 import { buildClaudeArgs, claudeCommand, type ClaudeArgsOptions } from "./args.js";
@@ -256,8 +256,23 @@ export class OrchestratorProcess extends EventEmitter<OrchestratorProcessEvents>
     return this.control(id, initializeRequest(id, extra));
   }
 
-  /** End stdin, then escalate to SIGTERM and SIGKILL if the child lingers. Resolves on exit. */
-  stop(): Promise<ExitInfo> {
+  /**
+   * End the running turn, then stdin, then escalate to SIGTERM and SIGKILL.
+   *
+   * The interrupt matters: a `claude -p` killed mid-turn leaves that turn
+   * unfinished, and resuming the session *continues* it — which looks like the
+   * session restarting itself the next time the console opens.
+   */
+  async stop(): Promise<ExitInfo> {
+    if (this.child && !this.exited && this.turnActive) {
+      await Promise.race([this.interrupt(true), new Promise((r) => setTimeout(r, 2_000))]);
+      if (this.turnActive) await Promise.race([once(this, "result"), new Promise((r) => setTimeout(r, 1_500))]);
+    }
+    return this.stopNow();
+  }
+
+  /** Close the child down without ending the turn first. */
+  stopNow(): Promise<ExitInfo> {
     const child = this.child;
     if (!child) return Promise.resolve({ code: null, signal: null });
     if (this.exited) return Promise.resolve(this.exited);

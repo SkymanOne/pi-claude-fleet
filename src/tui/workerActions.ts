@@ -3,7 +3,7 @@
  * components so the rules (no steering a finished run, no answer without a
  * question) are testable and identical to the CLI's.
  */
-import { appendControl, deriveStatus, resumeHint, TERMINAL_STATES, type RunState } from "../state.js";
+import { appendControl, deriveStatus, resumeHint, listRuns, loadStateSync, THINKING_LEVELS, TERMINAL_STATES, type RunState } from "../state.js";
 import { cleanupRuns } from "../commands.js";
 import { gitRaw } from "../worktree.js";
 import { resolveCommand } from "./completions.js";
@@ -69,6 +69,15 @@ export async function workerCommand(args: WorkerActionArgs): Promise<WorkerActio
     await appendControl(runDir, { type: "answer", message, source: "console", questionId });
     return { notice: `→ answered ${state.name} (${questionId}): ${message}`, error: false };
   }
+  if (command === "/thinking") {
+    const level = argument.trim().toLowerCase();
+    if (!THINKING_LEVELS.includes(level as (typeof THINKING_LEVELS)[number])) {
+      return { notice: `! usage: /thinking <${THINKING_LEVELS.join("|")}>`, error: true };
+    }
+    if (finished) return { notice: `! ${state.name} is ${status} — its thinking level no longer matters`, error: true };
+    await appendControl(runDir, { type: "thinking", message: level, source: "console" });
+    return { notice: `→ ${state.name} thinking level → ${level}`, error: false };
+  }
   if (command === "/remove") {
     if (!args.piFleetDir || !args.runId) return { notice: "! /remove is not available here", error: true };
     if (!finished) {
@@ -121,4 +130,21 @@ export async function removeWorker(args: { piFleetDir: string; runId: string; na
   }
   const why = result.err[0] ?? "cleanup refused";
   return { notice: `! could not remove ${args.name}: ${why}`, error: true };
+}
+
+/** Abort every worker that is still going; used by /shutdown. */
+export async function stopAllWorkers(piFleetDir: string): Promise<string[]> {
+  const stopped: string[] = [];
+  for (const { runDir } of listRuns(piFleetDir)) {
+    let state: RunState;
+    try {
+      state = loadStateSync(runDir);
+    } catch {
+      continue;
+    }
+    if (state.status === "archived" || isTerminal(deriveStatus(state))) continue;
+    await appendControl(runDir, { type: "abort", message: null, source: "console" });
+    stopped.push(state.name);
+  }
+  return stopped;
 }

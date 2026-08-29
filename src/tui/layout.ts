@@ -30,6 +30,15 @@ export function visibleTail<T>(lines: T[], maxRows: number, width: number, text:
   return { lines: lines.slice(start), hidden: start };
 }
 
+/**
+ * The same tail, with a row reserved for the "… N earlier lines" notice when
+ * there is one — otherwise the notice itself gets clipped off the top.
+ */
+export function visibleTailWithNotice<T>(lines: T[], maxRows: number, width: number, text: (line: T) => string): { lines: T[]; hidden: number } {
+  const first = visibleTail(lines, maxRows, width, text);
+  return first.hidden > 0 ? visibleTail(lines, maxRows - 1, width, text) : first;
+}
+
 export interface Chrome {
   /** Rows taken by the composer, its hint, and the status line. */
   base: number;

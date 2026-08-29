@@ -8,6 +8,8 @@ export interface SelectedSession {
   state: string;
   model: string | null;
   branch?: string | null;
+  /** Reasoning level, when the session reports or was told one. */
+  thinking?: string | null;
 }
 
 export interface StatusLineProps {
@@ -24,10 +26,12 @@ export function statusText(p: StatusLineProps): string {
   const parts: string[] = [];
   if (p.session.kind === "worker") {
     parts.push(p.session.name, p.session.state, p.session.model ?? "default model");
+    if (p.session.thinking) parts.push(`thinking ${p.session.thinking}`);
     if (p.session.branch) parts.push(p.session.branch);
   } else {
     parts.push(p.session.model ?? "starting…", p.sessionId ? p.sessionId.slice(0, 8) : "no session");
     parts.push(`$${p.costUsd.toFixed(3)}`, `${p.numTurns} turn${p.numTurns === 1 ? "" : "s"}`);
+    if (p.session.thinking) parts.push(`thinking ${p.session.thinking}`);
     if (p.session.state === "working") parts.push("working");
   }
   if (p.pendingApprovals > 0) parts.push(`${p.pendingApprovals} approval${p.pendingApprovals === 1 ? "" : "s"} pending`);

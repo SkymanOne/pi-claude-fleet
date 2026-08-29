@@ -1,54 +1,82 @@
 /** Key bindings, in one place so the help overlay and the handlers cannot drift. */
 export interface KeyHelp {
-  keys: string;
-  what: string;
+ keys: string;
+ what: string;
 }
 
 // Only non-printable keys are bound: the composer is always focused, so a
 // letter binding would swallow the first character of a message.
 export const GLOBAL_KEYS: KeyHelp[] = [
-  { keys: "tab / shift-tab", what: "next / previous session" },
-  { keys: "ctrl+n / ctrl+p", what: "next / previous session" },
-  { keys: "esc", what: "interrupt the orchestrator turn (or close help)" },
-  { keys: "ctrl-c", what: "quit (workers keep running)" },
+ {
+  keys: "tab / shift-tab",
+  what: "next / previous session (also ctrl+n / ctrl+p)",
+ },
+ { keys: "esc", what: "interrupt the orchestrator turn, or close this help" },
+ { keys: "ctrl-c", what: "quit (workers keep running)" },
 ];
 
 export const COMPOSER_KEYS: KeyHelp[] = [
-  { keys: "type + enter", what: "message the orchestrator, or steer the selected worker" },
-  { keys: "/answer /a ctrl+a", what: "answer the selected worker's question" },
-  { keys: "/followup /f ctrl+f", what: "queue a message for the selected worker" },
-  { keys: "/stop /s ctrl+x", what: "abort the selected worker" },
-  { keys: "/remove /rm ctrl+r", what: "remove the selected worker (worktree, branch, rail row)" },
-  { keys: "/help /h ctrl+g", what: "this help" },
-  { keys: "/quit /q ctrl+d", what: "quit" },
+ {
+  keys: "type + enter",
+  what: "message the orchestrator, or steer the selected worker",
+ },
+ { keys: "/answer /a ctrl+a", what: "answer the selected worker's question" },
+ {
+  keys: "/followup /f ctrl+f",
+  what: "queue a message for the selected worker",
+ },
+ { keys: "/stop /s ctrl+x", what: "abort the selected worker" },
+ {
+  keys: "/remove /rm ctrl+r",
+  what: "remove the selected worker (worktree, branch, rail row)",
+ },
+ {
+  keys: "/thinking /t ctrl+t",
+  what: "set the reasoning level of the selected session",
+ },
+ { keys: "/help /h ctrl+g", what: "this help" },
+ { keys: "/quit /q ctrl+d", what: "leave the console; workers keep running" },
+ {
+  keys: "/shutdown /sd ctrl+k",
+  what: "stop the orchestrator and every worker, then exit",
+ },
 ];
 
 export const COMPLETION_KEYS: KeyHelp[] = [
-  { keys: "/ or @", what: "suggestions: commands, workers, repository files" },
-  { keys: "tab / enter", what: "accept the highlighted suggestion" },
-  { keys: "up / down", what: "move through suggestions, or recall what you sent" },
-  { keys: "esc", what: "dismiss the suggestions" },
+ { keys: "/ or @", what: "commands and skills, or workers and files" },
+ {
+  keys: "tab / enter",
+  what: "accept the highlighted suggestion (esc dismisses)",
+ },
+ {
+  keys: "up / down",
+  what: "move through suggestions, or recall what you sent",
+ },
 ];
 
 export const APPROVAL_KEYS: KeyHelp[] = [
-  { keys: "y", what: "allow once" },
-  { keys: "a", what: "allow for this session" },
-  { keys: "n", what: "deny (then type a reason)" },
-  { keys: "↑/↓ + enter", what: "pick an answer (questions)" },
+ {
+  keys: "y / a / n",
+  what: "allow once · allow for this session · deny with a reason",
+ },
+ { keys: "↑/↓ + enter", what: "pick an answer to a question" },
 ];
 
 export const HINT = "tab switch · esc interrupt · ctrl+g help · ctrl+d quit";
 
+/**
+ * Compact on purpose: the help shares the pane with everything else, and a
+ * reference that scrolls off the top of a short terminal helps nobody.
+ */
 export function helpText(): string {
-  const section = (title: string, rows: KeyHelp[]): string =>
-    [title, ...rows.map((r) => `  ${r.keys.padEnd(16)} ${r.what}`)].join("\n");
-  return [
-    section("Keys", GLOBAL_KEYS),
-    "",
-    section("Composer", COMPOSER_KEYS),
-    "",
-    section("Suggestions", COMPLETION_KEYS),
-    "",
-    section("Approvals", APPROVAL_KEYS),
-  ].join("\n");
+ const section = (title: string, rows: KeyHelp[]): string =>
+  [`${title}:`, ...rows.map((r) => `  ${r.keys.padEnd(18)} ${r.what}`)].join(
+   "\n",
+  );
+ return [
+  section("Keys", GLOBAL_KEYS),
+  section("Composer", COMPOSER_KEYS),
+  section("Suggestions", COMPLETION_KEYS),
+  section("Approvals", APPROVAL_KEYS),
+ ].join("\n");
 }

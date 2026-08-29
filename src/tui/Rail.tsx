@@ -7,14 +7,30 @@ export interface RailProps {
   width?: number;
 }
 
-const clip = (s: string, n: number): string => (n <= 1 ? s.slice(0, Math.max(0, n)) : s.length > n ? `${s.slice(0, n - 1)}…` : s);
+const clip = (s: string, n: number): string =>
+  n <= 1
+    ? s.slice(0, Math.max(0, n))
+    : s.length > n
+      ? `${s.slice(0, n - 1)}…`
+      : s;
 
-/** `▸● add-auth        2m` — the age is right-aligned when there is room for it. */
-export function nameLine(glyph: string, name: string, age: string, selected: boolean, width: number, nameWidth: number): string {
-  const head = `${selected ? "▸" : " "}${glyph} ${clip(name, nameWidth)}`;
-  if (!age) return head;
-  const gap = width - head.length - age.length;
-  return gap >= 1 ? `${head}${" ".repeat(gap)}${age}` : head;
+/**
+ * `▸● add-auth        2m` — the age is always shown; a long name is clipped to
+ * make room for it, since how long a worker has been going is the point.
+ */
+export function nameLine(
+  glyph: string,
+  name: string,
+  age: string,
+  selected: boolean,
+  width: number,
+): string {
+  const prefix = `${selected ? "▸" : " "}${glyph} `;
+  if (!age) return `${prefix}${clip(name, Math.max(1, width - prefix.length))}`;
+  const room = Math.max(1, width - prefix.length - age.length - 1);
+  const shown = clip(name, room);
+  const gap = Math.max(1, width - prefix.length - shown.length - age.length);
+  return `${prefix}${shown}${" ".repeat(gap)}${age}`;
 }
 
 /**
@@ -23,7 +39,6 @@ export function nameLine(glyph: string, name: string, age: string, selected: boo
  * reads as selected even where the terminal's inverse is subtle.
  */
 export function Rail({ items, selectedIndex, width = 26 }: RailProps) {
-  const nameWidth = Math.max(4, width - 4);
   return (
     <Box flexDirection="column">
       {items.map((item, i) => {
@@ -35,12 +50,18 @@ export function Rail({ items, selectedIndex, width = 26 }: RailProps) {
             <Text
               inverse={selected}
               bold={selected || isOrchestrator}
-              color={item.attention ? "yellow" : isOrchestrator ? "cyan" : undefined}
+              color={
+                item.attention ? "yellow" : isOrchestrator ? "cyan" : undefined
+              }
             >
-              {nameLine(item.glyph, item.name, item.age, selected, width, nameWidth)}
+              {nameLine(item.glyph, item.name, item.age, selected, width)}
             </Text>
-            <Text dimColor>{`   ${clip(item.detail, Math.max(4, width - 3))}`}</Text>
-            {isOrchestrator && items.length > 1 ? <Text dimColor>{"─".repeat(Math.max(4, width - 1))}</Text> : null}
+            <Text
+              dimColor
+            >{`   ${clip(item.detail, Math.max(4, width - 3))}`}</Text>
+            {isOrchestrator && items.length > 1 ? (
+              <Text dimColor>{"─".repeat(Math.max(4, width - 1))}</Text>
+            ) : null}
           </Box>
         );
       })}

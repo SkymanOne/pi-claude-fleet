@@ -30,26 +30,43 @@ test("blocks: headings, bullets, numbered items, quotes, rules, fenced code", ()
     "```",
     "Done.",
   ].join("\n");
-  const lines = parseMarkdownBlock(md);
-  assert.deepEqual(lines.map((l) => l.kind), ["heading", "text", "bullet", "bullet", "bullet", "quote", "rule", "code", "text"]);
+  const all = parseMarkdownBlock(md);
+  // blocks of different kinds are separated by blank lines
+  const blanks = all.filter((l) => l.spans.every((sp) => sp.text.trim() === ""));
+  assert.ok(blanks.length >= 3, "groups are spaced apart");
+  const lines = all.filter((l) => !l.spans.every((sp) => sp.text.trim() === ""));
+  assert.deepEqual(lines.map((l) => l.kind), ["heading", "bullet", "bullet", "bullet", "quote", "rule", "code", "text"]);
 
   const heading = lines[0];
   assert.equal(plain(heading.spans), "Findings (5, no high severity)");
   assert.ok(heading.spans.every((s) => s.bold), "headings are bold all through");
 
-  const numbered = lines[2];
+  const numbered = lines[1];
   assert.equal(plain(numbered.spans), "1. medium — commands.ts:346: cleanup removes the worktree");
   assert.deepEqual(numbered.spans[0], { text: "1. " });
   assert.deepEqual(numbered.spans[1], { text: "medium", bold: true });
   assert.ok(numbered.spans.some((s) => s.code && s.text === "commands.ts:346"));
 
-  assert.equal(plain(lines[3].spans), "• a bullet with bold");
-  assert.equal(plain(lines[4].spans), "  • nested bullet");
-  assert.equal(plain(lines[5].spans), "│ quoted line");
-  assert.equal(lines[7].spans[0].code, true, "fenced content is code");
-  assert.equal(plain(lines[7].spans), "const x = 1;");
+  assert.equal(plain(lines[2].spans), "• a bullet with bold");
+  assert.equal(plain(lines[3].spans), "  • nested bullet");
+  assert.equal(plain(lines[4].spans), "│ quoted line");
+  assert.equal(lines[6].spans[0].code, true, "fenced content is code");
+  assert.equal(plain(lines[6].spans), "const x = 1;");
   assert.equal(lines.some((l) => l.spans.some((s) => s.text.includes("```"))), false, "fence markers are not rendered");
-  assert.equal(plain(lines[8].spans), "Done.");
+  assert.equal(plain(lines[7].spans), "Done.");
+});
+
+test("groups are separated, and a run of prose is not", () => {
+  const blank = (l: { spans: { text: string }[] }) => l.spans.every((s) => s.text.trim() === "");
+  const prose = parseMarkdownBlock("one line\nanother line\na third");
+  assert.equal(prose.filter(blank).length, 0, "consecutive prose stays together");
+
+  const mixed = parseMarkdownBlock("Status:\n- a\n- b\nAfter the list.\n## Heading\nUnder it.");
+  const kinds = mixed.map((l) => (blank(l) ? "blank" : l.kind));
+  assert.deepEqual(kinds, ["text", "blank", "bullet", "bullet", "blank", "text", "blank", "heading", "blank", "text"]);
+
+  const already = parseMarkdownBlock("Status:\n\n- a");
+  assert.equal(already.filter(blank).length, 1, "a blank line already there is not doubled");
 });
 
 test("markdown inside a fence is left alone", () => {

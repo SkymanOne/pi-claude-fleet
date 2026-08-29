@@ -44,7 +44,7 @@ Then talk to the orchestrator: *"Add token refresh to the auth module and update
 
 Each rail row carries what that session is doing — the tool a worker is in, `needs an answer` when it is blocked, the first line of its error when it failed — with its age on the right. The glyph carries the state (`○` idle, `●` working, `?` blocked or waiting on you, `✓` done, `!` failed), the selected row is marked with `▸`, and the rail widens to fit your worker names.
 
-The status line describes whatever is selected: for a worker its state, model and branch, so you always see the model that worker is actually running (what pi resolved, not just the pattern you asked for); for the orchestrator its model, session, spend and turns.
+The status line describes whatever is selected: for a worker its state, model, reasoning level and branch, so you always see the model that worker is actually running (what pi resolved, not just the pattern you asked for); for the orchestrator its model, session, spend and turns.
 
 Keys: `tab` / `shift-tab` (or `ctrl+n` / `ctrl+p`) switch between the orchestrator and the workers, `esc` interrupts the orchestrator's turn, `ctrl-c` quits. Only non-printable keys are bound, so a message that starts with "q" does not quit the app.
 
@@ -57,8 +57,10 @@ The composer at the bottom sends to whatever is selected. With the orchestrator 
 | `/followup <text>` | `/f` | `ctrl+f` | queues a message for when it finishes its current work |
 | `/stop` | `/s` | `ctrl+x` | aborts it |
 | `/remove` | `/rm` | `ctrl+r` | removes it: worktree, branch and rail row (asks first if that would destroy work) |
+| `/thinking <level>` | `/t` | `ctrl+t` | set the reasoning level: pi's `off…max` for a worker, claude's `low…max` for the orchestrator |
 | `/help` | `/h` | `ctrl+g` | keys and commands |
-| `/quit` | `/q` | `ctrl+d` | quit |
+| `/quit` | `/q` | `ctrl+d` | leave the console; workers keep running |
+| `/shutdown` | `/sd` | `ctrl+k` | stop the orchestrator and every worker, then exit (asks first; worktrees and branches are kept) |
 
 Typing `/` lists the commands available for the selected session, and `@` lists the workers and then the repository's files. `tab` accepts the highlighted suggestion, `up` and `down` move through them, and with no suggestions open `up` recalls what you sent to that session before.
 
@@ -70,7 +72,7 @@ The transcript separates the parts of a turn: your prompts in cyan, the model's 
 
 Workers disappear from the rail when they are done: the orchestrator removes each one after it merges and verifies it, and the console removes any settled worker whose branch is already merged. Nothing unmerged, dirty or still running is ever removed for you — that waits for `/remove`, which tells you exactly what would be lost before it does anything.
 
-Quitting stops the orchestrator but leaves workers running; they are detached processes with their state on disk. `pi-fleet` reopens the console and resumes the same orchestrator session (`--fresh` starts a new one).
+Quitting stops the orchestrator but leaves workers running; they are detached processes with their state on disk. `pi-fleet` reopens the console and resumes the same orchestrator session (`--fresh` starts a new one). If a turn is in flight when you quit, the console ends it first — a `claude -p` killed mid-turn leaves that turn unfinished, and resuming the session would otherwise pick up where it was interrupted. `/shutdown` is the other exit: it stops every worker as well, and says how many before it does.
 
 Options: `--cwd <dir>`, `--model <model>`, `--fresh`, `--budget <usd>`, `--progress-events` (forward workers' progress notes to the orchestrator, off by default because they are chatty).
 

@@ -20,6 +20,7 @@ const steers = [];
 let taskStarted = false;
 let answerText = null;
 const delay = Number(process.env.FAKE_PI_DELAY_MS || 300);
+let thinkingLevel = process.env.FAKE_PI_THINKING || "medium";
 const fleetDir = process.env.PI_FLEET_DIR;
 const runId = process.env.PI_FLEET_RUN;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -171,11 +172,18 @@ process.stdin.on("data", (chunk) => {
         success: true,
         data: {
           model: { id: process.env.FAKE_PI_MODEL_ID || "fake/model-1", name: "Fake Model", provider: process.env.FAKE_PI_PROVIDER || "fakeprovider" },
-          thinkingLevel: "medium",
+          thinkingLevel,
           isStreaming: false,
           sessionId: "fake-session",
         },
       });
+    } else if (msg.type === "set_thinking_level") {
+      if (["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(msg.level)) {
+        thinkingLevel = msg.level;
+        send({ id: msg.id, type: "response", command: "set_thinking_level", success: true });
+      } else {
+        send({ id: msg.id, type: "response", command: "set_thinking_level", success: false, error: `unknown level: ${msg.level}` });
+      }
     } else if (msg.type === "get_commands") {
       send({
         id: msg.id,

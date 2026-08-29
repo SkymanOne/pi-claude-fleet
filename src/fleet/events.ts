@@ -87,12 +87,21 @@ function attr(value: string): string {
  * forge another one, and long text is clipped.
  */
 export function sanitizeField(value: string): string {
-  const clipped = value.length > MAX_FIELD_CHARS ? `${value.slice(0, MAX_FIELD_CHARS - 1)}…` : value;
-  return clipped.replace(/<\/?fleet-event/gi, "<​fleet-event").replace(/\r/g, "");
+  const clipped =
+    value.length > MAX_FIELD_CHARS
+      ? `${value.slice(0, MAX_FIELD_CHARS - 1)}…`
+      : value;
+  // Escape the angle bracket rather than hiding it behind a zero-width space:
+  // an invisible character reads as a rendering bug to whoever sees the text.
+  return clipped
+    .replace(/<(\/?)fleet-event/gi, "&lt;$1fleet-event")
+    .replace(/\r/g, "");
 }
 
 export function formatFleetEvent(ev: FleetEvent): string {
-  const lines = [`<fleet-event kind="${attr(ev.kind)}" run="${attr(ev.runId)}" name="${attr(ev.name)}" id="${attr(ev.id)}" ts="${attr(ev.ts)}">`];
+  const lines = [
+    `<fleet-event kind="${attr(ev.kind)}" run="${attr(ev.runId)}" name="${attr(ev.name)}" id="${attr(ev.id)}" ts="${attr(ev.ts)}">`,
+  ];
   for (const [key, value] of Object.entries(ev.fields)) {
     if (value === null || value === undefined || value === "") continue;
     lines.push(`${key}: ${sanitizeField(String(value))}`);
@@ -103,11 +112,16 @@ export function formatFleetEvent(ev: FleetEvent): string {
 }
 
 /** One user message per batch; the cap keeps a burst from flooding the turn. */
-export function formatFleetBatch(events: FleetEvent[], maxPerBatch = 10): string {
+export function formatFleetBatch(
+  events: FleetEvent[],
+  maxPerBatch = 10,
+): string {
   const shown = events.slice(0, maxPerBatch);
   const blocks = shown.map(formatFleetEvent);
   if (events.length > shown.length) {
-    blocks.push(`(+${events.length - shown.length} more fleet events; call fleet_status for the whole fleet)`);
+    blocks.push(
+      `(+${events.length - shown.length} more fleet events; call fleet_status for the whole fleet)`,
+    );
   }
   return blocks.join("\n");
 }
