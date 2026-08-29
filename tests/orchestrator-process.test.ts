@@ -107,9 +107,16 @@ test("a turn over fake-claude: init after the first message, replay, deltas, ass
     assert.deepEqual(assistant, ["echo: hello"]);
     const argv: string[] = JSON.parse(fs.readFileSync(argvFile, "utf8"));
     assert.equal(argv[argv.indexOf("--permission-prompt-tool") + 1], "stdio");
-    const log = fs.readFileSync(path.join(root, "orchestrator.log"), "utf8");
+    // the protocol log is a write stream: wait for it to reach disk
+    const logPath = path.join(root, "orchestrator.log");
+    const log = await waitFor(
+      () => {
+        const text = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : "";
+        return /^> \{"type":"user"/m.test(text) && /^< \{"type":"system","subtype":"init"/m.test(text) ? text : undefined;
+      },
+      { timeoutMs: 5000, intervalMs: 20 },
+    );
     assert.match(log, /^> \{"type":"user"/m);
-    assert.match(log, /^< \{"type":"system","subtype":"init"/m);
     // the real CLI re-emits system/init after every user message; the wrapper must not mind
     let inits = 0;
     proc.on("init", () => { inits += 1; });
@@ -163,8 +170,14 @@ test("permission requests: allow with suggestions, deny with a reason, AskUserQu
     proc.answerQuestion(q.requestId, { "Which style?": "verbose" });
     const [r3] = await res3;
     assert.equal(r3.result, 'answers:{"Which style?":"verbose"}');
-    // the log carries the answer we sent
-    assert.match(fs.readFileSync(path.join(root, "orchestrator.log"), "utf8"), /"answers":\{"Which style\?":"verbose"\}/);
+    // the log carries the answer we sent (write stream: wait for the flush)
+    await waitFor(
+      () => {
+        const text = fs.readFileSync(path.join(root, "orchestrator.log"), "utf8");
+        return /"answers":\{"Which style\?":"verbose"\}/.test(text) ? true : undefined;
+      },
+      { timeoutMs: 5000, intervalMs: 20 },
+    );
   } finally {
     await proc.stop();
   }
@@ -212,7 +225,7 @@ test("needsInitialize: the bare initialize handshake is only sent when asked for
   const root2 = tmpDir("pf-proc-5-");
   const withInit = startProc(root2, { FAKE_CLAUDE_REQUIRE_INIT: "1" }, { needsInitialize: true });
   try {
-    await waitFor(() => (fs.existsSync(path.join(root2, "orchestrator.log")) && fs.readFileSync(path.join(root2, "orchestrator.log"), "utf8").includes('"subtype":"initialize"') ? true : undefined), { timeoutMs: 5000 });
+    await waitFor(() => (fs.existsSync(path.join(root2, "orchestrator.log")) && fs.readFileSync(path.join(root2, "orchestrator.log"), "utf8").includes('"subtype":"initialize"') ? true : undefined), { timeoutMs: 5000, intervalMs: 20 });
     const perm = once(withInit, "permission_request");
     withInit.send("perm:touch c.txt");
     const [req] = (await perm) as [PermissionRequest];
