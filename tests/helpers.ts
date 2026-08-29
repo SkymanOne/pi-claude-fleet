@@ -88,3 +88,10 @@ export async function waitFor<T>(
     await new Promise((r) => setTimeout(r, intervalMs));
   }
 }
+
+export const FAKE_CLAUDE = path.join(ROOT, "tests", "fixtures", "fake-claude.mjs");
+
+/** Run the orchestrator against the scripted claude stand-in. */
+export function fakeClaudeEnv(over: Record<string, string> = {}): NodeJS.ProcessEnv {
+  return { ...fakePiEnv(), PI_FLEET_CLAUDE_BIN: `${process.execPath} ${FAKE_CLAUDE}`, ...over };
+}

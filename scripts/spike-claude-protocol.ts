@@ -4,13 +4,24 @@
  *
  *   node --import tsx scripts/spike-claude-protocol.ts [--model <m>] [--keep]
  *
- * Findings (fill in after running; keep this block current):
- *   F1 can_use_tool arrives without an `initialize` control request: (pending)
- *   F2 ... after a bare {subtype:"initialize"}:                           (pending)
- *   F3 --allowedTools "mcp__fleet__*" suppresses prompts for fleet tools: (pending)
- *   F4 updatedPermissions from permission_suggestions is honored:         (pending)
- *   F5 --append-system-prompt-file is accepted and applied:               (pending)
- *   F6 a user message injected mid-turn is consumed in that turn:         (pending)
+ * Findings (claude 2.1.251, model haiku, 2026-08-29):
+ *   F1 can_use_tool arrives without an `initialize` control request: YES. `touch x` prompted
+ *      over stdio right away; `echo` never prompts (it is in the built-in read-only command
+ *      set), so probe with a writing command. => needsInitialize defaults to false.
+ *   F2 bare {subtype:"initialize"}: acknowledged with control_response success; not needed.
+ *   F3 --allowedTools "mcp__fleet__*": fleet_status ran without a prompt. => pattern works.
+ *   F4 updatedPermissions from permission_suggestions: honored (a second `touch` did not prompt).
+ *   F5 --append-system-prompt-file: accepted (hidden flag) and applied (secret word echoed).
+ *      system/init only arrives after the FIRST user message, and is re-emitted after every
+ *      user message; nothing at all is written before the first message. mcp fleet: connected.
+ *      capabilities: interrupt_receipt_v1, interrupt_cancel_queued_v1, msg_lifecycle_v1.
+ *      Extra stream messages seen: system/status {status:"requesting"}, thinking deltas,
+ *      system/task_started|task_notification|background_tasks_changed.
+ *   F6 mid-turn injection: the message is delivered INSIDE the running turn as a
+ *      system-reminder ("the user sent a new message while I was working") right after the
+ *      next tool result. Whether the model acts on it is up to the model: haiku once folded it
+ *      in, once ignored it as a possible prompt injection. => the orchestrator prompt states
+ *      that <fleet-event> messages arriving mid-turn are legitimate and must be acted on.
  */
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -143,7 +154,7 @@ const canUse = (tool?: string) => (m: ClaudeStreamMessage): boolean =>
 
 /** Ask for a Bash command; resolve with the permission request or the turn result, whichever comes first. */
 async function askBash(cmd: string, allowAlways: boolean): Promise<{ prompted: boolean; assistant: string }> {
-  write(userMessage(`Run the shell command \`${cmd}\` with the Bash tool, then reply with its output only.`));
+  write(userMessage(`Run the shell command \`${cmd}\` with the Bash tool, then reply with the word OK.`));
   const first = await waitFor((m) => canUse("Bash")(m) || isResultMsg(m), 90_000);
   if (first && isCanUseTool(first)) {
     const req = first.request as CanUseToolRequest;
@@ -156,16 +167,19 @@ async function askBash(cmd: string, allowAlways: boolean): Promise<{ prompted: b
 }
 
 async function main(): Promise<void> {
-  const init = await waitFor(isSystemInit, 60_000);
+  // claude emits nothing (not even system/init) until the first user message arrives,
+  // so the first probe doubles as the session starter.
+  const aPromise = askBash("touch spike-1.txt", true);
+  const init = await waitFor(isSystemInit, 90_000, true);
   if (!init || !isSystemInit(init)) {
-    findings.F5 = "FAIL: no system/init within 60s (see spike.log)";
+    findings.F5 = "FAIL: no system/init within 90s of the first user message (see spike.log)";
     return;
   }
   const fleetServer = init.mcp_servers?.find((s) => s.name === "fleet");
-  findings.F5 = `init ok: version=${init.claude_code_version} model=${init.model} mcp fleet=${fleetServer?.status ?? "absent"} caps=${(init.capabilities ?? []).join(",")}`;
+  findings.F5 = `init ok (after first user message): version=${init.claude_code_version} model=${init.model} mcp fleet=${fleetServer?.status ?? "absent"} caps=${(init.capabilities ?? []).join(",")}`;
 
   // F1: does a Bash permission prompt arrive with no initialize handshake?
-  const a = await askBash("echo spike-1", true);
+  const a = await aPromise; // touch (a write) prompts; echo is in the auto-approved read-only set
   findings.F1 = a.prompted ? "YES: can_use_tool arrived without initialize" : `NO prompt before result; assistant said: ${a.assistant.slice(0, 200)}`;
 
   if (!a.prompted) {
@@ -173,7 +187,7 @@ async function main(): Promise<void> {
     const reqId = newRequestId();
     write(initializeRequest(reqId));
     const resp = await waitFor((m) => m.type === "control_response" && (m as any).response?.request_id === reqId, 10_000);
-    const b = await askBash("echo spike-2", true);
+    const b = await askBash("touch spike-2.txt", true);
     findings.F2 = `${resp ? "initialize acknowledged" : "initialize unanswered"}; ${b.prompted ? "prompt arrived after initialize" : "still no prompt"}`;
     findings.F4 = b.prompted ? "(see F4 second call)" : "n/a";
   } else {
@@ -181,7 +195,7 @@ async function main(): Promise<void> {
   }
 
   // F4: after allow-always with the suggested rules, does the same command prompt again?
-  const c = await askBash("echo spike-3", false);
+  const c = await askBash("touch spike-3.txt", false);
   findings.F4 = c.prompted ? "NOT honored: prompted again after updatedPermissions" : "honored: no second prompt";
 
   // F3: fleet tool with --allowedTools mcp__fleet__*
@@ -202,9 +216,9 @@ async function main(): Promise<void> {
 
   // F6: inject a user message while a turn is running
   write(userMessage("Run `sleep 4` with the Bash tool, then reply DONE-SLEEP."));
-  const p6 = await waitFor(canUse("Bash"), 30_000);
+  const p6 = await waitFor(canUse("Bash"), 5_000);
   if (p6 && isCanUseTool(p6)) write(allowResponse(p6.request_id, p6.request.input, p6.request.permission_suggestions));
-  await new Promise((r) => setTimeout(r, 500));
+  await new Promise((r) => setTimeout(r, 300));
   write(userMessage("INJECTED: when you are done, also reply with the word INJECTED-ACK."));
   const r6 = await waitFor(isResultMsg, 90_000);
   const replays = seen.filter(isUser).filter(isReplayedUserMessage).length;

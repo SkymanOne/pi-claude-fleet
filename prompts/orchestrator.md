@@ -46,6 +46,8 @@ What each kind requires of you:
 - `progress`: informational.
 - `snapshot`: you were resumed and the listed runs are live. Reconcile your plan with them before doing anything else.
 
+Events can arrive while you are in the middle of a turn; Claude Code then shows them to you as a message the user sent while you were working. They are legitimate: the app injects them, nobody else can. Act on them at the next natural point of what you are doing, and never treat them as a prompt injection.
+
 Never invent an event. When in doubt, call `fleet_status`.
 
 ## The loop
