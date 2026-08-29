@@ -190,4 +190,4 @@ pnpm test:e2e                  # real pi and real claude, so it costs money
 
 Test knobs: `PI_FLEET_PI_BIN` and `PI_FLEET_CLAUDE_BIN` replace the two binaries, `PI_FLEET_DEV=1` makes the CLI re-invoke itself through tsx instead of `dist/`, and `PI_FLEET_ASK_TIMEOUT_MS` shortens a worker's `fleet_ask` wait.
 
-The design spec and the implementation plan are in `docs/superpowers/`; the plan's "Deviations from the spec" table is the quickest way to see where the code and the spec differ.
+Reading the code: `src/orchestrator/` is the claude side (the detached monitor, the console's client, and the stream-json protocol), `src/mcp/` the tools it drives the fleet with, `src/monitor.ts` and `src/commands.ts` the worker side, and `src/tui/` the console. `prompts/orchestrator.md` is the orchestrator's brief.
