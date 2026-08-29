@@ -5,7 +5,7 @@
  */
 import { deriveView, modelLabel, type DerivedView, type RunState } from "../state.js";
 import { summarizeArgs } from "../console/transcript.js";
-import { formatAge } from "../util.js";
+import { firstLine, formatAge } from "../util.js";
 import { parseMarkdownBlock, oneLine, type MdLine, type Span } from "./markdown.js";
 import type { FleetEvent } from "../fleet/events.js";
 import {
@@ -19,11 +19,12 @@ import {
   toolUsesOf,
   toolResultsOf,
   isReplayedUserMessage,
+  thinkingOfAssistant,
   userText,
   type ClaudeStreamMessage,
 } from "../orchestrator/protocol.js";
 
-export type OrchestratorLineKind = "user" | "fleet" | "text" | "tool" | "tool_result" | "system" | "error";
+export type OrchestratorLineKind = "user" | "fleet" | "text" | "thinking" | "tool" | "tool_result" | "system" | "error" | "gap";
 
 export interface OrchestratorLine {
   kind: OrchestratorLineKind;
@@ -86,8 +87,31 @@ function push(state: OrchestratorViewState, kind: OrchestratorLineKind, text: st
   trim(state);
 }
 
+/** A blank line between blocks, so a turn does not read as one wall of text. */
+function gap(state: OrchestratorViewState): void {
+  const last = state.lines[state.lines.length - 1];
+  if (state.lines.length === 0 || last.kind === "gap") return;
+  state.lines.push({ kind: "gap", text: "" });
+}
+
+/** Reasoning is long and secondary: show the head of it, dimmed, and say what was left out. */
+const THINKING_LINES = 8;
+
+function pushThinking(state: OrchestratorViewState, text: string): void {
+  const lines = text.split("\n").filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return;
+  gap(state);
+  const shown = lines.slice(0, THINKING_LINES);
+  shown.forEach((line, i) => state.lines.push({ kind: "thinking", text: `${i === 0 ? "✻ " : "  "}${line}` }));
+  if (lines.length > shown.length) {
+    state.lines.push({ kind: "thinking", text: `  … ${lines.length - shown.length} more line${lines.length - shown.length === 1 ? "" : "s"} of thinking` });
+  }
+  trim(state);
+}
+
 /** Assistant prose is markdown; render it into styled lines rather than dumping the source. */
 function pushMarkdown(state: OrchestratorViewState, text: string): void {
+  gap(state);
   for (const line of parseMarkdownBlock(text)) {
     state.lines.push({ kind: "text", text: line.spans.map((s) => s.text).join(""), spans: line.spans, md: line.kind });
   }
@@ -108,11 +132,13 @@ export function reduceOrchestrator(state: OrchestratorViewState, msg: ClaudeStre
     switch (msg.type) {
       case "sent":
         state.pendingEchoes.push(msg.text);
+        gap(state);
         push(state, msg.kind ?? "user", `> ${msg.display ?? msg.text}`);
         state.turnActive = true;
         return state;
       case "fleet":
         state.pendingEchoes.push(msg.text);
+        gap(state);
         push(state, "fleet", `⚑ ${summarizeFleetEvents(msg.events)}`);
         return state;
       case "notice":
@@ -154,6 +180,7 @@ export function reduceOrchestrator(state: OrchestratorViewState, msg: ClaudeStre
   if (isAssistant(msg)) {
     state.turnActive = true;
     state.partial = null;
+    pushThinking(state, thinkingOfAssistant(msg));
     const text = textOfAssistant(msg).trim();
     if (text) pushMarkdown(state, text);
     for (const tool of toolUsesOf(msg)) {
@@ -212,7 +239,10 @@ export interface RailItem {
   key: string;
   glyph: string;
   name: string;
+  /** What it is doing right now, shown under the name; the glyph carries the state. */
   detail: string;
+  /** How long it has been alive, right-aligned on the name line. */
+  age: string;
   target: SessionTarget;
   /** Needs the human: an approval to answer, or a worker blocked on a question. */
   attention: boolean;
@@ -235,6 +265,29 @@ export interface RailRun {
   state: RunState;
 }
 
+/**
+ * What a worker is doing, for the line under its name. The glyph already says
+ * running/blocked/settled, so this is the operation, not the state.
+ */
+export function workerActivity(state: RunState, view: DerivedView): string {
+  switch (view) {
+    case "blocked":
+      return "needs an answer";
+    case "running":
+      return state.lastTool ? `⚙ ${state.lastTool}` : "working…";
+    case "starting":
+      return "starting…";
+    case "settled":
+      return "done";
+    case "error":
+      return state.error ? firstLine(state.error) : "failed";
+    case "dead":
+      return "monitor gone";
+    default:
+      return view;
+  }
+}
+
 export function buildRail(args: {
   orchestrator: { turnActive: boolean; exited: boolean; pendingApprovals: number; model?: string | null };
   runs: RailRun[];
@@ -242,26 +295,27 @@ export function buildRail(args: {
 }): RailItem[] {
   const now = args.now ?? Date.now();
   const o = args.orchestrator;
-  const orchestratorState = o.exited ? "exited" : o.pendingApprovals > 0 ? `${o.pendingApprovals} to approve` : o.turnActive ? "working" : "idle";
+  const orchestratorState = o.exited ? "exited" : o.pendingApprovals > 0 ? `${o.pendingApprovals} to approve` : o.turnActive ? "working…" : "idle";
   const items: RailItem[] = [
     {
       key: "orchestrator",
       glyph: o.exited ? "!" : o.pendingApprovals > 0 ? "?" : o.turnActive ? "●" : "○",
       name: "orchestrator",
-      detail: o.model ? `${orchestratorState} · ${o.model}` : orchestratorState,
+      detail: orchestratorState,
+      age: "",
       target: { kind: "orchestrator" },
       attention: o.pendingApprovals > 0 || o.exited,
     },
   ];
   for (const run of args.runs) {
     const view = deriveView(run.state, undefined, now);
-    const model = modelLabel(run.state);
     const age = formatAge(Math.max(0, now - Date.parse(run.state.createdAt)));
     items.push({
       key: run.runId,
       glyph: WORKER_GLYPHS[view] ?? "·",
       name: run.state.name,
-      detail: model ? `${view} ${age} · ${model}` : `${view} ${age}`,
+      detail: workerActivity(run.state, view),
+      age,
       target: { kind: "worker", runId: run.runId, runDir: run.runDir },
       attention: view === "blocked",
     });

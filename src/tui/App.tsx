@@ -3,7 +3,7 @@ import { Box, Text, useInput, useStdout } from "ink";
 import { OrchestratorProcess, type PermissionRequest } from "../orchestrator/process.js";
 import { FleetWatcher } from "../fleet/watcher.js";
 import { formatFleetBatch, type FleetEvent } from "../fleet/events.js";
-import { deriveStatus, type RunState } from "../state.js";
+import { deriveStatus, deriveView, modelLabel, type RunState } from "../state.js";
 import { Rail } from "./Rail.js";
 import { Transcript } from "./Transcript.js";
 import { WorkerTranscript } from "./WorkerTranscript.js";
@@ -335,7 +335,9 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
 
   const workerLabel = currentRun ? `${currentRun.state.name} (${deriveStatus(currentRun.state)})` : "worker";
 
-  const railWidth = 22;
+  // wide enough for the longest name, but never more than a third of the screen
+  const longestName = Math.max(12, ...items.map((i) => i.name.length));
+  const railWidth = Math.min(Math.max(longestName + 4, 18), Math.max(18, Math.floor(size.columns * 0.34)), 40);
   const paneWidth = Math.max(20, size.columns - railWidth - 2);
   const suggestionRows = completion ? completion.items.length + 1 : 0;
   const overlayRows = approval ? 8 : confirm ? 4 : 0;
@@ -345,8 +347,9 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
     suggestions: suggestionRows,
     overlay: overlayRows,
   });
-  // the rail never pushes the transcript out of view
-  const railItems = items.length > paneRows ? items.slice(0, Math.max(1, paneRows - 1)) : items;
+  // two rows per session (name and what it is doing), plus the separator row
+  const railCapacity = Math.max(1, Math.floor((paneRows - 1) / 2));
+  const railItems = items.length > railCapacity ? items.slice(0, railCapacity) : items;
   const railOverflow = items.length - railItems.length;
 
   return (
@@ -419,12 +422,26 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, 
         </>
       )}
       <StatusLine
-        model={view.model}
+        session={
+          currentRun
+            ? {
+                kind: "worker",
+                name: currentRun.state.name,
+                state: deriveView(currentRun.state),
+                model: modelLabel(currentRun.state),
+                branch: currentRun.state.branch,
+              }
+            : {
+                kind: "orchestrator",
+                name: "orchestrator",
+                state: view.turnActive ? "working" : "idle",
+                model: view.model,
+              }
+        }
         sessionId={view.sessionId}
         costUsd={view.costUsd}
         numTurns={view.numTurns}
         pendingApprovals={approvals.length}
-        turnActive={view.turnActive}
         hint={showHelp ? "esc closes help" : HINT}
       />
     </Box>

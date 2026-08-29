@@ -315,6 +315,14 @@ export function textOfAssistant(msg: AssistantMessage): string {
     .join("");
 }
 
+/** The model's reasoning blocks, when thinking is on. */
+export function thinkingOfAssistant(msg: AssistantMessage): string {
+  return blocksOf(msg.message?.content)
+    .filter((b): b is ThinkingBlock => b.type === "thinking" && typeof (b as ThinkingBlock).thinking === "string")
+    .map((b) => b.thinking)
+    .join("\n");
+}
+
 export function toolUsesOf(msg: AssistantMessage): ToolUseBlock[] {
   return blocksOf(msg.message?.content).filter((b): b is ToolUseBlock => b.type === "tool_use");
 }

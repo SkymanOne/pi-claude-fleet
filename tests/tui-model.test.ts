@@ -7,6 +7,8 @@ import { helpText, GLOBAL_KEYS, COMPOSER_KEYS } from "../src/tui/keys.js";
 
 const feed = (msgs: any[]) => msgs.reduce((s, m) => reduceOrchestrator(s, m), initialViewState());
 const texts = (s: ReturnType<typeof initialViewState>) => s.lines.map((l) => `${l.kind}|${l.text}`);
+/** Blank separator lines are layout, not content; most assertions read better without them. */
+const content = (s: ReturnType<typeof initialViewState>) => texts(s).filter((l) => l !== "gap|");
 
 const init = (over: Record<string, unknown> = {}) => ({
   type: "system", subtype: "init", session_id: "sess-12345678", model: "fake-model",
@@ -19,12 +21,12 @@ test("a turn: init, our echo, deltas, assistant text and tools, tool results, re
   assert.equal(s.sessionId, "sess-12345678");
   assert.equal(s.model, "fake-model");
   assert.deepEqual(s.mcpStatus, [{ name: "fleet", status: "connected" }]);
-  assert.deepEqual(texts(s), ["system|· session sess-123 · fake-model · mcp fleet:connected"]);
+  assert.deepEqual(content(s), ["system|· session sess-123 · fake-model · mcp fleet:connected"]);
 
   reduceOrchestrator(s, { type: "sent", text: "spawn a worker" });
   assert.equal(s.turnActive, true);
   reduceOrchestrator(s, { type: "user", message: { role: "user", content: "spawn a worker" }, parent_tool_use_id: null });
-  assert.equal(texts(s).filter((t) => t.startsWith("user|")).length, 1, "the replay of our own message is suppressed");
+  assert.equal(content(s).filter((t) => t.startsWith("user|")).length, 1, "the replay of our own message is suppressed");
   assert.deepEqual(s.pendingEchoes, []);
 
   reduceOrchestrator(s, { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Spawn" } }, parent_tool_use_id: null });
@@ -47,7 +49,7 @@ test("a turn: init, our echo, deltas, assistant text and tools, tool results, re
   });
   reduceOrchestrator(s, { type: "result", subtype: "success", session_id: "s", total_cost_usd: 0.25, num_turns: 3 });
 
-  assert.deepEqual(texts(s).slice(1), [
+  assert.deepEqual(content(s).slice(1), [
     "user|> spawn a worker",
     "text|Spawning add-auth.",
     "text|Two steps.",
@@ -86,8 +88,8 @@ test("assistant markdown is rendered into styled spans, and huge tool output is 
 
 test("a user message we did not send is rendered; a second init is quiet", () => {
   const s = feed([init(), { type: "user", message: { role: "user", content: "typed elsewhere" }, parent_tool_use_id: null }, init()]);
-  assert.deepEqual(texts(s).filter((t) => t.startsWith("user|")), ["user|> typed elsewhere"]);
-  assert.equal(texts(s).filter((t) => t.startsWith("system|· session")).length, 1);
+  assert.deepEqual(content(s).filter((t) => t.startsWith("user|")), ["user|> typed elsewhere"]);
+  assert.equal(content(s).filter((t) => t.startsWith("system|· session")).length, 1);
 });
 
 test("fleet batches render as one line and their replay is suppressed", () => {
@@ -99,7 +101,7 @@ test("fleet batches render as one line and their replay is suppressed", () => {
   const s = initialViewState();
   reduceOrchestrator(s, { type: "fleet", events, text: "<fleet-event …>" });
   reduceOrchestrator(s, { type: "user", message: { role: "user", content: "<fleet-event …>" }, parent_tool_use_id: null });
-  assert.deepEqual(texts(s), ["fleet|⚑ settled add-auth · question db"]);
+  assert.deepEqual(content(s), ["fleet|⚑ settled add-auth · question db"]);
 });
 
 test("failures, retries, mcp trouble and exit are visible", () => {
@@ -109,7 +111,7 @@ test("failures, retries, mcp trouble and exit are visible", () => {
     { type: "system", subtype: "api_retry", attempt: 2, max_retries: 5, error: "overloaded" },
     { type: "exit", code: 143, signal: "SIGTERM" },
   ]);
-  const t = texts(s);
+  const t = content(s);
   assert.ok(t.some((l) => l === "error|! mcp server(s) not connected: fleet:failed"));
   assert.ok(t.some((l) => l.startsWith("error|! turn failed (error_during_execution): boom")));
   assert.ok(t.some((l) => l === "system|↻ api retry 2/5 (overloaded)"));
@@ -120,7 +122,7 @@ test("failures, retries, mcp trouble and exit are visible", () => {
 
 test("notices and local errors are lines; unknown messages are ignored", () => {
   const s = feed([{ type: "notice", text: "· steer queued for db" }, { type: "error", text: "! could not write control" }, { type: "mystery" }]);
-  assert.deepEqual(texts(s), ["system|· steer queued for db", "error|! could not write control"]);
+  assert.deepEqual(content(s), ["system|· steer queued for db", "error|! could not write control"]);
 });
 
 test("the rail glyphs the orchestrator and every worker, and flags what needs the human", () => {
@@ -138,11 +140,21 @@ test("the rail glyphs the orchestrator and every worker, and flags what needs th
   ];
   const idle = buildRail({ orchestrator: { turnActive: false, exited: false, pendingApprovals: 0 }, runs, now });
   assert.deepEqual(idle.map((i) => `${i.glyph}${i.name}`), ["○orchestrator", "●add-auth", "?db", "✓docs", "!gone"]);
-  assert.deepEqual(idle.map((i) => i.detail), ["idle", "running 10m", "blocked 10m", "settled 10m", "dead 10m"]);
+  assert.deepEqual(idle.map((i) => i.detail), ["idle", "working…", "needs an answer", "done", "monitor gone"]);
+  assert.deepEqual(idle.map((i) => i.age), ["", "10m", "10m", "10m", "10m"]);
+  // a running worker shows the tool it is in, which is the point of the rail
+  assert.equal(
+    buildRail({ orchestrator: { turnActive: false, exited: false, pendingApprovals: 0 }, runs: [mk("busy", { status: "running", lastTool: "bash" })], now })[1].detail,
+    "⚙ bash",
+  );
+  assert.equal(
+    buildRail({ orchestrator: { turnActive: false, exited: false, pendingApprovals: 0 }, runs: [mk("broke", { status: "error", error: "pi exited with code 1\nmore" })], now })[1].detail,
+    "pi exited with code 1",
+  );
   assert.deepEqual(
-    buildRail({ orchestrator: { turnActive: false, exited: false, pendingApprovals: 0, model: "sonnet" }, runs: [mk("m1", { status: "running", activeModel: "glm-5.3-flash" }), mk("m2", { status: "running", model: "requested-pattern" })], now }).map((i) => i.detail),
-    ["idle · sonnet", "running 10m · glm-5.3-flash", "running 10m · requested-pattern"],
-    "the resolved model wins over the requested pattern, and both beat nothing",
+    buildRail({ orchestrator: { turnActive: true, exited: false, pendingApprovals: 0 }, runs: [], now })[0].detail,
+    "working…",
+    "the orchestrator's row says what it is doing; its model is in the status line",
   );
   assert.deepEqual(idle.map((i) => i.attention), [false, false, true, false, false]);
   assert.deepEqual(idle[1].target, { kind: "worker", runId: "add-auth-1", runDir: "/f/runs/add-auth-1" });
@@ -161,4 +173,38 @@ test("help text lists every binding once", () => {
   const text = helpText();
   for (const row of [...GLOBAL_KEYS, ...COMPOSER_KEYS]) assert.ok(text.includes(row.keys), row.keys);
   assert.match(text, /^Keys/);
+});
+
+test("blocks are separated by blank lines, and thinking is kept short and marked", () => {
+  const s = feed([
+    init(),
+    { type: "sent", text: "do the thing" },
+    {
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: Array.from({ length: 12 }, (_, i) => `step ${i}`).join("\n") },
+          { type: "text", text: "Done." },
+        ],
+      },
+      parent_tool_use_id: null,
+    },
+  ]);
+  const kinds = s.lines.map((l) => l.kind);
+  assert.ok(kinds.includes("thinking"));
+  const thinking = s.lines.filter((l) => l.kind === "thinking");
+  assert.equal(thinking.length, 9, "eight lines plus the count of what was left out");
+  assert.equal(thinking[0].text, "✻ step 0");
+  assert.match(thinking.at(-1)!.text, /… 4 more lines of thinking/);
+
+  // every block starts after a blank line, and blanks never double up
+  const gapIndexes = kinds.flatMap((k, i) => (k === "gap" ? [i] : []));
+  assert.ok(gapIndexes.length >= 3, `expected separators, got ${kinds.join(",")}`);
+  assert.equal(gapIndexes.some((i) => kinds[i + 1] === "gap"), false, "no double blank lines");
+  assert.equal(kinds[0] !== "gap" || kinds.length > 1, true);
+  const userAt = kinds.indexOf("user");
+  assert.equal(kinds[userAt - 1], "gap", "a prompt starts a new block");
+  assert.equal(kinds[kinds.indexOf("thinking") - 1], "gap");
+  assert.equal(kinds[kinds.lastIndexOf("text") - 1], "gap");
 });

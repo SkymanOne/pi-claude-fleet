@@ -1,24 +1,35 @@
 import { Text } from "ink";
 import { HINT } from "./keys.js";
 
-export interface StatusLineProps {
+export interface SelectedSession {
+  kind: "orchestrator" | "worker";
+  name: string;
+  /** The worker's derived view, or the orchestrator's activity. */
+  state: string;
   model: string | null;
+  branch?: string | null;
+}
+
+export interface StatusLineProps {
+  /** Whatever is selected: its model is the one that matters to you right now. */
+  session: SelectedSession;
   sessionId: string | null;
   costUsd: number;
   numTurns: number;
   pendingApprovals: number;
-  turnActive: boolean;
   hint?: string;
 }
 
 export function statusText(p: StatusLineProps): string {
-  const parts = [
-    p.model ?? "starting…",
-    p.sessionId ? p.sessionId.slice(0, 8) : "no session",
-    `$${p.costUsd.toFixed(3)}`,
-    `${p.numTurns} turn${p.numTurns === 1 ? "" : "s"}`,
-  ];
-  if (p.turnActive) parts.push("working");
+  const parts: string[] = [];
+  if (p.session.kind === "worker") {
+    parts.push(p.session.name, p.session.state, p.session.model ?? "default model");
+    if (p.session.branch) parts.push(p.session.branch);
+  } else {
+    parts.push(p.session.model ?? "starting…", p.sessionId ? p.sessionId.slice(0, 8) : "no session");
+    parts.push(`$${p.costUsd.toFixed(3)}`, `${p.numTurns} turn${p.numTurns === 1 ? "" : "s"}`);
+    if (p.session.state === "working") parts.push("working");
+  }
   if (p.pendingApprovals > 0) parts.push(`${p.pendingApprovals} approval${p.pendingApprovals === 1 ? "" : "s"} pending`);
   parts.push(p.hint ?? HINT);
   return parts.join(" · ");

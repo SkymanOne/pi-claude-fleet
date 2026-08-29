@@ -11,10 +11,12 @@ export interface TranscriptProps {
   width?: number;
 }
 
-export function colorFor(kind: OrchestratorLineKind): { color?: string; dimColor?: boolean; bold?: boolean } {
+export function colorFor(kind: OrchestratorLineKind): { color?: string; dimColor?: boolean; bold?: boolean; italic?: boolean } {
   switch (kind) {
     case "user":
       return { color: "cyan", bold: true };
+    case "thinking":
+      return { color: "gray", italic: true };
     case "fleet":
       return { color: "yellow" };
     case "tool":
@@ -40,14 +42,22 @@ function mdStyle(md: MdLine["kind"] | undefined): { color?: string; dimColor?: b
     case "quote":
       return { dimColor: true };
     case "rule":
+    case "table-rule":
       return { dimColor: true };
+    case "table-header":
+      return { bold: true };
     default:
       return {};
   }
 }
 
-function spanStyle(span: Span): { bold?: boolean; italic?: boolean; color?: string } {
-  return { bold: span.bold, italic: span.italic, color: span.code ? "green" : undefined };
+function spanStyle(span: Span): { bold?: boolean; italic?: boolean; color?: string; underline?: boolean } {
+  return {
+    bold: span.bold,
+    italic: span.italic,
+    underline: span.link,
+    color: span.code ? "green" : span.link ? "cyan" : undefined,
+  };
 }
 
 function LineView({ line }: { line: OrchestratorLine }) {

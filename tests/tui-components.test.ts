@@ -16,19 +16,34 @@ const frameMatching = (lastFrame: () => string | undefined, re: RegExp): Promise
   waitFor(() => (re.test(lastFrame() ?? "") ? (lastFrame() as string) : undefined), { timeoutMs: 5000, intervalMs: 15 });
 
 const items: RailItem[] = [
-  { key: "orchestrator", glyph: "○", name: "orchestrator", detail: "idle", target: { kind: "orchestrator" }, attention: false },
-  { key: "r1", glyph: "?", name: "db", detail: "blocked 3m", target: { kind: "worker", runId: "r1", runDir: "/f/r1" }, attention: true },
+  { key: "orchestrator", glyph: "○", name: "orchestrator", detail: "idle", age: "", target: { kind: "orchestrator" }, attention: false },
+  { key: "r1", glyph: "?", name: "db", detail: "needs an answer", age: "3m", target: { kind: "worker", runId: "r1", runDir: "/f/r1" }, attention: true },
 ];
 
-test("Rail lists sessions with glyphs and shows the selected row's detail", () => {
-  const { lastFrame, unmount } = render(React.createElement(Rail, { items, selectedIndex: 1 }));
+test("Rail shows what each session is doing and marks the selected one", () => {
+  const { lastFrame, unmount } = render(React.createElement(Rail, { items, selectedIndex: 1, width: 26 }));
   try {
-    const frame = squash(lastFrame() ?? "");
-    assert.match(frame, /○ orchestrator/);
-    assert.match(frame, /\? db/);
-    assert.match(frame, /blocked 3m/);
+    const frame = lastFrame() ?? "";
+    assert.match(squash(frame), /○ orchestrator/);
+    assert.match(squash(frame), /idle/);
+    assert.match(squash(frame), /▸\? db/, "the selection is marked, not only inverted");
+    assert.match(squash(frame), /needs an answer/, "the row says what it is doing");
+    assert.match(frame, /db\s+3m/, "the age is right-aligned on the name line");
+    assert.match(frame, /─{4,}/, "a rule separates the orchestrator from the workers");
   } finally {
     unmount();
+  }
+  // long names are clipped to the rail, never wrapped
+  const long = render(React.createElement(Rail, {
+    items: [{ ...items[1], name: "review-orchestrator-mcp-and-more", age: "12m" }],
+    selectedIndex: 0,
+    width: 20,
+  }));
+  try {
+    for (const line of (long.lastFrame() ?? "").split("\n")) assert.ok(line.length <= 22, `"${line}" is wider than the rail`);
+    assert.match(long.lastFrame() ?? "", /…/);
+  } finally {
+    long.unmount();
   }
 });
 
@@ -61,14 +76,30 @@ test("Transcript keeps the tail that fits the pane and says what it hid", () => 
   assert.deepEqual(colorFor("text"), {});
 });
 
-test("StatusLine shows model, session, cost, turns and pending approvals", () => {
-  const props = { model: "fake-model", sessionId: "sess-12345678", costUsd: 0.125, numTurns: 1, pendingApprovals: 2, turnActive: true };
-  assert.match(statusText(props), /^fake-model · sess-123 · \$0\.125 · 1 turn · working · 2 approvals pending · /);
-  assert.match(statusText({ ...props, numTurns: 2, pendingApprovals: 0, turnActive: false }), /2 turns · tab switch/);
-  assert.match(statusText({ ...props, model: null, sessionId: null }), /^starting… · no session/);
-  const { lastFrame, unmount } = render(React.createElement(StatusLine, props));
+test("StatusLine shows the selected session: the worker's own model, or the orchestrator's spend", () => {
+  const orchestrator = {
+    session: { kind: "orchestrator" as const, name: "orchestrator", state: "working", model: "claude-opus-5" },
+    sessionId: "6a65a8dd-1111", costUsd: 0.921, numTurns: 5, pendingApprovals: 0,
+  };
+  assert.match(statusText(orchestrator), /^claude-opus-5 · 6a65a8dd · \$0\.921 · 5 turns · working · /);
+  assert.match(statusText({ ...orchestrator, session: { ...orchestrator.session, state: "idle" }, numTurns: 1 }), /1 turn · tab switch/);
+  assert.match(statusText({ ...orchestrator, session: { ...orchestrator.session, model: null }, sessionId: null }), /^starting… · no session/);
+  assert.match(statusText({ ...orchestrator, pendingApprovals: 2 }), /2 approvals pending/);
+
+  // a worker is selected: its model is the one that matters, not the orchestrator's
+  const worker = {
+    session: { kind: "worker" as const, name: "review-tui", state: "running", model: "glm-5.3-flash", branch: "pi-fleet/review-tui-1234567" },
+    sessionId: "6a65a8dd-1111", costUsd: 0.921, numTurns: 5, pendingApprovals: 0,
+  };
+  const text = statusText(worker);
+  assert.match(text, /^review-tui · running · glm-5\.3-flash · pi-fleet\/review-tui-1234567 · /);
+  assert.equal(text.includes("claude-opus-5"), false);
+  assert.equal(text.includes("$0.921"), false, "the orchestrator's spend is not this session's business");
+  assert.match(statusText({ ...worker, session: { ...worker.session, model: null, branch: null } }), /^review-tui · running · default model · tab switch/);
+
+  const { lastFrame, unmount } = render(React.createElement(StatusLine, worker));
   try {
-    assert.match(squash(lastFrame() ?? ""), /fake-model · sess-123/);
+    assert.match(squash(lastFrame() ?? ""), /review-tui · running · glm-5.3-flash/);
   } finally {
     unmount();
   }

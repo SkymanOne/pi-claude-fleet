@@ -30,17 +30,21 @@ pi-fleet
 Then talk to the orchestrator: *"Add token refresh to the auth module and update the tests."* It writes briefs, spawns workers, and reports back as they finish.
 
 ```text
-┌ ○ orchestrator          > add token refresh, then tests ───────────┐
-│ ● add-auth              ⚙ mcp__fleet__fleet_spawn add-auth        │
-│ ? add-tests             ↳ Spawned add-auth-20260829120000         │
-│                         I started add-auth. add-tests is asking   │
-│ blocked 2m ·            which fixture style to use.               │
-│ glm-5.3-flash           add-tests (blocked) >                     │
-├ sonnet · a1b2c3d4 · $0.12 · 3 turns · tab switch · esc interrupt ─┤
-└────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│▸○ orchestrator      > add token refresh, then tests               │
+│   idle                                                             │
+│  ─────────────      I started add-auth. add-tests is asking which │
+│ ● add-auth      2m  fixture style to use.                         │
+│   ⚙ bash                                                           │
+│ ? add-tests     1m  orchestrator >                                │
+│   needs an answer                                                  │
+├ claude-opus-5 · a1b2c3d4 · $0.12 · 3 turns · tab switch · esc ────┤
+└───────────────────────────────────────────────────────────────────┘
 ```
 
-The rail's detail line shows the selected session's state, age and model: the orchestrator's comes from Claude Code, and a worker's is what pi actually resolved, so a worker spawned without `--model` still tells you what it is running.
+Each rail row carries what that session is doing — the tool a worker is in, `needs an answer` when it is blocked, the first line of its error when it failed — with its age on the right. The glyph carries the state (`○` idle, `●` working, `?` blocked or waiting on you, `✓` done, `!` failed), the selected row is marked with `▸`, and the rail widens to fit your worker names.
+
+The status line describes whatever is selected: for a worker its state, model and branch, so you always see the model that worker is actually running (what pi resolved, not just the pattern you asked for); for the orchestrator its model, session, spend and turns.
 
 Keys: `tab` / `shift-tab` (or `ctrl+n` / `ctrl+p`) switch between the orchestrator and the workers, `esc` interrupts the orchestrator's turn, `ctrl-c` quits. Only non-printable keys are bound, so a message that starts with "q" does not quit the app.
 
@@ -61,6 +65,8 @@ Typing `/` lists the commands available for the selected session, and `@` lists 
 The list is not only the console's own commands: it also carries whatever the agent on the other end offers. For the orchestrator that is Claude Code's slash commands and skills (`/model`, `/usage`, any skill you have installed), learned from its handshake and passed through verbatim. For a worker it is pi's commands, skills and prompt templates (`/skill:some-skill`, extension commands), which the worker reports when it starts; the console delivers them as a pi `prompt`, the one form that runs extension commands as well as expanding skills.
 
 When the orchestrator wants to run something outside its allowlist, or asks you a question, an overlay appears: `y` allows once, `a` allows it for the session, `n` denies with a reason, and questions get an option picker.
+
+The transcript separates the parts of a turn: your prompts in cyan, the model's reasoning dimmed and abridged, its answer as rendered markdown (headings, emphasis, inline code, lists, links and tables laid out in columns), tool calls in blue with their results dimmed under them, and fleet events in yellow — each block set off by a blank line.
 
 Workers disappear from the rail when they are done: the orchestrator removes each one after it merges and verifies it, and the console removes any settled worker whose branch is already merged. Nothing unmerged, dirty or still running is ever removed for you — that waits for `/remove`, which tells you exactly what would be lost before it does anything.
 
