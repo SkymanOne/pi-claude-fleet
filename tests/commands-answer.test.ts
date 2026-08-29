@@ -16,41 +16,52 @@ test("answer refuses on a settled run and on a running run without a pending que
   assert.match(empty.stderr, /message required/);
 }, { timeout: 60_000 });
 
-test("answer writes an answer control line with the explicit or pending question id", async () => {
+test("answer refuses while nothing is pending on a running run", async () => {
   const root = initRepo("pf-ans-2-");
   const spawned = await runCli(["spawn", "w", "--cwd", root, "--no-worktree", "--", "t"],
     { env: fakePiEnv({ FAKE_PI_DELAY_MS: "20000" }) });
   assert.equal(spawned.code, 0, spawned.stderr);
   const runId = firstRunId(root);
-  const runDir = path.join(fleetDirOf(root), "runs", runId);
   await waitFor(() => (readState(root, runId).status === "running" ? true : undefined), { timeoutMs: 15_000 });
-
   const none = await runCli(["answer", "w", "--cwd", root, "--", "argon2"]);
   assert.equal(none.code, 1);
   assert.match(none.stderr, /has no pending question/);
+  assert.equal(fs.existsSync(path.join(fleetDirOf(root), "runs", runId, "control.jsonl")), false);
+  await runCli(["stop", "w", "--cwd", root]);
+  await runCli(["wait", "w", "--cwd", root, "--timeout", "15"]);
+}, { timeout: 60_000 });
 
-  const explicit = await runCli(["answer", "w", "--cwd", root, "--question", "q_explicit", "--", "argon2"]);
-  assert.equal(explicit.code, 0, explicit.stderr);
-  assert.equal(explicit.stdout.trim(), "answer queued for w (question q_explicit)");
+test("answer writes an answer control line with the explicit or pending question id", async () => {
+  const root = initRepo("pf-ans-3-");
+  const spawned = await runCli(["spawn", "w", "--cwd", root, "--no-worktree", "--", "t"],
+    { env: fakePiEnv({ FAKE_PI_ASK: "1", FAKE_PI_ASK_TIMEOUT_MS: "20000", FAKE_PI_DELAY_MS: "200" }) });
+  assert.equal(spawned.code, 0, spawned.stderr);
+  const runId = firstRunId(root);
+  const runDir = path.join(fleetDirOf(root), "runs", runId);
+  // the worker's fleet_ask makes the monitor record a pending question
+  const pending = await waitFor(() => readState(root, runId).pendingQuestion ?? undefined, { timeoutMs: 15_000 });
 
-  // a pending question in state.json becomes the default target
-  const statePath = path.join(runDir, "state.json");
-  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  state.pendingQuestion = { id: "q_pending", question: "which?", options: null, context: null, askedAt: new Date().toISOString() };
-  fs.writeFileSync(statePath, JSON.stringify(state));
   const status = await runCli(["status", "w", "--cwd", root]);
   assert.equal(JSON.parse(status.stdout).status, "blocked");
   const table = await runCli(["status", "--cwd", root]);
-  assert.match(table.stdout, /blocked/);
+  assert.match(table.stdout, /\bblocked\b/);
+
+  // an explicit id is written as given, even though it is not the pending one
+  const explicit = await runCli(["answer", "w", "--cwd", root, "--question", "q_explicit", "--", "not this one"]);
+  assert.equal(explicit.code, 0, explicit.stderr);
+  assert.equal(explicit.stdout.trim(), "answer queued for w (question q_explicit)");
+  // without --question the pending question is the target
   const implicit = await runCli(["answer", "w", "--cwd", root, "--", "use argon2"]);
   assert.equal(implicit.code, 0, implicit.stderr);
+  assert.equal(implicit.stdout.trim(), `answer queued for w (question ${pending.id})`);
 
   const control = fs.readFileSync(path.join(runDir, "control.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
   assert.deepEqual(control.map((c) => [c.type, c.message, c.source, c.questionId]), [
-    ["answer", "argon2", "orchestrator", "q_explicit"],
-    ["answer", "use argon2", "orchestrator", "q_pending"],
+    ["answer", "not this one", "orchestrator", "q_explicit"],
+    ["answer", "use argon2", "orchestrator", pending.id],
   ]);
   assert.ok(control.every((c) => typeof c.id === "string"));
-  await runCli(["stop", "w", "--cwd", root]);
-  await runCli(["wait", "w", "--cwd", root, "--timeout", "15"]);
+  const waited = await runCli(["wait", "w", "--cwd", root, "--timeout", "20"]);
+  assert.equal(waited.code, 0, waited.stderr);
+  assert.match((await runCli(["report", "w", "--cwd", root])).stdout, /Answer received: use argon2/);
 }, { timeout: 60_000 });
