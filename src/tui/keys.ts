@@ -18,6 +18,7 @@ export const COMPOSER_KEYS: KeyHelp[] = [
   { keys: "/answer <text>", what: "answer the selected worker's question" },
   { keys: "/followup <text>", what: "queue a message for the selected worker" },
   { keys: "/stop", what: "abort the selected worker" },
+  { keys: "/remove", what: "remove the selected worker (worktree, branch, rail row)" },
   { keys: "/help", what: "this help" },
   { keys: "/quit", what: "quit" },
 ];

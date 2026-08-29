@@ -66,7 +66,7 @@ async function addRun(piFleetDir: string, name: string, over: Partial<RunState> 
 }
 
 function renderApp(h: Harness) {
-  return render(React.createElement(App, { proc: h.proc, watcher: h.watcher, onQuit: () => { h.quit.called += 1; }, railPollMs: 30 }));
+  return render(React.createElement(App, { proc: h.proc, watcher: h.watcher, onQuit: () => { h.quit.called += 1; }, railPollMs: 30, reapMs: 0 }));
 }
 
 const frameMatching = (lastFrame: () => string | undefined, re: RegExp, timeoutMs = 8000): Promise<string> =>
@@ -221,3 +221,37 @@ test("esc interrupts a running turn", async () => {
     await teardown(h, app);
   }
 }, { timeout: 30_000 });
+
+test("/remove on a running worker asks first, and the confirmation removes it", async () => {
+  const h = setup();
+  const { runId, runDir } = await addRun(h.piFleetDir, "db");
+  const app = renderApp(h);
+  try {
+    await frameMatching(app.lastFrame, /. db/);
+    app.stdin.write("\t");
+    await frameMatching(app.lastFrame, /db \(running\) > /);
+    await type(app, "/remove");
+    const asked = await frameMatching(app.lastFrame, /Abort it and remove/);
+    assert.match(asked, /y remove . n or esc cancel/);
+    assert.equal(fs.existsSync(path.join(runDir, "state.json")), true);
+
+    app.stdin.write("n");
+    await frameMatching(app.lastFrame, /removal cancelled/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(runDir, "state.json"), "utf8")).status, "running");
+
+    await type(app, "/remove");
+    await frameMatching(app.lastFrame, /Abort it and remove/);
+    app.stdin.write("y");
+    await waitFor(
+      () => (JSON.parse(fs.readFileSync(path.join(runDir, "state.json"), "utf8")).status === "archived" ? true : undefined),
+      { timeoutMs: 15_000 },
+    );
+    await frameMatching(app.lastFrame, /removed db/);
+    // the rail drops it and the selection falls back to the orchestrator
+    await frameMatching(app.lastFrame, /orchestrator > /);
+    assert.equal(squash(app.lastFrame() ?? "").includes("? db"), false);
+    assert.ok(runId.startsWith("db-"));
+  } finally {
+    await teardown(h, app);
+  }
+}, { timeout: 60_000 });

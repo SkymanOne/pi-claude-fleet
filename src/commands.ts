@@ -487,6 +487,12 @@ export interface CleanupData {
 /** Remove worktree + branch and mark the run archived; reports/events are kept. */
 export async function cleanupCore(args: { target: string; cwd?: string; force?: boolean }): Promise<CommandResult<CleanupData>> {
   const { piFleetDir } = await resolveFleetDir(args.cwd);
+  return cleanupRuns({ piFleetDir, target: args.target, force: args.force });
+}
+
+/** The same cleanup, for callers that already know the fleet dir (the console, the reaper). */
+export async function cleanupRuns(args: { piFleetDir: string; target: string; force?: boolean }): Promise<CommandResult<CleanupData>> {
+  const { piFleetDir } = args;
   if (!args.target) throw new Error("cleanup: <name|all> required");
   const all = args.target === "all";
   const targets: RunRef[] = all

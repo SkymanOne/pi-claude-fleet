@@ -2,9 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { workerCommand, parseAnswer } from "../src/tui/workerActions.js";
+import { workerCommand, parseAnswer, removeWorker } from "../src/tui/workerActions.js";
 import { newRunState, type RunState } from "../src/state.js";
-import { tmpDir } from "./helpers.js";
+import { initRepo, runCli, fakePiEnv, readState, firstRunId, fleetDirOf, waitFor, tmpDir, TERMINAL } from "./helpers.js";
 
 function mk(over: Partial<RunState> = {}): { runDir: string; state: RunState } {
   const runDir = tmpDir("pf-wa-");
@@ -73,4 +73,64 @@ test("refusals: no pending question, finished runs, unknown commands, empty argu
   }
   assert.match((await workerCommand({ runDir: settled.runDir, state: settled.state, input: "steer me" })).notice, /pi-fleet spawn db-2 --session/);
   assert.deepEqual(control(settled.runDir), []);
+});
+
+test("/remove archives a finished, clean worker straight away", async () => {
+  const root = initRepo("pf-rm-1-");
+  const fleetDir = fleetDirOf(root);
+  assert.equal((await runCli(["spawn", "hello", "--cwd", root, "--", "t"], { env: fakePiEnv({ FAKE_PI_WRITE_HELLO: "1", FAKE_PI_DELAY_MS: "100" }) })).code, 0);
+  const runId = firstRunId(root);
+  await waitFor(() => (TERMINAL.includes(readState(root, runId).status) ? true : undefined), { timeoutMs: 30_000 });
+  const state = readState(root, runId);
+
+  const r = await workerCommand({ runDir: path.join(fleetDir, "runs", runId), state, input: "/remove", piFleetDir: fleetDir, runId });
+  assert.equal(r.error, false, r.notice);
+  assert.equal(r.confirm, undefined);
+  assert.match(r.notice, /^✓ removed hello/);
+  assert.match(r.notice, /unmerged branch was kept/, "an unmerged branch is kept, and said so");
+  assert.equal(readState(root, runId).status, "archived");
+  assert.equal(fs.existsSync(state.worktree), false);
+}, { timeout: 60_000 });
+
+test("/remove asks before destroying anything: a running worker, or uncommitted work", async () => {
+  const root = initRepo("pf-rm-2-");
+  const fleetDir = fleetDirOf(root);
+  assert.equal((await runCli(["spawn", "slow", "--cwd", root, "--", "t"], { env: fakePiEnv({ FAKE_PI_DELAY_MS: "20000" }) })).code, 0);
+  const runId = firstRunId(root);
+  await waitFor(() => (readState(root, runId).status === "running" ? true : undefined), { timeoutMs: 20_000 });
+  const runDir = path.join(fleetDir, "runs", runId);
+
+  const running = await workerCommand({ runDir, state: readState(root, runId), input: "/remove", piFleetDir: fleetDir, runId });
+  assert.equal(running.error, false);
+  assert.equal(running.notice, "");
+  assert.match(running.confirm!.message, /slow is running\. Abort it and remove/);
+  assert.equal(readState(root, runId).status, "running", "nothing happened without the confirmation");
+
+  // confirming aborts and removes it
+  const removed = await removeWorker({ piFleetDir: fleetDir, runId, name: "slow", force: true });
+  assert.equal(removed.error, false, removed.notice);
+  assert.match(removed.notice, /^✓ removed slow/);
+  assert.equal(readState(root, runId).status, "archived");
+}, { timeout: 60_000 });
+
+test("/remove on a settled worker with uncommitted changes asks first", async () => {
+  const root = initRepo("pf-rm-3-");
+  const fleetDir = fleetDirOf(root);
+  assert.equal((await runCli(["spawn", "hello", "--cwd", root, "--", "t"], { env: fakePiEnv({ FAKE_PI_WRITE_HELLO: "1", FAKE_PI_DELAY_MS: "100" }) })).code, 0);
+  const runId = firstRunId(root);
+  await waitFor(() => (TERMINAL.includes(readState(root, runId).status) ? true : undefined), { timeoutMs: 30_000 });
+  const state = readState(root, runId);
+  fs.writeFileSync(path.join(state.worktree, "scratch.txt"), "unsaved\n");
+
+  const r = await workerCommand({ runDir: path.join(fleetDir, "runs", runId), state, input: "/remove", piFleetDir: fleetDir, runId });
+  assert.equal(r.notice, "");
+  assert.match(r.confirm!.message, /1 uncommitted change\(s\) that would be discarded/);
+  assert.equal(fs.existsSync(path.join(state.worktree, "scratch.txt")), true);
+}, { timeout: 60_000 });
+
+test("/remove without a fleet dir, and the updated unknown-command hint", async () => {
+  const { runDir, state } = mk({ status: "settled" });
+  assert.deepEqual(await workerCommand({ runDir, state, input: "/remove" }), { notice: "! /remove is not available here", error: true });
+  const unknown = await workerCommand({ runDir, state, input: "/nope" });
+  assert.match(unknown.notice, /\/remove/);
 });
