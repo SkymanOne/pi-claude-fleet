@@ -1,6 +1,6 @@
 import { firstLine, parseLineSafe, readNewLines, resultTextOf } from "../util.js";
 
-export type LineKind = "steer" | "text" | "tool" | "tool_result" | "system";
+export type LineKind = "steer" | "text" | "tool" | "tool_result" | "system" | "question";
 
 export interface TranscriptLine {
   kind: LineKind;
@@ -45,6 +45,24 @@ export function applyEvent(t: Transcript, ev: any): void {
       return;
     case "abort_requested":
       push(t, "system", "■ abort requested");
+      return;
+    case "worker_question": {
+      const options = Array.isArray(ev.options) && ev.options.length > 0 ? ` [${ev.options.join(" | ")}]` : "";
+      push(t, "question", `? ${clip(String(ev.question ?? ""), 300)}${options}`);
+      return;
+    }
+    case "worker_progress":
+      push(t, "system", `· ${clip(String(ev.message ?? ""), 200)}`);
+      return;
+    case "answer_delivered":
+      push(t, "steer", `▶ answer (${ev.source ?? "unknown"}): ${ev.message ?? ""}`);
+      return;
+    case "worker_question_resolved":
+      if (ev.how === "timeout") push(t, "system", "! no answer in time; worker proceeds on its own judgment");
+      else if (ev.how === "aborted") push(t, "system", "! question aborted");
+      return;
+    case "control_dropped":
+      push(t, "system", `! ${ev.control ?? "control"} from ${ev.source ?? "unknown"} dropped: ${ev.reason ?? ""}`);
       return;
     case "message_update": {
       // the monitor stores the delta under `ev`; raw RPC uses `assistantMessageEvent`

@@ -173,3 +173,8 @@ export function sanitizeName(name: string): string {
 export function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+/** Short unique id: `<prefix>_<time36>_<random>`; sortable enough for logs. */
+export function newId(prefix: string): string {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}

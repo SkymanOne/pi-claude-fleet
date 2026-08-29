@@ -8,6 +8,7 @@ import {
   cmdLogs,
   cmdSend,
   cmdFollowup,
+  cmdAnswer,
   cmdStop,
   cmdReport,
   cmdDiff,
@@ -112,6 +113,15 @@ program
   .option(...cwdOption)
   .action(async (name: string, messageArgs: string[], options: OptionValues) =>
     done(await cmdFollowup({ name, cwd: options.cwd, message: messageArgs.join(" ") })),
+  );
+
+program
+  .command("answer <name> [message...]")
+  .description("answer the worker's pending fleet_ask question (default: the question it is blocked on)")
+  .option(...cwdOption)
+  .option("--question <id>", "question id to answer")
+  .action(async (name: string, messageArgs: string[], options: OptionValues) =>
+    done(await cmdAnswer({ name, cwd: options.cwd, questionId: options.question, message: messageArgs.join(" ") })),
   );
 
 program

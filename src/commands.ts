@@ -13,11 +13,13 @@ import {
   loadStateSync,
   saveState,
   deriveStatus,
+  deriveView,
   isAlive,
   appendControl,
   resumeHint,
   TERMINAL_STATES,
   type ControlType,
+  type DerivedView,
   type RunRef,
   type RunState,
 } from "./state.js";
@@ -135,8 +137,11 @@ export async function resolveRun(name: string, cwd?: string): Promise<{ piFleetD
   return { piFleetDir, run: findRun(piFleetDir, name) };
 }
 
-function withDerivedStatus(state: RunState): RunState {
-  return { ...state, status: deriveStatus(state) };
+/** A run state as observers see it: `status` is the derived view (may be `blocked`). */
+export type DerivedRunState = Omit<RunState, "status"> & { status: DerivedView };
+
+function withDerivedStatus(state: RunState): DerivedRunState {
+  return { ...state, status: deriveView(state) };
 }
 
 export interface StatusArgs {
@@ -148,7 +153,7 @@ export interface StatusArgs {
 
 export interface StatusData {
   /** Runs with their derived status; one element when `name` was given. */
-  runs: RunState[];
+  runs: DerivedRunState[];
 }
 
 export async function statusCore(args: StatusArgs): Promise<CommandResult<StatusData>> {
@@ -278,25 +283,37 @@ export interface ControlArgs {
   cwd?: string;
   message?: string;
   source?: ControlSource;
+  /** `answer` only: the question being answered (default: the run's pending one). */
+  questionId?: string | null;
 }
 
 export interface ControlData {
   name: string;
   type: ControlType;
+  questionId?: string;
 }
 
 async function controlCore(type: ControlType, args: ControlArgs): Promise<CommandResult<ControlData | null>> {
   const { run } = await resolveRun(args.name, args.cwd);
   const derived = deriveStatus(run.state);
   if (isTerminal(derived)) {
-    const what = type === "abort" ? "nothing to stop" : "steering refused";
+    const what = type === "abort" ? "nothing to stop" : type === "answer" ? "nothing is waiting for an answer" : "steering refused";
     return fail(
       1,
       `${type}: run ${run.state.name} is ${derived} — ${what}.\n` +
         `Answer its open questions in a new brief and resume with:\n  ${resumeHint(run.state, run.runDir)}`,
     );
   }
-  await appendControl(run.runDir, { type, message: args.message ?? null, source: args.source ?? "orchestrator" });
+  const source = args.source ?? "orchestrator";
+  if (type === "answer") {
+    const questionId = args.questionId ?? run.state.pendingQuestion?.id ?? null;
+    if (!questionId) {
+      return fail(1, `answer: ${run.state.name} has no pending question — use send to steer it instead.`);
+    }
+    await appendControl(run.runDir, { type, message: args.message ?? null, source, questionId });
+    return ok({ name: run.state.name, type, questionId }, [`answer queued for ${run.state.name} (question ${questionId})`]);
+  }
+  await appendControl(run.runDir, { type, message: args.message ?? null, source });
   const line = type === "abort" ? `abort requested for ${run.state.name}` : `${type} queued for ${run.state.name}`;
   return ok({ name: run.state.name, type }, [line]);
 }
@@ -311,12 +328,18 @@ export async function followupCore(args: ControlArgs): Promise<CommandResult<Con
   return controlCore("follow_up", args);
 }
 
+export async function answerCore(args: ControlArgs): Promise<CommandResult<ControlData | null>> {
+  if (!args.message?.trim()) throw new Error('answer: message required after "--"');
+  return controlCore("answer", args);
+}
+
 export async function stopCore(args: { name: string; cwd?: string; source?: ControlSource }): Promise<CommandResult<ControlData | null>> {
   return controlCore("abort", { name: args.name, cwd: args.cwd, source: args.source });
 }
 
 export const cmdSend = async (args: ControlArgs): Promise<number> => printResult(await sendCore(args));
 export const cmdFollowup = async (args: ControlArgs): Promise<number> => printResult(await followupCore(args));
+export const cmdAnswer = async (args: ControlArgs): Promise<number> => printResult(await answerCore(args));
 export const cmdStop = async (args: { name: string; cwd?: string }): Promise<number> => printResult(await stopCore(args));
 
 export interface ReportData {

@@ -87,3 +87,24 @@ test("readNewEvents advances only past complete lines; replay keeps the tail", (
   assert.equal(transcript.lines.at(-1)?.text, "▶ s: m49");
   assert.equal(offset, fs.statSync(p).size);
 });
+
+test("applyEvent renders worker questions, progress, answers, and dropped controls", () => {
+  const t = createTranscript();
+  applyEvent(t, { type: "worker_question", questionId: "q_1", question: "bcrypt or argon2?", options: ["bcrypt", "argon2"] });
+  applyEvent(t, { type: "worker_question", questionId: "q_2", question: "free form?" });
+  applyEvent(t, { type: "worker_progress", message: "tests passing" });
+  applyEvent(t, { type: "answer_delivered", source: "console", questionId: "q_1", message: "argon2" });
+  applyEvent(t, { type: "worker_question_resolved", questionId: "q_1", how: "answered" });
+  applyEvent(t, { type: "worker_question_resolved", questionId: "q_2", how: "timeout" });
+  applyEvent(t, { type: "control_dropped", control: "steer", source: "console", reason: "run already settled" });
+  assert.deepEqual(text(t), [
+    "? bcrypt or argon2? [bcrypt | argon2]",
+    "? free form?",
+    "· tests passing",
+    "▶ answer (console): argon2",
+    "! no answer in time; worker proceeds on its own judgment",
+    "! steer from console dropped: run already settled",
+  ]);
+  assert.equal(t.lines[0].kind, "question");
+  assert.equal(t.lines[3].kind, "steer");
+});
