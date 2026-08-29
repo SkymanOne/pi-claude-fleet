@@ -82,6 +82,8 @@ export function initialViewState(): OrchestratorViewState {
 /** Things that happen in the app rather than on the wire. */
 export type LocalEvent =
   | { type: "sent"; text: string; display?: string; kind?: OrchestratorLineKind }
+  | { type: "stream_text"; text: string }
+  | { type: "activity"; activity: Activity | null }
   | { type: "fleet"; events: FleetEvent[]; text: string }
   | { type: "notice"; text: string }
   | { type: "error"; text: string }
@@ -143,7 +145,7 @@ export function summarizeFleetEvents(events: FleetEvent[]): string {
 }
 
 const isLocal = (msg: ClaudeStreamMessage | LocalEvent): msg is LocalEvent =>
-  ["sent", "fleet", "notice", "error", "exit"].includes((msg as LocalEvent).type);
+  ["sent", "fleet", "notice", "error", "exit", "stream_text", "activity"].includes((msg as LocalEvent).type);
 
 /** Fold one message (wire or local) into the view state; mutates and returns it. */
 export function reduceOrchestrator(state: OrchestratorViewState, msg: ClaudeStreamMessage | LocalEvent): OrchestratorViewState {
@@ -160,6 +162,15 @@ export function reduceOrchestrator(state: OrchestratorViewState, msg: ClaudeStre
         state.pendingEchoes.push(msg.text);
         gap(state);
         push(state, "fleet", `⚑ ${summarizeFleetEvents(msg.events)}`);
+        return state;
+      case "stream_text":
+        // coalesced token deltas from the monitor
+        state.partial = (state.partial ?? "") + msg.text;
+        state.turnActive = true;
+        return state;
+      case "activity":
+        state.activity = msg.activity;
+        if (msg.activity) state.turnActive = true;
         return state;
       case "notice":
         push(state, "system", msg.text);
@@ -354,6 +365,11 @@ export function buildRail(args: {
     });
   }
   return items;
+}
+
+/** The current activity of a live process, for the monitor to record. */
+export function activityOf(proc: { turnActive: boolean; activity?: Activity | null }): Activity | null {
+  return proc.turnActive ? (proc.activity ?? null) : null;
 }
 
 /** `✻ thinking… 8s` — what the orchestrator is doing, and for how long. */

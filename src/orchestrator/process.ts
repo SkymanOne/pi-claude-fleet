@@ -18,6 +18,7 @@ import {
   isResult,
   isStreamEvent,
   textDeltaOf,
+  toolUsesOf,
   userMessage,
   allowResponse,
   denyResponse,
@@ -84,6 +85,14 @@ export interface OrchestratorProcessEvents {
 
 const CONTROL_TIMEOUT_MS = 5_000;
 
+/** A stream event carrying the model's reasoning rather than its answer. */
+function isThinkingEvent(msg: { event?: { type?: string; delta?: { type?: string }; content_block?: { type?: string } } }): boolean {
+  const ev = msg.event;
+  if (!ev) return false;
+  if (ev.type === "content_block_delta") return ev.delta?.type === "thinking_delta";
+  return ev.type === "content_block_start" && ev.content_block?.type === "thinking";
+}
+
 export class OrchestratorProcess extends EventEmitter<OrchestratorProcessEvents> {
   readonly options: OrchestratorProcessOptions;
   readonly pendingRequests = new Map<string, PermissionRequest>();
@@ -97,6 +106,8 @@ export class OrchestratorProcess extends EventEmitter<OrchestratorProcessEvents>
   numTurns = 0;
   /** True from the moment we send a user message until the next `result`. */
   turnActive = false;
+  /** What the model is doing right now: reasoning, writing, or in a tool. */
+  activity: { kind: "thinking" | "responding" | "tool"; label?: string; since: number } | null = null;
   initReceived = false;
   exited: ExitInfo | null = null;
   private child: ChildProcess | null = null;
@@ -200,7 +211,10 @@ export class OrchestratorProcess extends EventEmitter<OrchestratorProcessEvents>
   /** A user turn, or an async message injected mid-turn (claude folds it into the running turn). */
   send(text: string): boolean {
     const okWrite = this.write(userMessage(text));
-    if (okWrite) this.turnActive = true;
+    if (okWrite) {
+      this.turnActive = true;
+      this.activity = { kind: "thinking", since: Date.now() };
+    }
     return okWrite;
   }
 
@@ -340,12 +354,19 @@ export class OrchestratorProcess extends EventEmitter<OrchestratorProcessEvents>
     if (isStreamEvent(msg)) {
       this.turnActive = true;
       const delta = textDeltaOf(msg);
-      if (delta !== null) this.emit("text_delta", delta, msg);
+      if (delta !== null) {
+        if (this.activity?.kind !== "responding") this.activity = { kind: "responding", since: Date.now() };
+        this.emit("text_delta", delta, msg);
+      } else if (isThinkingEvent(msg) && this.activity?.kind !== "thinking") {
+        this.activity = { kind: "thinking", since: Date.now() };
+      }
       this.emit("stream_event", msg);
       return;
     }
     if (isAssistant(msg)) {
       this.turnActive = true;
+      const tools = toolUsesOf(msg);
+      if (tools.length > 0) this.activity = { kind: "tool", label: tools[tools.length - 1].name, since: Date.now() };
       this.emit("assistant", msg);
       return;
     }
@@ -355,6 +376,7 @@ export class OrchestratorProcess extends EventEmitter<OrchestratorProcessEvents>
     }
     if (isResult(msg)) {
       this.turnActive = false;
+      this.activity = null;
       if (typeof msg.total_cost_usd === "number") this.costUsd = msg.total_cost_usd;
       if (typeof msg.num_turns === "number") this.numTurns = msg.num_turns;
       if (msg.session_id) this.sessionId = msg.session_id;

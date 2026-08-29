@@ -1,9 +1,7 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { Box, Text, useInput, useStdout } from "ink";
-import type {
-  OrchestratorProcess,
-  PermissionRequest,
-} from "../orchestrator/process.js";
+import type { OrchestratorClient } from "../orchestrator/client.js";
+import type { PendingRequestRecord } from "../orchestrator/records.js";
 import type { FleetWatcher } from "../fleet/watcher.js";
 import { formatFleetBatch, type FleetEvent } from "../fleet/events.js";
 import {
@@ -51,7 +49,8 @@ import {
 import type { ClaudeStreamMessage } from "../orchestrator/protocol.js";
 
 export interface AppProps {
-  proc: OrchestratorProcess;
+  /** The console's handle on the detached orchestrator; it does not own that process. */
+  client: OrchestratorClient;
   watcher: FleetWatcher;
   onQuit: () => void;
   /** Poll interval for the rail (the watcher has its own). */
@@ -75,7 +74,7 @@ const reducer = (
 ): OrchestratorViewState => ({ ...reduceOrchestrator(state, msg) });
 
 export function App({
-  proc,
+  client,
   watcher,
   onQuit,
   railPollMs = 500,
@@ -85,7 +84,8 @@ export function App({
   const [view, dispatch] = useReducer(reducer, undefined, initialViewState);
   const [runs, setRuns] = useState<RailRun[]>(() => watcher.runs());
   const [selected, setSelected] = useState(0);
-  const [approvals, setApprovals] = useState<PermissionRequest[]>([]);
+  const [approvals, setApprovals] = useState<PendingRequestRecord[]>([]);
+  const [, setStateTick] = useState(0);
   const [input, setInput] = useState("");
   const [showHelp, setShowHelp] = useState(false);
   const [now, setNow] = useState(() => Date.now());
@@ -112,56 +112,65 @@ export function App({
     rows: stdout?.rows ?? 24,
     columns: stdout?.columns ?? 80,
   });
-  const [orchestratorCommands, setOrchestratorCommands] = useState(
-    proc.slashCommands,
-  );
+  const orchestratorCommands = client.state?.commands ?? [];
   const busy = useRef(false);
   // ink-text-input also receives the ctrl keypress and would insert it as text;
   // a shortcut sets this so the next change from the input is dropped.
   const swallowNextChange = useRef(false);
 
   useEffect(() => {
-    const onMessage = (msg: ClaudeStreamMessage): void => dispatch(msg);
-    const onPermission = (req: PermissionRequest): void =>
-      setApprovals((q) => [...q, req]);
-    const onExit = (info: {
-      code: number | null;
-      signal: NodeJS.Signals | null;
-    }): void =>
-      dispatch({ type: "exit", code: info.code, signal: info.signal });
-    const onError = (err: Error): void =>
-      dispatch({ type: "error", text: `! orchestrator: ${err.message}` });
-    const onCommands = (commands: typeof proc.slashCommands): void =>
-      setOrchestratorCommands(commands);
-    proc.on("commands", onCommands);
-    proc.on("message", onMessage);
-    proc.on("permission_request", onPermission);
-    proc.on("exit", onExit);
-    proc.on("error", onError);
-    return () => {
-      proc.off("commands", onCommands);
-      proc.off("message", onMessage);
-      proc.off("permission_request", onPermission);
-      proc.off("exit", onExit);
-      proc.off("error", onError);
+    const onRecord = (record: Record<string, unknown>): void => {
+      // the monitor's own records ride the same file as claude's messages
+      if (record.type === "stream_text") {
+        dispatch({ type: "stream_text", text: String(record.text ?? "") });
+        return;
+      }
+      if (record.type === "activity") {
+        dispatch({ type: "activity", activity: (record.activity as never) ?? null });
+        return;
+      }
+      if (record.type === "notice") {
+        dispatch(
+          record.error
+            ? { type: "error", text: String(record.text ?? "") }
+            : { type: "notice", text: String(record.text ?? "") },
+        );
+        return;
+      }
+      // permission records are state, not transcript: the overlay renders them
+      if (record.type === "permission_request" || record.type === "permission_resolved") return;
+      dispatch(record as unknown as ClaudeStreamMessage);
     };
-  }, [proc]);
+    const onPermission = (req: PendingRequestRecord): void =>
+      setApprovals((q) => (q.some((p) => p.requestId === req.requestId) ? q : [...q, req]));
+    const onExit = (info: { code: number | null; signal: string | null }): void =>
+      dispatch({ type: "exit", code: info.code, signal: info.signal });
+    const onState = (): void => setStateTick((n) => n + 1);
+    client.on("record", onRecord);
+    client.on("permission_request", onPermission);
+    client.on("exit", onExit);
+    client.on("state", onState);
+    return () => {
+      client.off("record", onRecord);
+      client.off("permission_request", onPermission);
+      client.off("exit", onExit);
+      client.off("state", onState);
+    };
+  }, [client]);
 
   useEffect(() => {
     const onBatch = (events: FleetEvent[]): void => {
       const text = formatFleetBatch(events, watcher.batchLimit);
       dispatch({ type: "fleet", events, text });
-      if (!proc.send(text))
-        dispatch({
-          type: "error",
-          text: "! could not deliver fleet events (orchestrator not running)",
-        });
+      void client
+        .send(text)
+        .catch(() => dispatch({ type: "error", text: "! could not deliver fleet events" }));
     };
     watcher.on("batch", onBatch);
     return () => {
       watcher.off("batch", onBatch);
     };
-  }, [watcher, proc]);
+  }, [watcher, client]);
 
   useEffect(() => {
     const tick = (): void => {
@@ -346,7 +355,7 @@ export function App({
       if (completion) setDismissed(true);
       else if (showHelp) setShowHelp(false);
       else if (view.turnActive) {
-        void proc.interrupt();
+        void client.interrupt();
         notice("· interrupt requested");
       }
       return;
@@ -425,8 +434,7 @@ export function App({
         text: `/effort ${level}`,
         display: `/thinking ${level}`,
       });
-      if (!proc.send(`/effort ${level}`))
-        notice("! orchestrator is not running", true);
+      void client.setEffort(level).catch(() => notice("! orchestrator is not running", true));
       return;
     }
     if (target?.kind === "worker") {
@@ -457,7 +465,7 @@ export function App({
       return;
     }
     dispatch({ type: "sent", text });
-    if (!proc.send(text)) notice("! orchestrator is not running", true);
+    void client.send(text).catch(() => notice("! orchestrator is not running", true));
   };
 
   /**
@@ -484,12 +492,12 @@ export function App({
   /** Stop everything — the orchestrator and every worker — and leave. */
   const shutdown = (): void => {
     setConfirm(null);
-    void stopAllWorkers(watcher.piFleetDir)
-      .then((stopped) => {
+    void Promise.all([stopAllWorkers(watcher.piFleetDir), client.shutdown()])
+      .then(([stopped]) => {
         notice(
           stopped.length > 0
-            ? `■ stopping ${stopped.join(", ")}`
-            : "■ shutting down",
+            ? `■ stopping the orchestrator and ${stopped.join(", ")}`
+            : "■ stopping the orchestrator",
         );
         onQuit();
       })
@@ -500,8 +508,10 @@ export function App({
   };
 
   const approval = approvals[0];
-  const resolve = (fn: () => boolean): void => {
-    fn();
+  const resolve = (fn: () => Promise<void>): void => {
+    void fn().catch((err: unknown) =>
+      notice(`! ${err instanceof Error ? err.message : String(err)}`, true),
+    );
     setApprovals((q) => q.slice(1));
   };
 
@@ -622,13 +632,11 @@ export function App({
             request={approval}
             queued={approvals.length - 1}
             onAllow={(updatedPermissions) =>
-              resolve(() => proc.allow(approval.requestId, updatedPermissions))
+              resolve(() => client.allow(approval.requestId, updatedPermissions))
             }
-            onDeny={(reason) =>
-              resolve(() => proc.deny(approval.requestId, reason))
-            }
+            onDeny={(reason) => resolve(() => client.deny(approval.requestId, reason))}
             onAnswer={(answers) =>
-              resolve(() => proc.answerQuestion(approval.requestId, answers))
+              resolve(() => client.answerQuestion(approval.requestId, answers))
             }
           />
         ) : (

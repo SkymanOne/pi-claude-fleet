@@ -5,10 +5,12 @@ import path from "node:path";
 import React from "react";
 import { render } from "ink-testing-library";
 import { App } from "../src/tui/App.js";
-import { OrchestratorProcess } from "../src/orchestrator/process.js";
+import { OrchestratorClient } from "../src/orchestrator/client.js";
+import { loadOrchestratorState } from "../src/orchestrator/monitor.js";
+import { orchestratorPaths } from "../src/orchestrator/records.js";
 import { FleetWatcher } from "../src/fleet/watcher.js";
-import { fleetMcpConfig } from "../src/orchestrator/mcpConfig.js";
 import {
+  isAlive,
   newRunState,
   saveState,
   runDirFor,
@@ -24,7 +26,8 @@ const CTRL_G = String.fromCharCode(7);
 const squash = (s: string): string => s.replace(/\s+/g, " ");
 
 interface Harness {
-  proc: OrchestratorProcess;
+  client: OrchestratorClient;
+  restoreEnv: () => void;
   watcher: FleetWatcher;
   piFleetDir: string;
   cwd: string;
@@ -32,30 +35,51 @@ interface Harness {
   quit: { called: number };
 }
 
+/** The monitor is a detached child, so fake-claude's knobs travel through this process's env. */
+function useFakeClaude(over: Record<string, string> = {}): () => void {
+  const keys = [
+    "PI_FLEET_DEV",
+    "PI_FLEET_CLAUDE_BIN",
+    "PI_FLEET_PI_BIN",
+    "FAKE_CLAUDE_STDIN_LOG",
+    "FAKE_CLAUDE_SESSION_ID",
+  ];
+  const saved: Record<string, string | undefined> = {};
+  for (const key of keys) saved[key] = process.env[key];
+  const env = fakeClaudeEnv(over);
+  for (const key of keys) {
+    if (typeof env[key] === "string") process.env[key] = env[key] as string;
+    else delete process.env[key];
+  }
+  return () => {
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  };
+}
+
 function setup(over: Record<string, string> = {}): Harness {
   const root = tmpDir("pf-app-");
   const piFleetDir = path.join(root, ".pi-fleet");
   fs.mkdirSync(path.join(piFleetDir, "runs"), { recursive: true });
   fs.mkdirSync(path.join(piFleetDir, "reports"), { recursive: true });
-  const promptFile = path.join(piFleetDir, "prompt.md");
-  fs.writeFileSync(promptFile, "# prompt\n");
+  const paths = orchestratorPaths(piFleetDir);
+  fs.mkdirSync(paths.dir, { recursive: true });
+  fs.writeFileSync(paths.prompt, "# prompt\n");
   const stdinLogPath = path.join(root, "stdin.log");
-  const proc = new OrchestratorProcess({
-    cwd: root,
-    promptFile,
-    mcpConfigJson: JSON.stringify(fleetMcpConfig(piFleetDir)),
-    env: fakeClaudeEnv({
-      FAKE_CLAUDE_STDIN_LOG: stdinLogPath,
-      FAKE_CLAUDE_SESSION_ID: "sess-abcdef12",
-      ...over,
-    }),
-    stopGraceMs: 300,
+  const restoreEnv = useFakeClaude({
+    FAKE_CLAUDE_STDIN_LOG: stdinLogPath,
+    FAKE_CLAUDE_SESSION_ID: "sess-abcdef12",
+    ...over,
   });
-  proc.start();
+  const client = new OrchestratorClient({ piFleetDir, cwd: root, fresh: true, pollMs: 30 });
+  client.start();
   const watcher = new FleetWatcher({ piFleetDir, pollMs: 30, batchMs: 20 });
   watcher.start();
   return {
-    proc,
+    client,
+    restoreEnv,
     watcher,
     piFleetDir,
     cwd: root,
@@ -91,7 +115,7 @@ async function addRun(
 function renderApp(h: Harness) {
   return render(
     React.createElement(App, {
-      proc: h.proc,
+      client: h.client,
       watcher: h.watcher,
       onQuit: () => {
         h.quit.called += 1;
@@ -103,8 +127,9 @@ function renderApp(h: Harness) {
   );
 }
 
-// each test drives a real claude child and a git subprocess for file completion,
-// so the whole file runs under load; be patient before calling a frame missing
+// each test spawns a detached orchestrator monitor, its claude child, that
+// child's MCP server and a git subprocess for file completion, so the whole
+// file runs under load; be patient before calling a frame missing
 /**
  * Keys must not land in the same stdin chunk: ink parses a chunk as one
  * keypress, so "down" + "enter" written together become a single escape
@@ -122,7 +147,7 @@ async function press(
 async function frameMatching(
   lastFrame: () => string | undefined,
   re: RegExp,
-  timeoutMs = 20_000,
+  timeoutMs = 40_000,
 ): Promise<string> {
   try {
     return await waitFor(
@@ -159,7 +184,20 @@ async function teardown(
 ): Promise<void> {
   app.unmount();
   h.watcher.stop();
-  await h.proc.stop();
+  h.client.stop();
+  // the orchestrator outlives a console now, so the test has to stop it itself
+  const state = loadOrchestratorState(h.piFleetDir);
+  if (state?.pid && isAlive(state.pid)) {
+    try {
+      process.kill(state.pid, "SIGTERM");
+    } catch {
+      // already gone
+    }
+    await waitFor(() => (!isAlive(state.pid) ? true : undefined), {
+      timeoutMs: 10_000,
+    }).catch(() => undefined);
+  }
+  h.restoreEnv();
 }
 
 test(

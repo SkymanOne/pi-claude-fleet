@@ -46,6 +46,8 @@ Each rail row carries what that session is doing — the tool a worker is in, `n
 
 The status line describes whatever is selected: for a worker its state, model, reasoning level and branch, so you always see the model that worker is actually running (what pi resolved, not just the pattern you asked for); for the orchestrator its model, session, spend and turns.
 
+A line above the composer says what the selected session is doing while it works — `✻ thinking… 12s`, `✎ replying…`, or the tool it is in — and the rail says the same for every session at a glance.
+
 Keys: `tab` / `shift-tab` (or `ctrl+n` / `ctrl+p`) switch between the orchestrator and the workers, `esc` interrupts the orchestrator's turn, `ctrl-c` quits. Only non-printable keys are bound, so a message that starts with "q" does not quit the app.
 
 The composer at the bottom sends to whatever is selected. With the orchestrator selected it is a normal message. With a worker selected:
@@ -72,7 +74,9 @@ The transcript separates the parts of a turn: your prompts in cyan, the model's 
 
 Workers disappear from the rail when they are done: the orchestrator removes each one after it merges and verifies it, and the console removes any settled worker whose branch is already merged. Nothing unmerged, dirty or still running is ever removed for you — that waits for `/remove`, which tells you exactly what would be lost before it does anything.
 
-Quitting stops the orchestrator but leaves workers running; they are detached processes with their state on disk. `pi-fleet` reopens the console and resumes the same orchestrator session (`--fresh` starts a new one). If a turn is in flight when you quit, the console ends it first — a `claude -p` killed mid-turn leaves that turn unfinished, and resuming the session would otherwise pick up where it was interrupted. `/shutdown` is the other exit: it stops every worker as well, and says how many before it does.
+Quitting closes the console, nothing else. The orchestrator and its workers are detached processes with their state on disk, so `pi-fleet` reopens where you left off: the same claude session, still mid-thought if it was working, with its transcript replayed. A permission prompt raised while no console was open is still waiting for you when you return. `--fresh` starts a new orchestrator instead of attaching.
+
+`/shutdown` is the other exit: it stops the orchestrator and every worker, after telling you how many are running. Worktrees and branches are kept.
 
 Options: `--cwd <dir>`, `--model <model>`, `--fresh`, `--budget <usd>`, `--progress-events` (forward workers' progress notes to the orchestrator, off by default because they are chatty).
 
@@ -141,7 +145,11 @@ Exit codes: 0 ok, 1 refusal or error, 2 no report, 3 wait timed out, 4 the run e
 | `runs/<id>/outbox.jsonl` | outbox: the worker's `question`, `progress` and `question_resolved` envelopes |
 | `runs/<id>/rpc.log`, `monitor.log` | raw pi stream and the monitor's own output |
 | `reports/<id>.md` | the worker's final report |
-| `orchestrator.json`, `orchestrator.log`, `orchestrator.prompt.md` | the claude session id and watcher cursors, the raw protocol log, the rendered prompt |
+| `orchestrator/state.json` | the orchestrator's durable facts: monitor pid, claude session id, model, commands, cost, turns, what it is doing, and any permission prompt waiting for you |
+| `orchestrator/events.jsonl` | its transcript: claude's messages, coalesced token deltas, activity and permission records |
+| `orchestrator/control.jsonl` | inbox: your messages, permission answers, interrupts, effort changes, stop |
+| `orchestrator/claude.log`, `monitor.log`, `prompt.md` | the raw protocol log, the monitor's own output, the rendered prompt |
+| `orchestrator.json` | the claude session id and the watcher's cursors, so a reopened console does not replay old fleet events |
 
 Status is derived, never stored: a run whose monitor is gone reads as `dead`, and a running worker waiting on `fleet_ask` reads as `blocked`.
 
@@ -150,15 +158,19 @@ One thing to know: `diff` and `merge` only see committed work. If a worker forge
 ## How it fits together
 
 ```text
-pi-fleet (ink TUI)
- ├── claude -p  (stream-json over stdio: messages in, transcript and permission
- │              prompts out; the orchestrator's session id is saved for --resume)
- │    └── pi-fleet mcp  (stdio MCP: the fleet_* tools, over .pi-fleet/)
- ├── monitors  (detached; each owns one `pi --mode rpc` worker in its worktree)
- └── watcher   (tails every run's state and events → the rail, and → <fleet-event>)
+pi-fleet (ink TUI)                    ← comes and goes; owns no agent
+ ├── attaches to .pi-fleet/orchestrator/{state,events,control}
+ └── watcher  (tails every run's state and events → the rail, and → <fleet-event>)
+
+orchestrator monitor (detached)       ← survives the console
+ └── claude -p  (stream-json over stdio)
+      └── pi-fleet mcp  (stdio MCP: the fleet_* tools, over .pi-fleet/)
+
+worker monitors (detached, one each)  ← survive the console
+ └── pi --mode rpc  in its own git worktree
 ```
 
-Each piece keeps its own state on disk, so the console can come and go without disturbing the workers.
+Every agent is owned by a detached monitor that writes what happens to files, and the console is only a reader and a writer of those files. That is what lets you close it mid-run, come back, and find the session where you left it.
 
 ## Development
 

@@ -221,6 +221,25 @@ program
   });
 
 program
+  .command("__orchestrator <piFleetDir>", { hidden: true })
+  .option(...cwdOption)
+  .option("--model <model>", "model for the orchestrator")
+  .option("--budget <usd>", "stop after this much spend")
+  .option("--fresh", "start a new claude session")
+  .action(async (piFleetDir: string, options: OptionValues) => {
+    const { runOrchestratorMonitor } = await import("./orchestrator/monitor.js");
+    done(
+      await runOrchestratorMonitor({
+        piFleetDir,
+        cwd: options.cwd ?? process.cwd(),
+        model: options.model ?? null,
+        budget: options.budget ? Number(options.budget) : null,
+        fresh: Boolean(options.fresh),
+      }),
+    );
+  });
+
+program
   .command("__monitor <piFleetDir> <runId>", { hidden: true })
   .action(async (piFleetDir: string, runId: string) => {
     const { runMonitor } = await import("./monitor.js");
