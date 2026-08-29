@@ -9,6 +9,7 @@ import {
   runDirFor,
   listRuns,
   findRun,
+  findSessionFile,
   loadState,
   loadStateSync,
   saveState,
@@ -138,7 +139,7 @@ export async function resolveRun(name: string, cwd?: string): Promise<{ piFleetD
 }
 
 /** A run state as observers see it: `status` is the derived view (may be `blocked`). */
-export type DerivedRunState = Omit<RunState, "status"> & { status: DerivedView };
+export type DerivedRunState = Omit<RunState, "status"> & { status: DerivedView; sessionFile?: string | null };
 
 function withDerivedStatus(state: RunState): DerivedRunState {
   return { ...state, status: deriveView(state) };
@@ -159,8 +160,9 @@ export interface StatusData {
 export async function statusCore(args: StatusArgs): Promise<CommandResult<StatusData>> {
   const { piFleetDir } = await resolveFleetDir(args.cwd);
   if (args.name) {
-    const { state } = findRun(piFleetDir, args.name);
-    const derived = withDerivedStatus(state);
+    const { state, runDir } = findRun(piFleetDir, args.name);
+    // the session file is what `spawn --session` / fleet_spawn(session) resumes
+    const derived: DerivedRunState = { ...withDerivedStatus(state), sessionFile: findSessionFile(runDir) };
     return ok({ runs: [derived] }, [JSON.stringify(derived, null, 2)]);
   }
   const runs = listRuns(piFleetDir)

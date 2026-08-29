@@ -17,7 +17,6 @@ import {
   type SpawnOpts,
 } from "./commands.js";
 import { cmdOpen, cmdAttach } from "./console/index.js";
-import { cmdInstallClaudeSkill } from "./install.js";
 
 let exitCode = 0;
 const done = (n: number): void => {
@@ -28,7 +27,7 @@ const program = new Command();
 program
   .name("pi-fleet")
   .description(
-    "Claude Code ↔ pi fleet orchestration: spawn headless pi workers, monitor, steer, collect reports, merge.",
+    "A fleet of headless pi workers orchestrated by Claude Code: run `pi-fleet` for the TUI, or drive workers with the subcommands.",
   );
 
 const cwdOption = [
@@ -178,11 +177,6 @@ program
   .description("live view + steering console for one worker (non-TTY: prints the captured tail)")
   .option(...cwdOption)
   .action(async (name: string, options: OptionValues) => done(await cmdAttach({ name, cwd: options.cwd })));
-
-program
-  .command("install-claude-skill")
-  .description("symlink the pi-orchestrator skill into ~/.claude/skills")
-  .action(async () => done(await cmdInstallClaudeSkill()));
 
 program
   .command("mcp")

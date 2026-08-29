@@ -20,3 +20,11 @@ test("spawn without a brief exits 1 with guidance", async () => {
   assert.equal(r.code, 1);
   assert.match(r.stderr, /brief required/);
 });
+
+test("the Claude Code skill installer is gone; mcp and answer are advertised", async () => {
+  const gone = await runCli(["install-claude-skill"]);
+  assert.equal(gone.code, 1);
+  const help = await runCli(["--help"]);
+  assert.match(help.stdout, /\bmcp\b/);
+  assert.match(help.stdout, /\banswer\b/);
+});

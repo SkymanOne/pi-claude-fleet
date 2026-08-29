@@ -1,13 +1,15 @@
 {
   "name": "pi-claude-fleet",
   "version": "0.1.0",
-  "description": "Claude Code orchestrates pi agents: pi-fleet CLI, report protocol, orchestrator skill",
+  "description": "A terminal app where Claude Code orchestrates a fleet of pi workers: TUI, fleet MCP tools, worker mailboxes",
   "keywords": [
     "pi-package",
     "pi",
     "claude-code",
     "orchestration",
-    "fleet"
+    "fleet",
+    "mcp",
+    "tui"
   ],
   "license": "MIT",
   "type": "module",
@@ -21,7 +23,7 @@
   "files": [
     "dist",
     "pi",
-    "claude",
+    "prompts",
     "README.md"
   ],
   "pi": {
