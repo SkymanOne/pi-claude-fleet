@@ -238,6 +238,26 @@ test("needsInitialize: the bare initialize handshake is only sent when asked for
   }
 }, { timeout: 20_000 });
 
+test("a write racing the child's death does not crash the app", async () => {
+  const root = tmpDir("pf-proc-epipe-");
+  const proc = startProc(root);
+  try {
+    await waitFor(() => (proc.pid && isAlive(proc.pid) ? true : undefined), { timeoutMs: 5000, intervalMs: 10 });
+    const exited = once(proc, "exit");
+    // kill, then write in the same tick: the pipe is still open, so the failure
+    // arrives as an asynchronous EPIPE rather than a throw from write()
+    process.kill(proc.pid as number, "SIGKILL");
+    const big = "x".repeat(4 * 1024 * 1024);
+    for (let i = 0; i < 4; i++) proc.send(big);
+    await exited;
+    // reaching here at all is the assertion: an unhandled EPIPE would have killed this process
+    assert.equal(proc.running, false);
+    assert.equal(proc.send("after death"), false);
+  } finally {
+    await proc.stop();
+  }
+}, { timeout: 20_000 });
+
 test("stop() escalates to SIGTERM/SIGKILL for a child that ignores stdin closing", async () => {
   const root = tmpDir("pf-proc-6-");
   const promptFile = path.join(root, "p.md");

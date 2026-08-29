@@ -141,6 +141,12 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
     stdio: ["pipe", "pipe", "pipe"],
   });
 
+  // As in the orchestrator: an EPIPE from a write racing pi's death must not
+  // become an uncaught exception and kill the monitor before it records why.
+  child.stdin?.on("error", () => {
+    // the close handler sets state.error with the stderr tail
+  });
+
   const send = (msg: Record<string, unknown>): boolean => {
     try {
       return child.stdin?.write(JSON.stringify(msg) + "\n") ?? false;

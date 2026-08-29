@@ -133,6 +133,12 @@ export class OrchestratorProcess extends EventEmitter<OrchestratorProcessEvents>
     });
     this.child = child;
     this.log?.write(`[${nowIso()}] spawn pid=${child.pid ?? "?"} ${bin} ${this.args().join(" ")}\n`);
+    // A write that races the child's death fails asynchronously (EPIPE). Without a
+    // listener that is an uncaught exception, which would take the whole app down;
+    // the `close` handler below is what actually reports the child going away.
+    child.stdin?.on("error", (err: Error) => {
+      this.log?.write(`[stdin error] ${err.message}\n`);
+    });
     child.stdout?.on("data", (chunk: Buffer) => this.onStdout(chunk));
     child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
