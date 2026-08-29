@@ -39,6 +39,9 @@ const LAST_TEXT_TIMEOUT_MS = 2000;
 /** After ending stdin: escalate to SIGTERM, then SIGKILL. */
 const SHUTDOWN_GRACE_MS = 5000;
 
+/** Tools the fleet-worker extension registers; appended to any `--tools` allowlist. */
+export const FLEET_WORKER_TOOLS = ["fleet_ask", "fleet_progress"] as const;
+
 /** `PI_FLEET_PI_BIN` is an executable spec split on spaces ("node /path/fake-pi.mjs"). */
 export function piCommand(): { bin: string; prefix: string[] } {
   const [bin, ...prefix] = (process.env.PI_FLEET_PI_BIN || "pi").split(" ");
@@ -58,7 +61,8 @@ export function buildPiArgs(state: RunState, runDir: string): string[] {
   if (state.thinking) args.push("--thinking", state.thinking);
   if (state.skill) args.push("--skill", state.skill);
   if (state.appendSystemPrompt) args.push("--append-system-prompt", state.appendSystemPrompt);
-  if (state.tools) args.push("--tools", state.tools);
+  // a user allowlist must not hide the worker protocol tools
+  if (state.tools) args.push("--tools", `${state.tools},${FLEET_WORKER_TOOLS.join(",")}`);
   if (state.excludeTools) args.push("--exclude-tools", state.excludeTools);
   if (state.sessionArg) args.push("--session", state.sessionArg);
   return args;

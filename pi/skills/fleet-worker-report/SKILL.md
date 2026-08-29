@@ -65,3 +65,10 @@ Suggested next step: one action, such as "merge the branch" or "re-run with X cl
 - Stay inside your working directory. Never run `git merge`, never touch the parent checkout, never push.
 - Commit your work in your worktree when the brief asks for commits. The orchestrator does the merging.
 - On long tasks, append one-line milestones to `$PI_FLEET_DIR/runs/$PI_FLEET_RUN/progress.md`.
+
+## Talking to the orchestrator mid-run
+
+Two tools are registered for fleet workers:
+
+- `fleet_ask` (`question`, optional `options`, optional `context`): ask the orchestrator a question and wait for the answer. Use it when you are blocked on a decision or a missing input instead of guessing. The call returns the answer text, or, if nobody answers in time, a note telling you to proceed on your own judgment; record that choice under "Decisions & assumptions". While you wait, steering messages are delivered only after the call returns.
+- `fleet_progress` (`message`): record a one-line milestone. The orchestrator and the human console see it immediately; it is also appended to `$PI_FLEET_DIR/runs/$PI_FLEET_RUN/progress.md`.
