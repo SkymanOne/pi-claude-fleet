@@ -92,6 +92,7 @@ export type OrchestratorCommand =
   | { type: "interrupt" }
   | { type: "effort"; level: string }
   | { type: "permission_mode"; mode: string }
+  | { type: "remote_control"; name: string | null }
   | { type: "stop" };
 
 /** Console → monitor. */
@@ -101,6 +102,7 @@ export type OrchestratorControl =
   | { id: string; ts: string; type: "interrupt" }
   | { id: string; ts: string; type: "effort"; level: string }
   | { id: string; ts: string; type: "permission_mode"; mode: string }
+  | { id: string; ts: string; type: "remote_control"; name: string | null }
   | { id: string; ts: string; type: "stop" };
 
 export type PermissionDecisionRecord =

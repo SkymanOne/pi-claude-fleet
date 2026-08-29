@@ -54,7 +54,8 @@ test("a turn: init, our echo, deltas, assistant text and tools, tool results, re
     "text|Spawning add-auth.",
     "text|Two steps.",
     "tool|⚙ mcp__fleet__fleet_spawn add-auth",
-    "tool_result|  ↳ mcp__fleet__fleet_spawn: Spawned add-auth-2026 more",
+    "tool_result|  ↳ mcp__fleet__fleet_spawn: Spawned add-auth-2026",
+    "tool_result|      more",
   ]);
   assert.equal(s.turnActive, false);
   assert.equal(s.costUsd, 0.25);
@@ -80,10 +81,15 @@ test("assistant markdown is rendered into styled spans, and huge tool output is 
   assert.ok(md[2].spans?.some((sp) => sp.code && sp.text === "commands.ts:346"));
   assert.equal(md[2].text, "1. medium — commands.ts:346 is risky", "the plain text has no markdown syntax left");
 
-  const result = s.lines.find((l) => l.kind === "tool_result")!;
-  assert.ok(result.text.length < 260, `tool result stays bounded (was ${result.text.length})`);
-  assert.ok(result.text.endsWith("…"));
-  assert.equal(result.text.includes("\n"), false);
+  const results = s.lines.filter((l) => l.kind === "tool_result");
+  const total = results.reduce((n, l) => n + l.text.length, 0);
+  assert.ok(total < 800, `tool output stays bounded (was ${total})`);
+  assert.match(
+    results[results.length - 1].text,
+    /… \d+ more characters/,
+    "and what was left out is counted, not hidden behind an ellipsis",
+  );
+  assert.ok(results.every((l) => !l.text.includes("\n")), "every line is one row's worth");
 });
 
 test("a user message we did not send is rendered; a second init is quiet", () => {
@@ -244,4 +250,44 @@ test("a worker's rail line says whether it is thinking, replying or in a tool", 
   assert.equal(workerActivity({ ...base, activity: "tool", lastTool: "bash" }, "running"), "⚙ bash");
   assert.equal(workerActivity({ ...base, activity: null }, "running"), "working…");
   assert.equal(workerActivity({ ...base, activity: "thinking" }, "blocked"), "needs an answer", "blocked wins");
+});
+
+test("a long command is shown in full, and a long result says what it left out", () => {
+  const command =
+    'gh issue view 17 --repo SkymanOne/digital-id-done-right --json number,title,body,labels,state,comments';
+  let s = initialViewState();
+  s = reduceOrchestrator(s, {
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command } }] },
+  } as never);
+  const tool = s.lines.filter((l) => l.kind === "tool").map((l) => l.text).join("\n");
+  assert.equal(tool, `⚙ Bash ${command}`, "the command is not cut");
+  assert.equal(tool.includes("…"), false);
+
+  // a command too long to be worth showing whole is counted, not silently cut
+  const script = Array.from({ length: 40 }, (_, i) => `echo line ${i}`).join("\n");
+  s = reduceOrchestrator(initialViewState(), {
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "tool_use", id: "t2", name: "Bash", input: { command: script } }] },
+  } as never);
+  const lines = s.lines.filter((l) => l.kind === "tool").map((l) => l.text);
+  assert.equal(lines[0], "⚙ Bash echo line 0");
+  assert.equal(lines[lines.length - 1], "      … 30 more lines");
+
+  // and a result keeps its shape rather than being flattened into one clipped line
+  s = reduceOrchestrator(s, {
+    type: "user",
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "t2", content: "first\nsecond\nthird\nfourth\nfifth\nsixth" }],
+    },
+  } as never);
+  const out = s.lines.filter((l) => l.kind === "tool_result").map((l) => l.text);
+  assert.deepEqual(out, [
+    "  ↳ Bash: first",
+    "      second",
+    "      third",
+    "      fourth",
+    "      … 2 more lines",
+  ]);
 });

@@ -33,7 +33,9 @@ test("applyEvent renders steering, tools, streamed text, and status markers", ()
     "Working",
     "line2",
     "⚙ bash echo hi",
+    "      echo there",
     "  ↳ hi",
+    "    there",
     "  ↳ (error)",
     "▶ console: use tabs",
     "■ abort requested",
@@ -44,7 +46,8 @@ test("applyEvent renders steering, tools, streamed text, and status markers", ()
   ]);
   assert.equal(t.lines[0].kind, "steer");
   assert.equal(t.lines[3].kind, "tool");
-  assert.equal(t.lines[4].kind, "tool_result");
+  assert.equal(t.lines[4].kind, "tool", "a command keeps every line it was written with");
+  assert.equal(t.lines[5].kind, "tool_result");
   assert.equal(t.lines.at(-1)?.kind, "system");
 });
 

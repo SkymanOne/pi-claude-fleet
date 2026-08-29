@@ -46,7 +46,9 @@ Each rail row carries what that session is doing — the tool a worker is in, `n
 
 The status line describes whatever is selected: for a worker its state, model, reasoning level and branch, so you always see the model that worker is actually running (what pi resolved, not just the pattern you asked for); for the orchestrator its model, session, spend and turns.
 
-Remote Control is a launch flag rather than something the session can be told mid-conversation, so `/rc` gives the orchestrator a new claude process with the flag set: same conversation, resumed under it, transcript kept. `pi-fleet --remote-control [name]` starts that way, and the choice is remembered if the orchestrator restarts.
+Remote Control is a launch flag rather than something the session can be told mid-conversation, so `/rc` has the monitor swap claude for a new process with the flag set. The monitor itself stays up and the conversation is resumed, so the orchestrator does not stop and no console sees the session end. `pi-fleet --remote-control [name]` starts that way, and the choice is remembered if the orchestrator restarts.
+
+Tool calls are shown as written rather than clipped to fit, so a long command stays readable. Tool output is a preview: the first few lines, then a count of what was left out, since output can run to megabytes.
 
 A line above the composer says what the selected session is doing while it works — `✻ thinking… 12s`, `✎ replying…`, or the tool it is in — and the rail says the same for every session at a glance.
 

@@ -95,6 +95,63 @@ function trim(state: OrchestratorViewState): void {
   if (state.lines.length > MAX_LINES) state.lines.splice(0, state.lines.length - MAX_LINES);
 }
 
+/**
+ * How much of a tool call and of its output the transcript shows. A command is
+ * written by the model and is the thing worth reading, so it gets room; output
+ * can be megabytes, so it gets a preview.
+ */
+const TOOL_ARGS = { maxLines: 10, maxChars: 1200 };
+const TOOL_RESULT = { maxLines: 4, maxChars: 600 };
+
+/** The arguments as written, not a one-line digest of them. */
+function toolArgs(input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const a = input as Record<string, unknown>;
+  const primary = a.command ?? a.path ?? a.file_path ?? a.pattern ?? a.url ?? a.name ?? a.target;
+  return typeof primary === "string" ? primary.trim() : JSON.stringify(a);
+}
+
+/**
+ * Push text over as many lines as it takes, up to a bound. What is left out is
+ * counted rather than hidden behind a bare ellipsis, so it is clear that there
+ * is more and roughly how much.
+ */
+function pushBlock(
+  state: OrchestratorViewState,
+  kind: OrchestratorLineKind,
+  prefix: string,
+  text: string,
+  { maxLines, maxChars }: { maxLines: number; maxChars: number },
+): void {
+  const lines = text.split("\n");
+  const shown: string[] = [];
+  let budget = maxChars;
+  let cutMidLine = false;
+  for (const line of lines) {
+    if (shown.length >= maxLines || budget <= 0) break;
+    if (line.length > budget) {
+      shown.push(line.slice(0, budget));
+      cutMidLine = true;
+      budget = 0;
+      break;
+    }
+    shown.push(line);
+    budget -= line.length;
+  }
+  const indent = " ".repeat(Math.min(prefix.length, 6));
+  shown.forEach((line, i) => {
+    push(state, kind, i === 0 ? `${prefix}${line}`.trimEnd() : `${indent}${line}`.trimEnd());
+  });
+  if (shown.length === 0) push(state, kind, prefix.trimEnd());
+  const restLines = lines.length - shown.length;
+  const restChars = text.length - shown.reduce((n, l) => n + l.length + 1, -1);
+  if (restLines > 0) {
+    push(state, kind, `${indent}… ${restLines} more ${restLines === 1 ? "line" : "lines"}`);
+  } else if (cutMidLine && restChars > 0) {
+    push(state, kind, `${indent}… ${restChars} more characters`);
+  }
+}
+
 function push(state: OrchestratorViewState, kind: OrchestratorLineKind, text: string): void {
   for (const line of text.split("\n")) state.lines.push({ kind, text: line });
   trim(state);
@@ -225,7 +282,9 @@ export function reduceOrchestrator(state: OrchestratorViewState, msg: ClaudeStre
     const tools = toolUsesOf(msg);
     for (const tool of tools) {
       state.toolNames[tool.id] = tool.name;
-      push(state, "tool", `⚙ ${tool.name} ${summarizeArgs(tool.input)}`.trimEnd());
+      // the command itself is the thing worth reading, so it is not cut: ink
+      // wraps it and the row budget counts the rows it takes
+      pushBlock(state, "tool", `⚙ ${tool.name} `, toolArgs(tool.input), TOOL_ARGS);
     }
     if (tools.length > 0) state.activity = { kind: "tool", label: tools[tools.length - 1].name, since: Date.now() };
     return state;
@@ -247,8 +306,8 @@ export function reduceOrchestrator(state: OrchestratorViewState, msg: ClaudeStre
       const name = state.toolNames[result.toolUseId] ?? "tool";
       // tool output can be one enormous line (a whole state.json, a report);
       // the transcript shows a bounded preview, the tools show the rest
-      const head = oneLine(result.text) || (result.isError ? "(error)" : "(no output)");
-      push(state, "tool_result", `  ↳ ${name}: ${head}`);
+      const body = result.text.trim() || (result.isError ? "(error)" : "(no output)");
+      pushBlock(state, "tool_result", `  ↳ ${name}: `, body, TOOL_RESULT);
     }
     return state;
   }

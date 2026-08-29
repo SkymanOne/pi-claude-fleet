@@ -83,17 +83,28 @@ export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Pro
   };
   writeState();
 
-  const proc = new OrchestratorProcess({
-    cwd: args.cwd,
-    promptFile: paths.prompt,
-    mcpConfigJson: JSON.stringify(fleetMcpConfig(args.piFleetDir)),
-    model: args.model ?? undefined,
-    resumeSessionId: args.fresh ? null : session.sessionId,
-    maxBudgetUsd: args.budget ?? null,
-    permissionMode: args.permissionMode ?? null,
-    remoteControl: args.remoteControl ?? null,
-    logPath: paths.log,
-  });
+  /**
+   * Remote Control is a launch flag, so turning it on means a new claude child.
+   * The monitor owns that child and outlives it: the session is resumed in
+   * place, and the console attached to this monitor never sees an exit.
+   */
+  const newProcess = (remoteControl: string | null): OrchestratorProcess =>
+    new OrchestratorProcess({
+      cwd: args.cwd,
+      promptFile: paths.prompt,
+      mcpConfigJson: JSON.stringify(fleetMcpConfig(args.piFleetDir)),
+      model: args.model ?? undefined,
+      // after a restart this is the session the previous child was running
+      resumeSessionId: args.fresh && session.sessionId === null ? null : session.sessionId,
+      maxBudgetUsd: args.budget ?? null,
+      permissionMode: state.permissionMode ?? null,
+      remoteControl,
+      logPath: paths.log,
+    });
+
+  let proc = newProcess(args.remoteControl ?? null);
+  /** Set when the child is being replaced rather than shut down. */
+  let restartWith: { remoteControl: string | null } | null = null;
 
   // Coalesce token deltas: one record per tick rather than one per token.
   let pendingText = "";
@@ -103,59 +114,84 @@ export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Pro
     pendingText = "";
   };
 
-  proc.on("message", (msg: ClaudeStreamMessage) => {
-    if (textDeltaOf(msg as never) !== null) return; // handled by text_delta below
-    if (isSystemInit(msg) || isAssistant(msg) || isUser(msg) || isResult(msg) || (msg.type === "system" && (msg as { subtype?: string }).subtype === "api_retry")) {
+  /** Everything the monitor watches on a child; re-applied when one replaces it. */
+  const wire = (p: OrchestratorProcess): void => {
+    p.on("message", (msg: ClaudeStreamMessage) => {
+      if (textDeltaOf(msg as never) !== null) return; // handled by text_delta below
+      if (isSystemInit(msg) || isAssistant(msg) || isUser(msg) || isResult(msg) || (msg.type === "system" && (msg as { subtype?: string }).subtype === "api_retry")) {
+        flushText();
+        writeEvent(msg as OrchestratorEvent);
+      }
+    });
+    p.on("text_delta", (delta) => {
+      pendingText += delta;
+      state.lastActivity = nowIso();
+      dirty = true;
+    });
+    p.on("init", (init) => {
+      state.sessionId = init.session_id;
+      state.model = init.model ?? state.model;
+      state.claudeVersion = init.claude_code_version ?? state.claudeVersion;
+      state.capabilities = init.capabilities ?? [];
+      state.mcpServers = init.mcp_servers ?? [];
+      session.sessionId = init.session_id;
+      session.pid = process.pid;
+      session.model = state.model;
+      session.claudeVersion = state.claudeVersion;
+      void saveSession(args.piFleetDir, session);
+      writeState();
+    });
+    p.on("commands", (commands) => {
+      state.commands = commands;
+      dirty = true;
+    });
+    p.on("permission_request", (request) => {
       flushText();
-      writeEvent(msg as OrchestratorEvent);
-    }
-  });
-  proc.on("text_delta", (delta) => {
-    pendingText += delta;
-    state.lastActivity = nowIso();
-    dirty = true;
-  });
-  proc.on("init", (init) => {
-    state.sessionId = init.session_id;
-    state.model = init.model ?? state.model;
-    state.claudeVersion = init.claude_code_version ?? state.claudeVersion;
-    state.capabilities = init.capabilities ?? [];
-    state.mcpServers = init.mcp_servers ?? [];
-    session.sessionId = init.session_id;
-    session.pid = process.pid;
-    session.model = state.model;
-    session.claudeVersion = state.claudeVersion;
-    void saveSession(args.piFleetDir, session);
-    writeState();
-  });
-  proc.on("commands", (commands) => {
-    state.commands = commands;
-    dirty = true;
-  });
-  proc.on("permission_request", (request) => {
-    flushText();
-    state.pendingRequests.push({ requestId: request.requestId, request: request.request, receivedAt: request.receivedAt });
-    writeEvent({ type: "permission_request", requestId: request.requestId, request: request.request });
-    writeState();
-  });
-  proc.on("result", () => {
-    flushText();
-    state.costUsd = proc.costUsd;
-    state.numTurns = proc.numTurns;
-    state.turnActive = false;
-    state.activity = null;
-    writeState();
-  });
-  proc.on("stderr", (text) => {
-    const trimmed = text.trim();
-    if (trimmed) writeEvent({ type: "notice", text: trimmed, error: true });
-  });
+      state.pendingRequests.push({ requestId: request.requestId, request: request.request, receivedAt: request.receivedAt });
+      writeEvent({ type: "permission_request", requestId: request.requestId, request: request.request });
+      writeState();
+    });
+    p.on("result", () => {
+      flushText();
+      state.costUsd = proc.costUsd;
+      state.numTurns = proc.numTurns;
+      state.turnActive = false;
+      state.activity = null;
+      writeState();
+    });
+    p.on("stderr", (text) => {
+      const trimmed = text.trim();
+      if (trimmed) writeEvent({ type: "notice", text: trimmed, error: true });
+    });
+  };
+  wire(proc);
 
   let finished = false;
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-    proc.on("exit", (info) => {
-      finished = true;
+    const onExit = (info: { code: number | null; signal: NodeJS.Signals | null }): void => {
       flushText();
+      if (restartWith) {
+        // a flag change, not the end of the session: the same conversation is
+        // resumed in a new child and the console sees no exit at all
+        const { remoteControl } = restartWith;
+        restartWith = null;
+        state.remoteControl = remoteControl;
+        proc = newProcess(remoteControl);
+        wire(proc);
+        proc.on("exit", onExit);
+        proc.start();
+        state.turnActive = false;
+        state.activity = null;
+        writeEvent({
+          type: "notice",
+          text: remoteControl === null
+            ? "· Remote Control is off; the session was resumed without it"
+            : `· Remote Control is on${remoteControl ? ` as "${remoteControl}"` : ""}; the session was resumed under it`,
+        });
+        writeState();
+        return;
+      }
+      finished = true;
       state.exited = { code: info.code, signal: info.signal, at: nowIso() };
       state.turnActive = false;
       state.activity = null;
@@ -163,7 +199,8 @@ export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Pro
       writeEvent({ type: "exit", code: info.code, signal: info.signal });
       writeState();
       resolve(info);
-    });
+    };
+    proc.on("exit", onExit);
   });
 
   proc.start();
@@ -244,8 +281,21 @@ export async function runOrchestratorMonitor(args: OrchestratorMonitorArgs): Pro
         writeState();
         return;
       }
+      case "remote_control": {
+        const name = control.name ?? null;
+        if ((state.remoteControl ?? null) === name) {
+          writeEvent({ type: "notice", text: "· Remote Control is already on" });
+          return;
+        }
+        writeEvent({ type: "notice", text: "· reconnecting claude with Remote Control…" });
+        restartWith = { remoteControl: name };
+        // the exit handler brings the session straight back up
+        await proc.stop();
+        return;
+      }
       case "stop":
         writeEvent({ type: "notice", text: "· shutting down" });
+        restartWith = null;
         await proc.stop();
         return;
     }

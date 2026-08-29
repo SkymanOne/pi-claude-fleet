@@ -231,7 +231,7 @@ test("a restarted orchestrator keeps the conversation; --fresh is what clears it
   }
 }, { timeout: 90_000 });
 
-test("/rc restarts the session with Remote Control, keeping the conversation", async () => {
+test("/rc gives claude the flag without ending the orchestrator", async () => {
   const f = fixture({ FAKE_CLAUDE_SESSION_ID: "sess-remote01" });
   const c = client(f);
   try {
@@ -243,11 +243,10 @@ test("/rc restarts the session with Remote Control, keeping the conversation", a
     await waitFor(() => (said.some((r) => r.type === "result") ? true : undefined), { timeoutMs: 20_000 });
     const firstArgv: string[] = JSON.parse(fs.readFileSync(path.join(f.cwd, "argv.json"), "utf8"));
     assert.equal(firstArgv.includes("--remote-control"), false, "off until asked for");
-    const firstPid = loadOrchestratorState(f.piFleetDir)!.pid!;
+    const monitorPid = loadOrchestratorState(f.piFleetDir)!.pid!;
 
     await c.enableRemoteControl("my-fleet");
-    await waitFor(() => (c.running() && loadOrchestratorState(f.piFleetDir)!.pid !== firstPid ? true : undefined), { timeoutMs: 20_000 });
-    // the new claude writes its argv when it starts, a moment after the monitor
+    // the new claude writes its argv when it starts
     const argv: string[] = await waitFor(
       () => {
         try {
@@ -257,13 +256,24 @@ test("/rc restarts the session with Remote Control, keeping the conversation", a
           return undefined;
         }
       },
-      { timeoutMs: 15_000 },
+      { timeoutMs: 20_000 },
     );
     assert.equal(argv[argv.indexOf("--remote-control") + 1], "my-fleet");
     assert.equal(argv[argv.indexOf("--resume") + 1], "sess-remote01", "the same conversation, resumed");
     await waitFor(() => (loadOrchestratorState(f.piFleetDir)?.remoteControl === "my-fleet" ? true : undefined), { timeoutMs: 10_000 });
 
-    // the transcript survived the restart, and the session still works
+    // only claude was replaced: the orchestrator itself never went away
+    const state = loadOrchestratorState(f.piFleetDir)!;
+    assert.equal(state.pid, monitorPid, "the same orchestrator, not a new one");
+    assert.equal(state.exited, null, "and it never exited");
+    assert.equal(c.running(), true);
+    assert.equal(
+      said.some((r) => r.type === "exit"),
+      false,
+      "so no console is told the session ended",
+    );
+
+    // the transcript survived, and the session still works
     const events = fs.readFileSync(path.join(f.piFleetDir, "orchestrator", "events.jsonl"), "utf8");
     assert.match(events, /before remote control/);
     const after: Record<string, unknown>[] = [];

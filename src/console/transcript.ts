@@ -35,6 +35,50 @@ function push(t: Transcript, kind: LineKind, text: string): void {
   t.lines.push({ kind, text });
 }
 
+/** Matches the orchestrator pane: a command in full, output as a counted preview. */
+const TOOL_ARGS = { maxLines: 10, maxChars: 1200 };
+const TOOL_RESULT = { maxLines: 4, maxChars: 600 };
+
+/** The arguments as written, not a one-line digest of them. */
+function toolArgs(args: unknown): string {
+  if (!args || typeof args !== "object") return "";
+  const a = args as Record<string, unknown>;
+  const primary = a.command ?? a.path ?? a.file_path ?? a.pattern ?? a.url ?? a.name ?? a.target;
+  return typeof primary === "string" ? primary.trim() : JSON.stringify(a);
+}
+
+/** Text over as many lines as it takes, up to a bound; the rest is counted. */
+function pushBlock(
+  t: Transcript,
+  kind: LineKind,
+  prefix: string,
+  text: string,
+  { maxLines, maxChars }: { maxLines: number; maxChars: number },
+): void {
+  const lines = text.split("\n");
+  const shown: string[] = [];
+  let budget = maxChars;
+  let cutMidLine = false;
+  for (const line of lines) {
+    if (shown.length >= maxLines || budget <= 0) break;
+    if (line.length > budget) {
+      shown.push(line.slice(0, budget));
+      cutMidLine = true;
+      budget = 0;
+      break;
+    }
+    shown.push(line);
+    budget -= line.length;
+  }
+  const indent = " ".repeat(Math.min(prefix.length, 6));
+  shown.forEach((line, i) => push(t, kind, i === 0 ? `${prefix}${line}`.trimEnd() : `${indent}${line}`.trimEnd()));
+  if (shown.length === 0) push(t, kind, prefix.trimEnd());
+  const restLines = lines.length - shown.length;
+  const restChars = text.length - shown.reduce((n, l) => n + l.length + 1, -1);
+  if (restLines > 0) push(t, kind, `${indent}… ${restLines} more ${restLines === 1 ? "line" : "lines"}`);
+  else if (cutMidLine && restChars > 0) push(t, kind, `${indent}… ${restChars} more characters`);
+}
+
 /** Fold one events.jsonl entry (fleet or RPC event) into the transcript. */
 export function applyEvent(t: Transcript, ev: any): void {
   switch (ev?.type) {
@@ -91,11 +135,12 @@ export function applyEvent(t: Transcript, ev: any): void {
       return;
     }
     case "tool_execution_start":
-      push(t, "tool", `⚙ ${ev.toolName ?? "tool"} ${summarizeArgs(ev.args)}`.trimEnd());
+      // the command is the thing worth reading, so it is not cut
+      pushBlock(t, "tool", `⚙ ${ev.toolName ?? "tool"} `, toolArgs(ev.args), TOOL_ARGS);
       return;
     case "tool_execution_end": {
-      const head = firstLine(resultTextOf(ev)) || (ev.isError ? "(error)" : "(no output)");
-      push(t, "tool_result", `  ↳ ${clip(head, 120)}`);
+      const body = resultTextOf(ev).trim() || (ev.isError ? "(error)" : "(no output)");
+      pushBlock(t, "tool_result", "  ↳ ", body, TOOL_RESULT);
       return;
     }
     case "agent_settled":

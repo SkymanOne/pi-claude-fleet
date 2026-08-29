@@ -138,21 +138,12 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
   }
 
   /**
-   * Remote Control is a launch flag, so turning it on means giving the session a
-   * new claude process: the monitor stops, and a new one resumes the same
-   * session with the flag set. The transcript is kept.
+   * Remote Control is a launch flag, so the monitor gives the session a new
+   * claude child with it set. The monitor stays up and the conversation is
+   * resumed, so nothing here restarts and no console sees an exit.
    */
   async enableRemoteControl(name: string): Promise<void> {
-    this.remoteControl = name;
-    await this.shutdown();
-    const state = loadOrchestratorState(this.piFleetDir);
-    const pid = state?.pid ?? null;
-    const deadline = Date.now() + 10_000;
-    while (pid && isAlive(pid) && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    this.announced.clear();
-    this.spawnMonitor(false);
+    await appendOrchestratorControl(this.piFleetDir, { type: "remote_control", name: name || "" });
   }
 
   async allow(requestId: string, updatedPermissions?: PermissionUpdate[]): Promise<void> {
@@ -191,7 +182,7 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
     const previous = loadOrchestratorState(this.piFleetDir);
     const mode = this.options.permissionMode ?? previous?.permissionMode ?? null;
     // undefined means "leave it off"; "" means on with an automatic name
-    const remote = this.remoteControl ?? this.options.remoteControl ?? previous?.remoteControl ?? null;
+    const remote = this.options.remoteControl ?? previous?.remoteControl ?? null;
     const logFd = fs.openSync(paths.monitorLog, "a");
     const args = [
       ...cliSpawnArgs(),
