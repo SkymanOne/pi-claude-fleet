@@ -23,6 +23,13 @@
  *      next tool result. Whether the model acts on it is up to the model: haiku once folded it
  *      in, once ignored it as a possible prompt injection. => the orchestrator prompt states
  *      that <fleet-event> messages arriving mid-turn are legitimate and must be acted on.
+ *   F7 permission modes (checked 2026-08-29, claude 2.1.251): --help advertises
+ *      acceptEdits, auto, bypassPermissions, manual, dontAsk, plan. "default" is NOT in that
+ *      list but the flag still takes it (a hidden alias for "manual"; "bogus" is rejected, so
+ *      the choice really is validated). Over the control protocol, set_permission_mode returns
+ *      success for every one of default/auto/acceptEdits/dontAsk/plan/manual, even though
+ *      sdk.d.ts types PermissionMode as only default|acceptEdits|bypassPermissions|plan.
+ *      => the modes the console offers work both at launch and mid-session; the SDK type lags.
  */
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
