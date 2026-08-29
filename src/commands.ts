@@ -27,6 +27,35 @@ import { gitRaw, isGitRepo, removeWorktree } from "./worktree.js";
 
 export type { SpawnOpts } from "./spawn.js";
 
+/**
+ * What a command core produces: the exit code, the lines the CLI prints on
+ * stdout (`out`) and stderr (`err`), and structured data for programmatic
+ * callers such as the MCP server. Cores never print; `printResult` does.
+ */
+export interface CommandResult<T = unknown> {
+  code: number;
+  out: string[];
+  err: string[];
+  data: T;
+}
+
+export function ok<T>(data: T, out: string[] = [], err: string[] = []): CommandResult<T> {
+  return { code: 0, out, err, data };
+}
+
+export function fail(code: number, ...err: string[]): CommandResult<null> {
+  return { code, out: [], err, data: null };
+}
+
+/** Print a core's lines the way the CLI always has, and hand back its exit code. */
+export function printResult(result: CommandResult<unknown>): number {
+  for (const line of result.out) console.log(line);
+  for (const line of result.err) console.error(line);
+  return result.code;
+}
+
+/** Who a control message comes from: the orchestrating agent or a human at the console. */
+export type ControlSource = "orchestrator" | "console";
 
 /**
  * How to re-invoke this CLI as a detached background process.
@@ -55,21 +84,45 @@ export async function launchMonitor(args: { piFleetDir: string; runId: string })
   fs.closeSync(logFd);
 }
 
-export async function cmdSpawn(args: { name: string; brief: string; opts: SpawnOpts }): Promise<number> {
+export interface SpawnData {
+  runId: string;
+  runDir: string;
+  piFleetDir: string;
+  worktree: string | null;
+  branch: string | null;
+}
+
+export async function spawnCore(args: { name: string; brief: string; opts: SpawnOpts }): Promise<CommandResult<SpawnData>> {
   if (!args.brief.trim()) throw new Error('spawn: task brief required after "--"');
   const created = await createRun({ name: sanitizeName(args.name), opts: args.opts, brief: args.brief });
+  const err: string[] = [];
   if (!created.state.isGit && args.opts.worktree !== false) {
-    console.error("warning: target is not a git repo — running in place without a worktree");
+    err.push("warning: target is not a git repo — running in place without a worktree");
   }
   await launchMonitor({ piFleetDir: created.piFleetDir, runId: created.runId });
-  console.log(`Spawned ${created.runId}`);
-  console.log(`  state:    ${created.runDir}/state.json`);
-  console.log(`  logs:     ${created.runDir}/{events.jsonl,rpc.log,monitor.log}`);
-  console.log(`  fleet dir: ${created.piFleetDir}`);
-  if (created.worktreePath) console.log(`  worktree: ${created.worktreePath}`);
-  if (created.state.branch) console.log(`  branch:   ${created.state.branch}`);
-  return 0;
+  const out = [
+    `Spawned ${created.runId}`,
+    `  state:    ${created.runDir}/state.json`,
+    `  logs:     ${created.runDir}/{events.jsonl,rpc.log,monitor.log}`,
+    `  fleet dir: ${created.piFleetDir}`,
+  ];
+  if (created.worktreePath) out.push(`  worktree: ${created.worktreePath}`);
+  if (created.state.branch) out.push(`  branch:   ${created.state.branch}`);
+  return ok(
+    {
+      runId: created.runId,
+      runDir: created.runDir,
+      piFleetDir: created.piFleetDir,
+      worktree: created.worktreePath,
+      branch: created.state.branch,
+    },
+    out,
+    err,
+  );
 }
+
+export const cmdSpawn = async (args: { name: string; brief: string; opts: SpawnOpts }): Promise<number> =>
+  printResult(await spawnCore(args));
 
 const WAIT_POLL_MS = 2000;
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -93,12 +146,17 @@ export interface StatusArgs {
   all?: boolean;
 }
 
-export async function cmdStatus(args: StatusArgs): Promise<number> {
+export interface StatusData {
+  /** Runs with their derived status; one element when `name` was given. */
+  runs: RunState[];
+}
+
+export async function statusCore(args: StatusArgs): Promise<CommandResult<StatusData>> {
   const { piFleetDir } = await resolveFleetDir(args.cwd);
   if (args.name) {
     const { state } = findRun(piFleetDir, args.name);
-    console.log(JSON.stringify(withDerivedStatus(state), null, 2));
-    return 0;
+    const derived = withDerivedStatus(state);
+    return ok({ runs: [derived] }, [JSON.stringify(derived, null, 2)]);
   }
   const runs = listRuns(piFleetDir)
     .flatMap(({ runDir }) => {
@@ -109,31 +167,27 @@ export async function cmdStatus(args: StatusArgs): Promise<number> {
       }
     })
     .filter((s) => args.all || s.status !== "archived");
-  if (args.json) {
-    console.log(JSON.stringify(runs.map(withDerivedStatus), null, 2));
-    return 0;
-  }
-  if (runs.length === 0) {
-    console.log("(no runs)");
-    return 0;
-  }
+  const derived = runs.map(withDerivedStatus);
+  if (args.json) return ok({ runs: derived }, [JSON.stringify(derived, null, 2)]);
+  if (runs.length === 0) return ok({ runs: derived }, ["(no runs)"]);
   const table = new Table({
     head: ["NAME", "STATE", "LAST-ACTIVITY", "LAST-TOOL", "STEERED", "AGE"],
     style: { head: [], border: [] },
   });
-  for (const s of runs) {
+  for (const s of derived) {
     table.push([
       s.name,
-      deriveStatus(s),
+      s.status,
       s.lastActivity ?? "-",
       s.lastTool ?? "-",
       String(s.steerCount),
       formatAge(Math.max(0, Date.now() - Date.parse(s.createdAt))),
     ]);
   }
-  console.log(table.toString());
-  return 0;
+  return ok({ runs: derived }, [table.toString()]);
 }
+
+export const cmdStatus = async (args: StatusArgs): Promise<number> => printResult(await statusCore(args));
 
 export interface WaitArgs {
   name: string;
@@ -141,8 +195,14 @@ export interface WaitArgs {
   timeout?: string;
 }
 
+export interface WaitData {
+  name: string;
+  /** Derived status at the end, or null when the wait timed out. */
+  status: string | null;
+}
+
 /** Exit 0 settled/archived · 3 timeout · 4 stopped/error/dead. */
-export async function cmdWait(args: WaitArgs): Promise<number> {
+export async function waitCore(args: WaitArgs): Promise<CommandResult<WaitData>> {
   const { run } = await resolveRun(args.name, args.cwd);
   const timeoutSec = Number(args.timeout) > 0 ? Number(args.timeout) : 600;
   const deadline = Date.now() + timeoutSec * 1000;
@@ -156,18 +216,24 @@ export async function cmdWait(args: WaitArgs): Promise<number> {
     if (state) {
       const derived = deriveStatus(state);
       if (isTerminal(derived)) {
-        console.log(`${state.name} ${derived}`);
-        return derived === "settled" || derived === "archived" ? 0 : 4;
+        const code = derived === "settled" || derived === "archived" ? 0 : 4;
+        return { code, out: [`${state.name} ${derived}`], err: [], data: { name: state.name, status: derived } };
       }
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      console.error(`wait: timed out after ${timeoutSec}s waiting for ${run.state.name}`);
-      return 3;
+      return {
+        code: 3,
+        out: [],
+        err: [`wait: timed out after ${timeoutSec}s waiting for ${run.state.name}`],
+        data: { name: run.state.name, status: null },
+      };
     }
     await sleep(Math.min(WAIT_POLL_MS, remaining));
   }
 }
+
+export const cmdWait = async (args: WaitArgs): Promise<number> => printResult(await waitCore(args));
 
 export interface OutputArgs {
   name: string;
@@ -175,147 +241,212 @@ export interface OutputArgs {
   tail?: string;
 }
 
-export async function cmdOutput(args: OutputArgs): Promise<number> {
+export interface TextData {
+  text: string;
+}
+
+export async function outputCore(args: OutputArgs): Promise<CommandResult<TextData>> {
   const { run } = await resolveRun(args.name, args.cwd);
   if (args.tail !== undefined) {
     const n = Number(args.tail) > 0 ? Number(args.tail) : 10;
     const events = await readJsonlTail<any>(path.join(run.runDir, "events.jsonl"), 5000);
     const ends = events.filter((e) => e.type === "tool_execution_end").slice(-n);
-    if (ends.length === 0) console.log("(no tool activity yet)");
-    for (const ev of ends) console.log(`${ev.toolName ?? "tool"}: ${firstLine(resultTextOf(ev))}`);
-    return 0;
+    const out = ends.length === 0
+      ? ["(no tool activity yet)"]
+      : ends.map((ev) => `${ev.toolName ?? "tool"}: ${firstLine(resultTextOf(ev))}`);
+    return ok({ text: out.join("\n") }, out);
   }
-  console.log(run.state.lastAssistantText ?? "(no output yet)");
-  return 0;
+  const text = run.state.lastAssistantText ?? "(no output yet)";
+  return ok({ text }, [text]);
 }
 
-export async function cmdLogs(args: OutputArgs): Promise<number> {
+export const cmdOutput = async (args: OutputArgs): Promise<number> => printResult(await outputCore(args));
+
+export async function logsCore(args: OutputArgs): Promise<CommandResult<TextData>> {
   const { run } = await resolveRun(args.name, args.cwd);
   const n = Number(args.tail) > 0 ? Number(args.tail) : 50;
   const text = await tailText(path.join(run.runDir, "rpc.log"), n);
-  if (text.trim()) process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
-  else console.log("(no rpc.log yet)");
-  return 0;
+  if (!text.trim()) return ok({ text: "" }, ["(no rpc.log yet)"]);
+  const body = text.endsWith("\n") ? text.slice(0, -1) : text;
+  return ok({ text: body }, [body]);
 }
+
+export const cmdLogs = async (args: OutputArgs): Promise<number> => printResult(await logsCore(args));
 
 export interface ControlArgs {
   name: string;
   cwd?: string;
   message?: string;
+  source?: ControlSource;
 }
 
-async function controlCommand(type: ControlType, args: ControlArgs): Promise<number> {
+export interface ControlData {
+  name: string;
+  type: ControlType;
+}
+
+async function controlCore(type: ControlType, args: ControlArgs): Promise<CommandResult<ControlData | null>> {
   const { run } = await resolveRun(args.name, args.cwd);
   const derived = deriveStatus(run.state);
   if (isTerminal(derived)) {
     const what = type === "abort" ? "nothing to stop" : "steering refused";
-    console.error(
+    return fail(
+      1,
       `${type}: run ${run.state.name} is ${derived} — ${what}.\n` +
         `Answer its open questions in a new brief and resume with:\n  ${resumeHint(run.state, run.runDir)}`,
     );
-    return 1;
   }
-  await appendControl(run.runDir, { type, message: args.message ?? null, source: "orchestrator" });
-  console.log(type === "abort" ? `abort requested for ${run.state.name}` : `${type} queued for ${run.state.name}`);
-  return 0;
+  await appendControl(run.runDir, { type, message: args.message ?? null, source: args.source ?? "orchestrator" });
+  const line = type === "abort" ? `abort requested for ${run.state.name}` : `${type} queued for ${run.state.name}`;
+  return ok({ name: run.state.name, type }, [line]);
 }
 
-export async function cmdSend(args: ControlArgs): Promise<number> {
+export async function sendCore(args: ControlArgs): Promise<CommandResult<ControlData | null>> {
   if (!args.message?.trim()) throw new Error('send: message required after "--"');
-  return controlCommand("steer", args);
+  return controlCore("steer", args);
 }
 
-export async function cmdFollowup(args: ControlArgs): Promise<number> {
+export async function followupCore(args: ControlArgs): Promise<CommandResult<ControlData | null>> {
   if (!args.message?.trim()) throw new Error('followup: message required after "--"');
-  return controlCommand("follow_up", args);
+  return controlCore("follow_up", args);
 }
 
-export async function cmdStop(args: { name: string; cwd?: string }): Promise<number> {
-  return controlCommand("abort", { name: args.name, cwd: args.cwd });
+export async function stopCore(args: { name: string; cwd?: string; source?: ControlSource }): Promise<CommandResult<ControlData | null>> {
+  return controlCore("abort", { name: args.name, cwd: args.cwd, source: args.source });
+}
+
+export const cmdSend = async (args: ControlArgs): Promise<number> => printResult(await sendCore(args));
+export const cmdFollowup = async (args: ControlArgs): Promise<number> => printResult(await followupCore(args));
+export const cmdStop = async (args: { name: string; cwd?: string }): Promise<number> => printResult(await stopCore(args));
+
+export interface ReportData {
+  kind: "report" | "fallback";
+  text: string;
+  appendix: string;
 }
 
 /** Exit 0 with the report (or fallback text) + steering appendix; exit 2 when there is nothing. */
-export async function cmdReport(args: { name: string; cwd?: string }): Promise<number> {
+export async function reportCore(args: { name: string; cwd?: string }): Promise<CommandResult<ReportData | null>> {
   const { piFleetDir, run } = await resolveRun(args.name, args.cwd);
   const result = readReport(piFleetDir, run.state);
   if (result.kind === "missing") {
-    console.error(`report: no report file and no captured output for ${run.state.name}`);
-    return 2;
+    return fail(2, `report: no report file and no captured output for ${run.state.name}`);
   }
-  console.log(result.text);
   const appendix = buildSteeringAppendix(run.state);
-  if (appendix) console.log(appendix);
-  return 0;
+  const out = [result.text];
+  if (appendix) out.push(appendix);
+  return ok({ kind: result.kind, text: result.text, appendix }, out);
 }
 
-export async function cmdDiff(args: { name: string; cwd?: string; nameOnly?: boolean }): Promise<number> {
+export const cmdReport = async (args: { name: string; cwd?: string }): Promise<number> => printResult(await reportCore(args));
+
+export interface DiffData {
+  applicable: boolean;
+  text: string;
+  /** Uncommitted paths in the worktree (invisible to diff/merge). */
+  dirty: string[];
+}
+
+export async function diffCore(args: { name: string; cwd?: string; nameOnly?: boolean }): Promise<CommandResult<DiffData | null>> {
   const { run } = await resolveRun(args.name, args.cwd);
   if (!run.state.worktree || !fs.existsSync(run.state.worktree)) {
-    console.log("not applicable (run has no isolated worktree)");
-    return 0;
+    const text = "not applicable (run has no isolated worktree)";
+    return ok({ applicable: false, text, dirty: [] }, [text]);
   }
   const base = run.state.baseCommit ?? run.state.base ?? "HEAD";
   const r = await gitRaw(["diff", args.nameOnly ? "--name-only" : "--stat", `${base}...HEAD`], run.state.worktree);
-  if (r.code !== 0) {
-    console.error(`diff: ${r.stderr.trim()}`);
-    return 1;
-  }
-  process.stdout.write(r.stdout.trim() ? (r.stdout.endsWith("\n") ? r.stdout : `${r.stdout}\n`) : "(no changes)\n");
-  await warnIfDirty(run.state.worktree, "diff", "merge will not include them");
-  return 0;
+  if (r.code !== 0) return fail(1, `diff: ${r.stderr.trim()}`);
+  const text = r.stdout.trim() ? r.stdout.replace(/\n$/, "") : "(no changes)";
+  const dirty = await dirtyFiles(run.state.worktree);
+  const err = dirty.length > 0 ? [dirtyWarning(dirty, "diff", "merge will not include them")] : [];
+  return ok({ applicable: true, text, dirty }, [text], err);
 }
+
+export const cmdDiff = async (args: { name: string; cwd?: string; nameOnly?: boolean }): Promise<number> =>
+  printResult(await diffCore(args));
 
 /** Uncommitted worker output is invisible to diff/merge and lost by `cleanup --force`. */
-async function warnIfDirty(worktree: string, command: string, consequence: string): Promise<boolean> {
+async function dirtyFiles(worktree: string): Promise<string[]> {
   const status = await gitRaw(["status", "--porcelain"], worktree);
-  const files = status.stdout.split("\n").filter((l) => l.trim().length > 0);
-  if (status.code !== 0 || files.length === 0) return false;
-  console.error(`${command}: warning — worktree has ${files.length} uncommitted change(s) (worker did not commit); ${consequence}:\n${files.map((f) => `  ${f}`).join("\n")}`);
-  return true;
+  if (status.code !== 0) return [];
+  return status.stdout.split("\n").filter((l) => l.trim().length > 0);
 }
 
-const MERGE_CONFLICT_EXIT = 5;
+function dirtyWarning(files: string[], command: string, consequence: string): string {
+  return (
+    `${command}: warning — worktree has ${files.length} uncommitted change(s) (worker did not commit); ${consequence}:\n` +
+    files.map((f) => `  ${f}`).join("\n")
+  );
+}
+
+export const MERGE_CONFLICT_EXIT = 5;
+
+export interface MergeData {
+  branch: string;
+  into: string;
+  committed: boolean;
+  conflicts: string[];
+}
 
 /** Merge the worker branch into the checkout we're running from. Exit 5 on conflicts. */
-export async function cmdMerge(args: { name: string; cwd?: string; noCommit?: boolean }): Promise<number> {
+export async function mergeCore(args: { name: string; cwd?: string; noCommit?: boolean }): Promise<CommandResult<MergeData | null>> {
   const { run } = await resolveRun(args.name, args.cwd);
   const derived = deriveStatus(run.state);
   if (derived !== "settled") {
-    console.error(`merge: run ${run.state.name} is ${derived} — only settled runs can be merged.`);
-    return 1;
+    return fail(1, `merge: run ${run.state.name} is ${derived} — only settled runs can be merged.`);
   }
   if (!run.state.branch) {
-    console.error(`merge: run ${run.state.name} has no branch (spawned without a worktree) — nothing to merge.`);
-    return 1;
+    return fail(1, `merge: run ${run.state.name} has no branch (spawned without a worktree) — nothing to merge.`);
   }
   // The orchestrating checkout is the repo the run was spawned from, wherever we're invoked.
   const cwd = run.state.repoRoot;
   if (!cwd || !(await isGitRepo(cwd))) {
-    console.error(`merge: run ${run.state.name} has no git checkout to merge into (repoRoot: ${cwd ?? "none"}).`);
-    return 1;
+    return fail(1, `merge: run ${run.state.name} has no git checkout to merge into (repoRoot: ${cwd ?? "none"}).`);
   }
-  if (run.state.worktree) await warnIfDirty(run.state.worktree, "merge", "they are not part of the branch");
+  const err: string[] = [];
+  if (run.state.worktree) {
+    const dirty = await dirtyFiles(run.state.worktree);
+    if (dirty.length > 0) err.push(dirtyWarning(dirty, "merge", "they are not part of the branch"));
+  }
   const mergeArgs = ["merge", ...(args.noCommit ? ["--no-commit", "--no-ff"] : []), run.state.branch];
   const r = await gitRaw(mergeArgs, cwd);
   if (r.code !== 0) {
     const conflicts = await gitRaw(["diff", "--name-only", "--diff-filter=U"], cwd);
     const files = conflicts.stdout.trim();
     if (files) {
-      console.error(`merge: conflicts in:\n${files}\nResolve them, then \`git add\` and \`git commit\` (or \`git merge --abort\`).`);
-      return MERGE_CONFLICT_EXIT;
+      err.push(`merge: conflicts in:\n${files}\nResolve them, then \`git add\` and \`git commit\` (or \`git merge --abort\`).`);
+      return {
+        code: MERGE_CONFLICT_EXIT,
+        out: [],
+        err,
+        data: { branch: run.state.branch, into: cwd, committed: false, conflicts: files.split("\n") },
+      };
     }
-    console.error(`merge: git merge failed:\n${r.stderr.trim()}`);
-    return 1;
+    err.push(`merge: git merge failed:\n${r.stderr.trim()}`);
+    return { code: 1, out: [], err, data: null };
   }
-  console.log(`merged ${run.state.branch} into ${cwd}${args.noCommit ? " (staged, not committed)" : ""}`);
-  console.log("Run your integration checks before cleanup.");
-  return 0;
+  return ok(
+    { branch: run.state.branch, into: cwd, committed: !args.noCommit, conflicts: [] },
+    [
+      `merged ${run.state.branch} into ${cwd}${args.noCommit ? " (staged, not committed)" : ""}`,
+      "Run your integration checks before cleanup.",
+    ],
+    err,
+  );
 }
+
+export const cmdMerge = async (args: { name: string; cwd?: string; noCommit?: boolean }): Promise<number> =>
+  printResult(await mergeCore(args));
 
 const CLEANUP_ABORT_WAIT_MS = 10_000;
 
+export interface CleanupData {
+  archived: string[];
+  refused: string[];
+}
+
 /** Remove worktree + branch and mark the run archived; reports/events are kept. */
-export async function cmdCleanup(args: { target: string; cwd?: string; force?: boolean }): Promise<number> {
+export async function cleanupCore(args: { target: string; cwd?: string; force?: boolean }): Promise<CommandResult<CleanupData>> {
   const { piFleetDir } = await resolveFleetDir(args.cwd);
   if (!args.target) throw new Error("cleanup: <name|all> required");
   const all = args.target === "all";
@@ -329,16 +460,20 @@ export async function cmdCleanup(args: { target: string; cwd?: string; force?: b
       })
     : [findRun(piFleetDir, args.target)];
 
+  const out: string[] = [];
+  const err: string[] = [];
+  const data: CleanupData = { archived: [], refused: [] };
   let refused = false;
   for (const t of targets) {
     if (t.state.status === "archived") {
-      if (!all) console.log(`${t.runId} is already archived`);
+      if (!all) out.push(`${t.runId} is already archived`);
       continue;
     }
     let derived = deriveStatus(t.state);
     if (!isTerminal(derived)) {
       if (!args.force) {
-        console.error(`cleanup: ${all ? "skipping" : "refusing"} ${t.state.name} (${derived}) — use --force to abort and clean.`);
+        err.push(`cleanup: ${all ? "skipping" : "refusing"} ${t.state.name} (${derived}) — use --force to abort and clean.`);
+        data.refused.push(t.runId);
         if (!all) refused = true;
         continue;
       }
@@ -355,7 +490,7 @@ export async function cmdCleanup(args: { target: string; cwd?: string; force?: b
         // terminal AND monitor gone: its final flush can no longer race our archive write
         if (isTerminal(derived) && !isAlive(t.state.pid)) break;
       }
-      if (!isTerminal(derived)) console.error(`cleanup: ${t.state.name} did not stop within ${CLEANUP_ABORT_WAIT_MS / 1000}s — archiving anyway`);
+      if (!isTerminal(derived)) err.push(`cleanup: ${t.state.name} did not stop within ${CLEANUP_ABORT_WAIT_MS / 1000}s — archiving anyway`);
     }
     if (t.state.worktree && t.state.repoRoot) {
       const r = await removeWorktree({
@@ -365,20 +500,25 @@ export async function cmdCleanup(args: { target: string; cwd?: string; force?: b
         force: Boolean(args.force),
       });
       if (!r.worktreeRemoved && fs.existsSync(t.state.worktree)) {
-        console.error(
+        err.push(
           `cleanup: ${all ? "skipping" : "refusing"} ${t.state.name} — worktree ${t.state.worktree} could not be removed ` +
             "(uncommitted changes?) — inspect or commit them, or use --force to discard.",
         );
+        data.refused.push(t.runId);
         if (!all) refused = true;
         continue;
       }
       if (t.state.branch && !r.branchDeleted) {
-        console.error(`cleanup: kept unmerged branch ${t.state.branch} (use --force to delete it)`);
+        err.push(`cleanup: kept unmerged branch ${t.state.branch} (use --force to delete it)`);
       }
     }
     t.state.status = "archived";
     await saveState(t.runDir, t.state);
-    console.log(`archived ${t.runId}`);
+    out.push(`archived ${t.runId}`);
+    data.archived.push(t.runId);
   }
-  return refused ? 1 : 0;
+  return { code: refused ? 1 : 0, out, err, data };
 }
+
+export const cmdCleanup = async (args: { target: string; cwd?: string; force?: boolean }): Promise<number> =>
+  printResult(await cleanupCore(args));
