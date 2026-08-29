@@ -115,3 +115,17 @@ test("applyEvent renders worker questions, progress, answers, and dropped contro
   assert.equal(t.lines[0].kind, "question");
   assert.equal(t.lines[3].kind, "steer");
 });
+
+test("a worker that died shows why, on every line of the reason", () => {
+  const t = createTranscript();
+  applyEvent(t, {
+    type: "run_failed",
+    error: 'pi exited with code 1 before settling\nError: Model "glm-5.3-max" not found.',
+  });
+  const lines = t.lines.map((l) => l.text);
+  assert.deepEqual(lines, [
+    "✖ pi exited with code 1 before settling",
+    '  Error: Model "glm-5.3-max" not found.',
+  ]);
+  assert.equal(t.lines[0].kind, "error");
+});

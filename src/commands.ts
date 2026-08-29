@@ -26,6 +26,7 @@ import {
 } from "./state.js";
 import { readJsonlTail, tailText, firstLine, formatAge, resultTextOf } from "./util.js";
 import { readReport, buildSteeringAppendix } from "./report.js";
+import { checkModel } from "./models.js";
 import { gitRaw, isGitRepo, removeWorktree } from "./worktree.js";
 
 export type { SpawnOpts } from "./spawn.js";
@@ -95,8 +96,11 @@ export interface SpawnData {
   branch: string | null;
 }
 
-export async function spawnCore(args: { name: string; brief: string; opts: SpawnOpts }): Promise<CommandResult<SpawnData>> {
+export async function spawnCore(args: { name: string; brief: string; opts: SpawnOpts }): Promise<CommandResult<SpawnData | null>> {
   if (!args.brief.trim()) throw new Error('spawn: task brief required after "--"');
+  // before a worktree and a branch exist, so a wrong name costs a second
+  const badModel = await checkModel(args.opts.model);
+  if (badModel) return fail(2, `spawn: ${badModel}`);
   const created = await createRun({ name: sanitizeName(args.name), opts: args.opts, brief: args.brief });
   const err: string[] = [];
   if (!created.state.isGit && args.opts.worktree !== false) {

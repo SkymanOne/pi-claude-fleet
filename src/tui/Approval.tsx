@@ -21,6 +21,9 @@ export interface ApprovalProps {
   queued?: number;
 }
 
+/** Sentinel for the "write your own" row; a label could never collide with it. */
+const CUSTOM = "\u0000custom";
+
 const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
 export function summarizeInput(input: Record<string, unknown>): string {
@@ -40,6 +43,7 @@ export function Approval({ request, onAllow, onDeny, onAnswer, queued = 0 }: App
   const [answers, setAnswers] = useState<AskUserQuestionAnswers>({});
   const [index, setIndex] = useState(0);
   const [denying, setDenying] = useState(false);
+  const [custom, setCustom] = useState(false);
   const [reason, setReason] = useState("");
 
   useInput(
@@ -60,38 +64,42 @@ export function Approval({ request, onAllow, onDeny, onAnswer, queued = 0 }: App
 
   if (isQuestion && questions.length > 0) {
     const current = questions[Math.min(index, questions.length - 1)];
-    const items = (current.options ?? []).map((o, i) => ({ key: String(i), label: o.label, value: o.label }));
+    const answer = (value: string): void => {
+      const next = { ...answers, [current.question]: value };
+      setAnswers(next);
+      setReason("");
+      setCustom(false);
+      if (index + 1 < questions.length) setIndex(index + 1);
+      else onAnswer(next);
+    };
+    // an option list is a suggestion, not a menu: there is always a way to say
+    // something the model did not think of
+    const items = [
+      ...(current.options ?? []).map((o, i) => ({ key: String(i), label: o.label, value: o.label })),
+      { key: "__own__", label: "✎ something else…", value: CUSTOM },
+    ];
+    const typing = custom || items.length === 1;
     return (
       <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
         {header}
         <Text>{current.question}</Text>
-        {items.length > 0 ? (
+        {typing ? (
+          <Box>
+            <Text color="cyan">{"answer > "}</Text>
+            <TextInput value={reason} onChange={setReason} onSubmit={(value) => answer(value.trim())} />
+          </Box>
+        ) : (
           <SelectInput
             items={items}
             onSelect={(item) => {
-              const next = { ...answers, [current.question]: String(item.value) };
-              setAnswers(next);
-              if (index + 1 < questions.length) setIndex(index + 1);
-              else onAnswer(next);
+              if (String(item.value) === CUSTOM) setCustom(true);
+              else answer(String(item.value));
             }}
           />
-        ) : (
-          <Box>
-            <Text color="cyan">{"answer > "}</Text>
-            <TextInput
-              value={reason}
-              onChange={setReason}
-              onSubmit={(value) => {
-                const next = { ...answers, [current.question]: value };
-                setAnswers(next);
-                setReason("");
-                if (index + 1 < questions.length) setIndex(index + 1);
-                else onAnswer(next);
-              }}
-            />
-          </Box>
         )}
-        <Text dimColor>{`question ${Math.min(index + 1, questions.length)}/${questions.length} · ↑/↓ + enter`}</Text>
+        <Text dimColor>
+          {`question ${Math.min(index + 1, questions.length)}/${questions.length} · ${typing ? "type your answer and press enter" : "↑/↓ + enter, or pick “something else” to write your own"}`}
+        </Text>
       </Box>
     );
   }

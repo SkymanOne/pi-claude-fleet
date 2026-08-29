@@ -439,6 +439,9 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
           ? `failed to start pi: ${spawnError.message}`
           : `pi exited with code ${code ?? "unknown"} before settling`;
         state.error = state.error ?? (tail ? `${reason}\n${tail}` : reason);
+        // the rail can only show a clipped label, so the whole reason belongs in
+        // the transcript where it can be read
+        writeEvent({ type: "run_failed", error: state.error });
       }
       if (!state.settledAt) state.settledAt = nowIso();
       state.pendingQuestion = null;

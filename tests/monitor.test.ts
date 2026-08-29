@@ -129,6 +129,11 @@ test("pi child exits without settling → error state with exit code", async () 
   assert.match(state.error, /exited with code 1/);
   assert.match(state.error, /model provider unreachable/, "stderr tail captured");
   assert.ok(state.settledAt);
+  // the rail can only show a clipped label, so the reason is in the transcript too
+  const events = fs.readFileSync(path.join(state.fleetDir, "runs", state.id, "events.jsonl"), "utf8");
+  const failure = events.split("\n").filter((l) => l.includes('"run_failed"')).map((l) => JSON.parse(l))[0];
+  assert.ok(failure, "the failure is an event, not only a state field");
+  assert.match(String(failure.error), /model provider unreachable/);
 }, { timeout: 60_000 });
 
 test("missing pi binary → error state naming the spawn failure", async () => {

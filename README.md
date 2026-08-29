@@ -125,7 +125,7 @@ The TUI is one client; the same fleet is driveable from scripts.
 
 | Command | What it does |
 |---|---|
-| `spawn <name> [opts] -- "<brief>"` | start a worker (`--cwd`, `--model`, `--provider`, `--thinking`, `--no-worktree`, `--base`, `--skill`, `--append-system-prompt`, `--session`, `--tools`, `--exclude-tools`) |
+| `spawn <name> [opts] -- "<brief>"` | start a worker (`--cwd`, `--model`, `--provider`, `--thinking`, `--no-worktree`, `--base`, `--skill`, `--append-system-prompt`, `--session`, `--tools`, `--exclude-tools`). A `--model` pi does not have is refused before a worktree exists, naming the closest models it does have |
 | `status [<name>] [--json] [--all]` | fleet table, or one run's full state |
 | `wait <name> [--timeout s]` | block until the run reaches a terminal state |
 | `output <name> [--tail n]` | last assistant text, or the last n tool results |

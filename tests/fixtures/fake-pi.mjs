@@ -11,6 +11,14 @@ import fsSync from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 
+// the real pi lists its models this way, and spawn checks a model before using it
+if (process.argv.includes("--list-models")) {
+  const models = (process.env.FAKE_PI_MODELS ?? "glm-5.3,glm-5.3-flash,claude-sonnet-5").split(",");
+  process.stdout.write("provider           model                context\n");
+  for (const m of models) process.stdout.write(`fake               ${m}                1M\n`);
+  process.exit(0);
+}
+
 if (process.env.FAKE_PI_ARGV_FILE) {
   fsSync.writeFileSync(process.env.FAKE_PI_ARGV_FILE, JSON.stringify(process.argv.slice(2)));
 }

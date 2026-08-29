@@ -24,6 +24,9 @@ export interface OrchestratorClientEvents {
 /** How much of an old transcript is carried into a restarted session. */
 export const MAX_RESTORED_LINES = 2000;
 
+/** Cap on what is held for a console that has not attached yet. */
+const MAX_BUFFERED_RECORDS = 5000;
+
 export interface OrchestratorClientOptions {
   piFleetDir: string;
   cwd: string;
@@ -44,12 +47,27 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
   private timer: NodeJS.Timeout | null = null;
   private readonly announced = new Set<string>();
   private lastStateJson = "";
+  /** Records read before anything listened; a console attaches after start(). */
+  private buffered: Record<string, unknown>[] = [];
+  /** The catch-up read of an existing transcript is history, not news. */
+  private caughtUp = false;
   /** Set by enableRemoteControl, for the monitor this client starts next. */
   private remoteControl: string | null = null;
 
   constructor(private readonly options: OrchestratorClientOptions) {
     super();
     this.piFleetDir = options.piFleetDir;
+    // The console renders after start(), so the restored transcript would be
+    // emitted to nobody. Hold it until something is listening.
+    this.on("newListener", (name) => {
+      if (name !== "record" || this.listenerCount("record") > 0) return;
+      const pending = this.buffered;
+      this.buffered = [];
+      // the listener being added is not registered until this returns
+      queueMicrotask(() => {
+        for (const event of pending) this.emit("record", event);
+      });
+    });
   }
 
   /** True when a monitor is alive and owns a claude child. */
@@ -197,9 +215,20 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
     const { events, offset } = readNewEvents(paths.events, this.offset);
     this.offset = offset;
     for (const event of events) {
-      this.emit("record", event as Record<string, unknown>);
-      if (event?.type === "exit") this.emit("exit", { code: event.code ?? null, signal: event.signal ?? null });
+      const record = event as Record<string, unknown>;
+      if (this.listenerCount("record") === 0) {
+        this.buffered.push(record);
+        if (this.buffered.length > MAX_BUFFERED_RECORDS) this.buffered.shift();
+      } else {
+        this.emit("record", record);
+      }
+      // an exit in a restored transcript belongs to the session that ended, and
+      // announcing it would close a console over a conversation that is running
+      if (event?.type === "exit" && this.caughtUp) {
+        this.emit("exit", { code: event.code ?? null, signal: event.signal ?? null });
+      }
     }
+    this.caughtUp = true;
     const state = loadOrchestratorState(this.piFleetDir);
     if (!state) return;
     const json = JSON.stringify(state);
@@ -211,6 +240,9 @@ export class OrchestratorClient extends EventEmitter<OrchestratorClientEvents> {
     // a request the monitor is still holding, that this console has not shown yet
     for (const pending of state.pendingRequests) {
       if (this.announced.has(pending.requestId)) continue;
+      // with no console attached it stays unannounced, so the one that attaches
+      // next is still asked
+      if (this.listenerCount("permission_request") === 0) continue;
       this.announced.add(pending.requestId);
       this.emit("permission_request", pending);
     }

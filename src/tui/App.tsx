@@ -29,6 +29,8 @@ import {
   applySuggestion,
   listRepoFiles,
   resolveCommand,
+  commandForms,
+  COMMANDS,
   SHORTCUTS,
   type CompletionState,
 } from "./completions.js";
@@ -69,6 +71,34 @@ type Dispatchable = ClaudeStreamMessage | LocalEvent;
 const TERMINAL_VIEWS: string[] = [...TERMINAL_STATES];
 /** What claude's own /effort accepts. */
 const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+/** The closest command to what was typed, when it is close enough to suggest. */
+export function suggestCommand(typed: string, available: string[]): string | null {
+  const all = [...available, ...COMMANDS.flatMap((c) => commandForms(c))];
+  const target = typed.toLowerCase();
+  let best: { name: string; distance: number } | null = null;
+  for (const name of all) {
+    const distance = editDistance(target, name.toLowerCase());
+    if (!best || distance < best.distance) best = { name, distance };
+  }
+  // only worth offering when it is a near miss, not a different word
+  return best && best.distance <= Math.max(2, Math.floor(target.length / 3)) ? best.name : null;
+}
+
+function editDistance(a: string, b: string): number {
+  const rows = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array<number>(b.length).fill(0)]);
+  for (let j = 0; j <= b.length; j++) rows[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      rows[i][j] = Math.min(
+        rows[i - 1][j] + 1,
+        rows[i][j - 1] + 1,
+        rows[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+  }
+  return rows[a.length][b.length];
+}
+
 /** How long a toolbar note stays up. */
 const FLASH_MS = 6_000;
 
@@ -400,7 +430,7 @@ export function App({
       if (spec.cycles) {
         cycleThinking();
       } else if (spec.takesArgument) {
-        if (target?.kind !== "worker") {
+        if (spec.workerOnly && target?.kind !== "worker") {
           notice(`! ${spec.name} needs a worker selected (tab switches)`, true);
         } else {
           desired = `${spec.name} `;
@@ -413,7 +443,11 @@ export function App({
       setInput(desired);
       setTimeout(() => {
         swallowNextChange.current = false;
-        setInput((current) => (current === desired ? current : desired));
+        // undo only the single character the input may have typed for us; a
+        // later keystroke of the user's own must survive
+        setInput((current) =>
+          current.length === desired.length + 1 && current.startsWith(desired) ? desired : current,
+        );
       }, 0);
       return;
     }
@@ -545,6 +579,17 @@ export function App({
           busy.current = false;
         });
       return;
+    }
+    if (text.startsWith("/")) {
+      // neither ours nor one claude offers: almost certainly a typo, and sending
+      // it would put it in the conversation as a question about a command
+      const word = text.split(/\s+/)[0];
+      const known = orchestratorCommands.some((c) => `/${c.name}` === word);
+      if (!known) {
+        const near = suggestCommand(word, orchestratorCommands.map((c) => `/${c.name}`));
+        notice(`! unknown command ${word}${near ? ` — did you mean ${near}?` : ""}`, true);
+        return;
+      }
     }
     dispatch({ type: "sent", text });
     void client.send(text).catch(() => notice("! orchestrator is not running", true));

@@ -4,7 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRun } from "../src/spawn.js";
-import { statusCore, reportCore, diffCore, printResult, ok, fail } from "../src/commands.js";
+import { statusCore, reportCore, diffCore, spawnCore, printResult, ok, fail } from "../src/commands.js";
+import { checkModel, resetModelCache } from "../src/models.js";
+import { FAKE_PI } from "./helpers.js";
 
 function mkTmp(): string {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-core-")));
@@ -83,4 +85,37 @@ test("printResult writes out to stdout, err to stderr, and returns the code", ()
   }
   assert.deepEqual(logs, ["a", "b"]);
   assert.deepEqual(errs, ["w", "boom"]);
+});
+
+test("spawn refuses a model pi does not have, before it makes a run", async () => {
+  const dir = mkTmp();
+  const savedBin = process.env.PI_FLEET_PI_BIN;
+  process.env.PI_FLEET_PI_BIN = `${process.execPath} ${FAKE_PI}`;
+  const restore = (): void => {
+    if (savedBin === undefined) delete process.env.PI_FLEET_PI_BIN;
+    else process.env.PI_FLEET_PI_BIN = savedBin;
+  };
+  resetModelCache();
+  try {
+    const { result, writes } = await withOutputSpy(() =>
+      spawnCore({ name: "escrow", brief: "do the thing", opts: { cwd: dir, model: "glm-5.3-max", worktree: false } }),
+    );
+    assert.equal(writes, 0);
+    assert.equal(result.code, 2);
+    const err = result.err.join("\n");
+    assert.match(err, /unknown model "glm-5.3-max"/);
+    assert.match(err, /did you mean [^\n]*glm-5\.3/, "and it says what is actually there");
+    const runs = path.join(dir, ".pi-fleet", "runs");
+    assert.equal(fs.existsSync(runs) ? fs.readdirSync(runs).length : 0, 0, "nothing was created");
+
+    // one it does have passes the check
+    assert.equal(await checkModel("glm-5.3"), null);
+    // and a fleet whose pi cannot be asked is never blocked by this
+    resetModelCache();
+    process.env.PI_FLEET_PI_BIN = "node /nonexistent-pi.mjs";
+    assert.equal(await checkModel("anything-at-all"), null);
+  } finally {
+    resetModelCache();
+    restore();
+  }
 });

@@ -24,6 +24,7 @@ const UP = `${ESC}[A`;
 const CTRL_A = String.fromCharCode(1);
 const CTRL_G = String.fromCharCode(7);
 const CTRL_T = String.fromCharCode(20);
+const CTRL_O = String.fromCharCode(15);
 const squash = (s: string): string => s.replace(/\s+/g, " ");
 
 interface Harness {
@@ -182,9 +183,9 @@ async function type(app: Rendered, text: string): Promise<void> {
 
 async function teardown(
   h: Harness,
-  app: { unmount: () => void },
+  app: { unmount: () => void } | null,
 ): Promise<void> {
-  app.unmount();
+  app?.unmount();
   h.watcher.stop();
   h.client.stop();
   // the orchestrator outlives a console now, so the test has to stop it itself
@@ -253,27 +254,36 @@ test(
   { timeout: 60_000 },
 );
 
-test(
-  "an AskUserQuestion is answered with the picker",
-  async () => {
-    const h = setup();
-    const app = renderApp(h);
-    try {
-      await frameMatching(app.lastFrame, /orchestrator > /);
-      await type(app, "ask:Which hash?|bcrypt|argon2");
-      const overlay = await frameMatching(app.lastFrame, /question 1\/1/);
-      assert.match(overlay, /Which hash\?/);
-      assert.match(overlay, /bcrypt/);
-      await press(app, DOWN);
-      await frameMatching(app.lastFrame, /argon2/);
-      await press(app, "\r");
-      await frameMatching(app.lastFrame, /answers:\{"Which hash\?":"argon2"\}/);
-    } finally {
-      await teardown(h, app);
-    }
-  },
-  { timeout: 60_000 },
-);
+test("an AskUserQuestion is answered from the list, or in your own words", async () => {
+  const h = setup();
+  const app = renderApp(h);
+  try {
+    await frameMatching(app.lastFrame, /orchestrator > /);
+    await type(app, "ask:Which hash?|bcrypt|argon2");
+    const overlay = await frameMatching(app.lastFrame, /question 1\/1/);
+    assert.match(overlay, /Which hash\?/);
+    assert.match(overlay, /something else/, "there is always a way to answer in your own words");
+    await press(app, DOWN);
+    await frameMatching(app.lastFrame, /❯ argon2/);
+    await press(app, "\r");
+    await frameMatching(app.lastFrame, /answers:\{"Which hash\?":"argon2"\}/);
+
+    // and the same question answered with something the model did not offer
+    await type(app, "ask:Which hash?|bcrypt|argon2");
+    await frameMatching(app.lastFrame, /question 1\/1/);
+    await press(app, DOWN);
+    await press(app, DOWN);
+    await frameMatching(app.lastFrame, /❯ ✎ something else/);
+    await press(app, "\r");
+    await frameMatching(app.lastFrame, /answer > /);
+    await press(app, "scrypt, actually");
+    await frameMatching(app.lastFrame, /answer > scrypt, actually/);
+    await press(app, "\r");
+    await frameMatching(app.lastFrame, /answers:\{"Which hash\?":"scrypt, actually"\}/);
+  } finally {
+    await teardown(h, app);
+  }
+}, { timeout: 60_000 });
 
 test(
   "a worker question reaches the rail and the orchestrator; the human can answer it",
@@ -716,5 +726,71 @@ test("ctrl+t steps the level of the open session, as a toolbar note rather than 
     await frameMatching(app.lastFrame, /· thinking high/);
   } finally {
     await teardown(h, app);
+  }
+}, { timeout: 60_000 });
+
+test("ctrl+o prefills /permissions on the orchestrator, and a typo is caught rather than sent", async () => {
+  const h = setup();
+  const app = renderApp(h);
+  try {
+    await frameMatching(app.lastFrame, /orchestrator > /);
+    // /permissions is not a worker command: its shortcut must work here
+    await press(app, CTRL_O);
+    const prefilled = await frameMatching(app.lastFrame, /orchestrator > \/permissions/);
+    assert.equal(prefilled.includes("needs a worker selected"), false);
+    // submit it to clear the composer; with no argument it reports the mode
+    await press(app, "\r");
+    await frameMatching(app.lastFrame, /permissions: default/);
+
+    // a mistyped command is reported, not sent to the model as a question
+    await type(app, "/pemissions auto");
+    await frameMatching(app.lastFrame, /unknown command \/pemissions — did you mean \/permissions\?/);
+    assert.equal(h.stdinLog().includes("/pemissions"), false, "nothing was sent");
+
+    // one claude does offer still goes through
+    await waitFor(() => (h.client.state?.commands?.length ? true : undefined), { timeoutMs: 15_000 });
+    await type(app, "/model sonnet");
+    await waitFor(() => (h.stdinLog().includes("/model sonnet") ? true : undefined), { timeoutMs: 15_000 });
+  } finally {
+    await teardown(h, app);
+  }
+}, { timeout: 60_000 });
+
+test("reopening the console shows the conversation that is already there", async () => {
+  const h = setup();
+  const first = renderApp(h);
+  try {
+    await frameMatching(first.lastFrame, /orchestrator > /);
+    await type(first, "remember this line");
+    await frameMatching(first.lastFrame, /remember this line/);
+    await frameMatching(first.lastFrame, /echo: remember this line/);
+  } finally {
+    first.unmount();
+    h.client.stop();
+  }
+
+  // a second console over the same orchestrator, wired the way the real one is:
+  // the client starts and replays before anything renders
+  const client = new OrchestratorClient({ piFleetDir: h.piFleetDir, cwd: h.cwd, pollMs: 30 });
+  const { attached } = client.start();
+  assert.equal(attached, true, "it attaches rather than starting a second orchestrator");
+  const second = render(
+    React.createElement(App, {
+      client,
+      watcher: h.watcher,
+      onQuit: () => {},
+      railPollMs: 30,
+      reapMs: 0,
+      cwd: h.cwd,
+    }),
+  );
+  try {
+    const frame = await frameMatching(second.lastFrame, /echo: remember this line/);
+    assert.match(frame, /remember this line/, "the prompt is there too");
+    assert.equal(frame.includes("orchestrator exited"), false, "and it is not read as an exit");
+  } finally {
+    second.unmount();
+    client.stop();
+    await teardown(h, null);
   }
 }, { timeout: 60_000 });

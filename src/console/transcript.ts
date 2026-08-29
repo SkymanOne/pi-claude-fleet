@@ -1,6 +1,6 @@
 import { firstLine, parseLineSafe, readNewLines, resultTextOf } from "../util.js";
 
-export type LineKind = "steer" | "text" | "tool" | "tool_result" | "system" | "question";
+export type LineKind = "steer" | "text" | "tool" | "tool_result" | "system" | "question" | "error";
 
 export interface TranscriptLine {
   kind: LineKind;
@@ -101,6 +101,11 @@ export function applyEvent(t: Transcript, ev: any): void {
     case "agent_settled":
       push(t, "system", "● settled");
       return;
+    case "run_failed": {
+      const lines = String(ev.error ?? "the worker stopped").split("\n").filter((l) => l.length > 0);
+      for (const [i, line] of lines.entries()) push(t, "error", i === 0 ? `✖ ${line}` : `  ${line}`);
+      return;
+    }
     case "extension_error":
       push(t, "system", `! extension error: ${clip(String(ev.error ?? ""), 120)}`);
       return;

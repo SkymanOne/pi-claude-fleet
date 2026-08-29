@@ -33,6 +33,8 @@ function colorFor(kind: LineKind): { color?: string; dimColor?: boolean } {
       return { dimColor: true };
     case "system":
       return { color: "magenta" };
+    case "error":
+      return { color: "red" };
     default:
       return {};
   }
