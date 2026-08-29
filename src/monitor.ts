@@ -31,6 +31,7 @@ const SELECTED = new Set([
   "compaction_end",
 ]);
 const TEXT_TYPES = new Set(["text_start", "text_delta", "text_end"]);
+const THINKING_TYPES = new Set(["thinking_start", "thinking_delta", "thinking_end"]);
 
 const FLUSH_INTERVAL_MS = 300;
 const PROMPT_DELAY_MS = 150;
@@ -224,12 +225,22 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
     }
     if (ev.type === "message_update") {
       const a = ev.assistantMessageEvent;
+      if (a && THINKING_TYPES.has(a.type)) {
+        // the console shows "thinking…" for as long as this lasts
+        if (state.activity !== "thinking") {
+          state.activity = "thinking";
+          state.lastActivity = nowIso();
+          dirty = true;
+        }
+        return;
+      }
       if (!a || !TEXT_TYPES.has(a.type)) return;
       writeEvent({
         type: "message_update",
         ev: { type: a.type, contentIndex: a.contentIndex, delta: a.delta, content: a.content },
       });
       if (a.type === "text_delta") {
+        state.activity = "text";
         state.lastActivity = nowIso();
         dirty = true;
       }
@@ -239,6 +250,7 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
     writeEvent(ev);
     if (ev.type === "tool_execution_start" || ev.type === "tool_execution_end") {
       recordToolActivity(state, ev.toolName ?? state.lastTool);
+      state.activity = "tool";
       dirty = true;
     }
     if (ev.type === "agent_settled" && !settledHandled) {
@@ -249,6 +261,7 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
       state.status = pendingAbort ? "stopped" : "settled";
       state.settledAt = nowIso();
       state.pendingQuestion = null;
+      state.activity = null;
       void flushNow();
       send({ id: "fleet-last", type: "get_last_assistant_text" });
       lastTextTimer = setTimeout(beginShutdown, LAST_TEXT_TIMEOUT_MS);

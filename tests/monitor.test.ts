@@ -35,6 +35,27 @@ test("the monitor records the commands the worker offers, and forwards one as a 
   await runCli(["wait", "w", "--cwd", root, "--timeout", "15"]);
 }, { timeout: 60_000 });
 
+test("the monitor records what the worker is doing, including thinking", async () => {
+  const root = initRepo("pf-activity-");
+  assert.equal(
+    (await runCli(["spawn", "w", "--cwd", root, "--no-worktree", "--", "t"], { env: fakePiEnv({ FAKE_PI_THINK_MS: "1500", FAKE_PI_DELAY_MS: "1500" }) })).code,
+    0,
+  );
+  const runId = firstRunId(root);
+  // sample what the console would show while the worker works
+  const seen = new Set<string>();
+  const deadline = Date.now() + 25_000;
+  while (Date.now() < deadline) {
+    const state = readState(root, runId);
+    seen.add(`${state.status}:${state.activity}`);
+    if (TERMINAL.includes(state.status)) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(seen.has("running:thinking"), `expected a thinking phase, saw ${[...seen].join(", ")}`);
+  assert.ok([...seen].some((s) => s === "running:tool" || s === "running:text"), "and then work");
+  assert.equal(readState(root, runId).activity, null, "a finished worker is doing nothing");
+}, { timeout: 60_000 });
+
 test("the monitor reports and changes the worker's thinking level", async () => {
   const root = initRepo("pf-think-");
   assert.equal((await runCli(["spawn", "w", "--cwd", root, "--no-worktree", "--", "t"], { env: fakePiEnv({ FAKE_PI_DELAY_MS: "20000", FAKE_PI_THINKING: "low" }) })).code, 0);

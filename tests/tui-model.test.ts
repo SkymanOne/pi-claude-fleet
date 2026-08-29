@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { initialViewState, reduceOrchestrator, buildRail, summarizeFleetEvents, WORKER_GLYPHS } from "../src/tui/model.js";
+import { initialViewState, reduceOrchestrator, buildRail, summarizeFleetEvents, activityLine, workerActivity, WORKER_GLYPHS } from "../src/tui/model.js";
 import { makeFleetEvent } from "../src/fleet/events.js";
 import { newRunState, type RunState } from "../src/state.js";
 import { helpText, GLOBAL_KEYS, COMPOSER_KEYS } from "../src/tui/keys.js";
@@ -207,4 +207,41 @@ test("blocks are separated by blank lines, and thinking is kept short and marked
   assert.equal(kinds[userAt - 1], "gap", "a prompt starts a new block");
   assert.equal(kinds[kinds.indexOf("thinking") - 1], "gap");
   assert.equal(kinds[kinds.lastIndexOf("text") - 1], "gap");
+});
+
+test("the orchestrator's activity says what it is doing and for how long", () => {
+  assert.equal(activityLine(null, Date.now()), null);
+  const since = 1_000_000;
+  assert.equal(activityLine({ kind: "thinking", since }, since + 8_000), "✻ thinking… 8s");
+  assert.equal(activityLine({ kind: "responding", since }, since + 500), "✎ replying… 1s");
+  assert.equal(activityLine({ kind: "tool", label: "Bash", since }, since + 95_000), "⚙ Bash… 1m35s");
+
+  // it follows the stream: sending starts it, thinking and text move it, the result ends it
+  const s = initialViewState();
+  reduceOrchestrator(s, { type: "sent", text: "go" });
+  assert.equal(s.activity?.kind, "thinking", "a sent message is waiting on the model");
+  reduceOrchestrator(s, { type: "stream_event", event: { type: "content_block_delta", delta: { type: "thinking_delta" } }, parent_tool_use_id: null });
+  assert.equal(s.activity?.kind, "thinking");
+  const thinkingSince = s.activity!.since;
+  reduceOrchestrator(s, { type: "stream_event", event: { type: "content_block_delta", delta: { type: "thinking_delta" } }, parent_tool_use_id: null });
+  assert.equal(s.activity!.since, thinkingSince, "the clock does not restart on every delta");
+  reduceOrchestrator(s, { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "hi" } }, parent_tool_use_id: null });
+  assert.equal(s.activity?.kind, "responding");
+  reduceOrchestrator(s, {
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
+    parent_tool_use_id: null,
+  });
+  assert.deepEqual([s.activity?.kind, s.activity?.label], ["tool", "Bash"]);
+  reduceOrchestrator(s, { type: "result", subtype: "success", session_id: "x" });
+  assert.equal(s.activity, null, "the turn ended");
+});
+
+test("a worker's rail line says whether it is thinking, replying or in a tool", () => {
+  const base = newRunState({ fleetDir: "/f", runId: "r-1", name: "r", cwd: "/w" });
+  assert.equal(workerActivity({ ...base, activity: "thinking" }, "running"), "✻ thinking…");
+  assert.equal(workerActivity({ ...base, activity: "text" }, "running"), "✎ replying…");
+  assert.equal(workerActivity({ ...base, activity: "tool", lastTool: "bash" }, "running"), "⚙ bash");
+  assert.equal(workerActivity({ ...base, activity: null }, "running"), "working…");
+  assert.equal(workerActivity({ ...base, activity: "thinking" }, "blocked"), "needs an answer", "blocked wins");
 });

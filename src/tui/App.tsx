@@ -23,6 +23,7 @@ import { Approval } from "./Approval.js";
 import { Confirm } from "./Confirm.js";
 import { helpText, HINT } from "./keys.js";
 import { transcriptRows, CHROME_BASE } from "./layout.js";
+import { formatAge } from "../util.js";
 import {
   completionsFor,
   applySuggestion,
@@ -38,9 +39,11 @@ import {
 } from "./workerActions.js";
 import { reapMergedRuns } from "../fleet/reap.js";
 import {
+  activityLine,
   buildRail,
   initialViewState,
   reduceOrchestrator,
+  workerActivity,
   type LocalEvent,
   type OrchestratorViewState,
   type RailRun,
@@ -508,6 +511,14 @@ export function App({
 
   // wide enough for the longest name, but never more than a third of the screen
   const longestName = Math.max(12, ...items.map((i) => i.name.length));
+  // a live "thinking…" line above the composer, for whichever session is selected
+  const activity =
+    target?.kind === "worker"
+      ? currentRun && deriveStatus(currentRun.state) === "running"
+        ? `${workerActivity(currentRun.state, deriveView(currentRun.state))} ${formatAge(Math.max(0, now - Date.parse(currentRun.state.lastActivity ?? currentRun.state.createdAt)))}`
+        : null
+      : activityLine(view.activity, now);
+
   const railWidth = Math.min(
     Math.max(longestName + 4, 18),
     Math.max(18, Math.floor(size.columns * 0.34)),
@@ -519,6 +530,7 @@ export function App({
   const paneRows = transcriptRows(size.rows, {
     base: CHROME_BASE,
     flash: flash ? 1 : 0,
+    activity: activity ? 1 : 0,
     suggestions: suggestionRows,
     overlay: overlayRows,
   });
@@ -621,7 +633,8 @@ export function App({
           />
         ) : (
           <>
-            {flash ? (
+            {activity ? <Text color="magenta">{activity}</Text> : null}
+          {flash ? (
               <Text
                 color={flash.error ? "red" : undefined}
                 dimColor={!flash.error}

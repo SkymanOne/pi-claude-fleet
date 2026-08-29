@@ -28,6 +28,8 @@ export interface SteeringEntry {
   message: string;
 }
 
+export type WorkerActivityKind = "thinking" | "text" | "tool";
+
 /** One entry from pi's `get_commands`: an extension command, prompt template or skill. */
 export interface WorkerCommand {
   name: string;
@@ -84,6 +86,8 @@ export interface RunState {
   commands?: WorkerCommand[];
   /** The reasoning level pi is running at, as it reports it. */
   thinkingLevel?: string | null;
+  /** What the worker is doing right now: reasoning, writing, or in a tool. */
+  activity?: WorkerActivityKind | null;
   /** Last `fleet_progress` message. */
   lastProgress?: string | null;
 }
@@ -152,6 +156,7 @@ export function newRunState(input: {
     activeProvider: null,
     commands: [],
     thinkingLevel: null,
+    activity: null,
   };
 }
 

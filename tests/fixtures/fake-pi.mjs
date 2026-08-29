@@ -106,6 +106,14 @@ async function askQuestion() {
 async function runTask() {
   send({ type: "agent_start" });
   send({ type: "turn_start" });
+  // FAKE_PI_THINK_MS: reason for a while first, like a model with thinking on
+  const thinkMs = Number(process.env.FAKE_PI_THINK_MS || 0);
+  if (thinkMs > 0) {
+    send({ type: "message_update", assistantMessageEvent: { type: "thinking_start", contentIndex: 0 } });
+    send({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "hmm" } });
+    await sleep(thinkMs);
+    send({ type: "message_update", assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "hmm" } });
+  }
   send({ type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } });
   send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Working: " } });
   if (process.env.FAKE_PI_PROGRESS === "1" && fleetDir && runId) {

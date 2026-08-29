@@ -43,6 +43,8 @@ export interface Chrome {
   /** Rows taken by the composer, its hint, and the status line. */
   base: number;
   flash: number;
+  /** The "thinking…" line above the composer. */
+  activity: number;
   suggestions: number;
   overlay: number;
 }
@@ -51,6 +53,7 @@ export const CHROME_BASE = 3;
 
 /** Rows left for the transcript once the chrome is accounted for. */
 export function transcriptRows(terminalRows: number, chrome: Partial<Chrome> = {}): number {
-  const used = (chrome.base ?? CHROME_BASE) + (chrome.flash ?? 0) + (chrome.suggestions ?? 0) + (chrome.overlay ?? 0);
+  const used =
+    (chrome.base ?? CHROME_BASE) + (chrome.flash ?? 0) + (chrome.activity ?? 0) + (chrome.suggestions ?? 0) + (chrome.overlay ?? 0);
   return Math.max(MIN_TRANSCRIPT_ROWS, terminalRows - used - 1);
 }

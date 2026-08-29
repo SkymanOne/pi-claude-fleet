@@ -538,45 +538,72 @@ test(
   { timeout: 60_000 },
 );
 
-test("/shutdown asks, then stops every worker and leaves", async () => {
-  const h = setup();
-  const { runDir } = await addRun(h.piFleetDir, "busy");
-  const app = renderApp(h);
-  try {
-    await frameMatching(app.lastFrame, /. busy/);
-    await type(app, "/shutdown");
-    const asked = await frameMatching(app.lastFrame, /Stop the orchestrator and 1 running worker/);
-    assert.match(asked, /Worktrees and branches are kept/);
-    assert.equal(h.quit.called, 0);
-    await press(app, "n");
-    await frameMatching(app.lastFrame, /shutdown cancelled/);
-    assert.equal(fs.existsSync(path.join(runDir, "control.jsonl")), false, "cancelling touches nothing");
+test(
+  "/shutdown asks, then stops every worker and leaves",
+  async () => {
+    const h = setup();
+    const { runDir } = await addRun(h.piFleetDir, "busy");
+    const app = renderApp(h);
+    try {
+      await frameMatching(app.lastFrame, /. busy/);
+      await type(app, "/shutdown");
+      const asked = await frameMatching(
+        app.lastFrame,
+        /Stop the orchestrator and 1 running worker/,
+      );
+      assert.match(asked, /Worktrees and branches are kept/);
+      assert.equal(h.quit.called, 0);
+      await press(app, "n");
+      await frameMatching(app.lastFrame, /shutdown cancelled/);
+      assert.equal(
+        fs.existsSync(path.join(runDir, "control.jsonl")),
+        false,
+        "cancelling touches nothing",
+      );
 
-    await type(app, "/sd");
-    await frameMatching(app.lastFrame, /Stop the orchestrator/);
-    await press(app, "y");
-    await waitFor(() => (h.quit.called > 0 ? true : undefined), { timeoutMs: 10_000 });
-    const control = fs.readFileSync(path.join(runDir, "control.jsonl"), "utf8");
-    assert.match(control, /"type":"abort"/);
-  } finally {
-    await teardown(h, app);
-  }
-}, { timeout: 60_000 });
+      await type(app, "/sd");
+      await frameMatching(app.lastFrame, /Stop the orchestrator/);
+      await press(app, "y");
+      await waitFor(() => (h.quit.called > 0 ? true : undefined), {
+        timeoutMs: 10_000,
+      });
+      const control = fs.readFileSync(
+        path.join(runDir, "control.jsonl"),
+        "utf8",
+      );
+      assert.match(control, /"type":"abort"/);
+    } finally {
+      await teardown(h, app);
+    }
+  },
+  { timeout: 60_000 },
+);
 
-test("/thinking sets the orchestrator's effort and shows it in the status line", async () => {
-  const h = setup();
-  const app = renderApp(h);
-  try {
-    await frameMatching(app.lastFrame, /orchestrator > /);
-    await type(app, "/thinking nonsense");
-    await frameMatching(app.lastFrame, /usage: \/thinking <low\|medium\|high\|xhigh\|max>/);
-    await type(app, "/thinking high");
-    // the console shows what you typed, and claude receives its own /effort
-    await frameMatching(app.lastFrame, /> \/thinking high/);
-    await frameMatching(app.lastFrame, /thinking high/);
-    const sent = await waitFor(() => (h.stdinLog().includes("/effort high") ? h.stdinLog() : undefined), { timeoutMs: 8000 });
-    assert.match(sent, /"content":"\/effort high"/);
-  } finally {
-    await teardown(h, app);
-  }
-}, { timeout: 60_000 });
+test(
+  "/thinking sets the orchestrator's effort and shows it in the status line",
+  async () => {
+    const h = setup();
+    const app = renderApp(h);
+    try {
+      await frameMatching(app.lastFrame, /orchestrator > /);
+      await type(app, "/thinking nonsense");
+      await frameMatching(
+        app.lastFrame,
+        /usage: \/thinking <low\|medium\|high\|xhigh\|max>/,
+      );
+      await type(app, "/thinking high");
+      // the console shows what you typed, and claude receives its own /effort
+      await frameMatching(app.lastFrame, /> \/thinking high/);
+      await frameMatching(app.lastFrame, /thinking high/);
+      const sent = await waitFor(
+        () =>
+          h.stdinLog().includes("/effort high") ? h.stdinLog() : undefined,
+        { timeoutMs: 8000 },
+      );
+      assert.match(sent, /"content":"\/effort high"/);
+    } finally {
+      await teardown(h, app);
+    }
+  },
+  { timeout: 60_000 },
+);

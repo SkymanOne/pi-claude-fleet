@@ -35,8 +35,18 @@ export interface OrchestratorLine {
   md?: MdLine["kind"];
 }
 
+export interface Activity {
+  kind: "thinking" | "responding" | "tool";
+  /** The tool being run, when that is what it is doing. */
+  label?: string;
+  /** Epoch millis this activity started, for the elapsed counter. */
+  since: number;
+}
+
 export interface OrchestratorViewState {
   lines: OrchestratorLine[];
+  /** What the orchestrator is doing right now, or null between turns. */
+  activity: Activity | null;
   /** Text the model is still streaming, not yet a committed line. */
   partial: string | null;
   turnActive: boolean;
@@ -55,6 +65,7 @@ export interface OrchestratorViewState {
 export function initialViewState(): OrchestratorViewState {
   return {
     lines: [],
+    activity: null,
     partial: null,
     turnActive: false,
     sessionId: null,
@@ -118,6 +129,14 @@ function pushMarkdown(state: OrchestratorViewState, text: string): void {
   trim(state);
 }
 
+/** What the model is doing when it emits a thinking block. */
+function thinkingKindOf(msg: { event?: { type?: string; delta?: { type?: string }; content_block?: { type?: string } } }): boolean {
+  const ev = msg.event;
+  if (!ev) return false;
+  if (ev.type === "content_block_delta" && ev.delta?.type === "thinking_delta") return true;
+  return ev.type === "content_block_start" && ev.content_block?.type === "thinking";
+}
+
 /** `settled add-auth · question db` — a fleet batch as one rail-friendly line. */
 export function summarizeFleetEvents(events: FleetEvent[]): string {
   return events.map((e) => `${e.kind} ${e.name}`).join(" · ");
@@ -132,6 +151,7 @@ export function reduceOrchestrator(state: OrchestratorViewState, msg: ClaudeStre
     switch (msg.type) {
       case "sent":
         state.pendingEchoes.push(msg.text);
+        state.activity = { kind: "thinking", since: Date.now() };
         gap(state);
         push(state, msg.kind ?? "user", `> ${msg.display ?? msg.text}`);
         state.turnActive = true;
@@ -150,6 +170,7 @@ export function reduceOrchestrator(state: OrchestratorViewState, msg: ClaudeStre
       case "exit":
         state.exited = true;
         state.turnActive = false;
+        state.activity = null;
         push(state, "error", `orchestrator exited (code ${msg.code ?? "?"}${msg.signal ? `, ${msg.signal}` : ""})`);
         return state;
     }
@@ -173,6 +194,13 @@ export function reduceOrchestrator(state: OrchestratorViewState, msg: ClaudeStre
     if (delta !== null) {
       state.partial = (state.partial ?? "") + delta;
       state.turnActive = true;
+      state.activity = state.activity?.kind === "responding" ? state.activity : { kind: "responding", since: Date.now() };
+      return state;
+    }
+    const kind = thinkingKindOf(msg);
+    if (kind) {
+      state.turnActive = true;
+      if (state.activity?.kind !== "thinking") state.activity = { kind: "thinking", since: Date.now() };
     }
     return state;
   }
@@ -183,10 +211,12 @@ export function reduceOrchestrator(state: OrchestratorViewState, msg: ClaudeStre
     pushThinking(state, thinkingOfAssistant(msg));
     const text = textOfAssistant(msg).trim();
     if (text) pushMarkdown(state, text);
-    for (const tool of toolUsesOf(msg)) {
+    const tools = toolUsesOf(msg);
+    for (const tool of tools) {
       state.toolNames[tool.id] = tool.name;
       push(state, "tool", `⚙ ${tool.name} ${summarizeArgs(tool.input)}`.trimEnd());
     }
+    if (tools.length > 0) state.activity = { kind: "tool", label: tools[tools.length - 1].name, since: Date.now() };
     return state;
   }
 
@@ -215,6 +245,7 @@ export function reduceOrchestrator(state: OrchestratorViewState, msg: ClaudeStre
   if (isResult(msg)) {
     state.turnActive = false;
     state.partial = null;
+    state.activity = null;
     if (typeof msg.total_cost_usd === "number") state.costUsd = msg.total_cost_usd;
     if (typeof msg.num_turns === "number") state.numTurns = msg.num_turns;
     if (msg.is_error) push(state, "error", `! turn failed (${msg.subtype})${msg.errors?.length ? `: ${msg.errors.join("; ")}` : ""}`);
@@ -274,6 +305,8 @@ export function workerActivity(state: RunState, view: DerivedView): string {
     case "blocked":
       return "needs an answer";
     case "running":
+      if (state.activity === "thinking") return "✻ thinking…";
+      if (state.activity === "text") return "✎ replying…";
       return state.lastTool ? `⚙ ${state.lastTool}` : "working…";
     case "starting":
       return "starting…";
@@ -321,4 +354,19 @@ export function buildRail(args: {
     });
   }
   return items;
+}
+
+/** `✻ thinking… 8s` — what the orchestrator is doing, and for how long. */
+export function activityLine(activity: Activity | null, now: number): string | null {
+  if (!activity) return null;
+  const seconds = Math.max(0, Math.round((now - activity.since) / 1000));
+  const elapsed = seconds >= 60 ? `${Math.floor(seconds / 60)}m${seconds % 60}s` : `${seconds}s`;
+  switch (activity.kind) {
+    case "thinking":
+      return `✻ thinking… ${elapsed}`;
+    case "responding":
+      return `✎ replying… ${elapsed}`;
+    case "tool":
+      return `⚙ ${activity.label ?? "tool"}… ${elapsed}`;
+  }
 }
