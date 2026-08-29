@@ -9,9 +9,11 @@ import { Transcript } from "./Transcript.js";
 import { WorkerTranscript } from "./WorkerTranscript.js";
 import { StatusLine } from "./StatusLine.js";
 import { Composer } from "./Composer.js";
+import { Suggestions } from "./Suggestions.js";
 import { Approval } from "./Approval.js";
 import { Confirm } from "./Confirm.js";
 import { helpText, HINT } from "./keys.js";
+import { completionsFor, applySuggestion, listRepoFiles, resolveCommand, SHORTCUTS, type CompletionState } from "./completions.js";
 import { workerCommand, removeWorker } from "./workerActions.js";
 import { reapMergedRuns } from "../fleet/reap.js";
 import {
@@ -32,6 +34,8 @@ export interface AppProps {
   railPollMs?: number;
   /** How often to archive settled workers whose branch is already merged; 0 disables it. */
   reapMs?: number;
+  /** Repository root, for `@` file completion. */
+  cwd?: string;
 }
 
 type Dispatchable = ClaudeStreamMessage | LocalEvent;
@@ -39,7 +43,7 @@ type Dispatchable = ClaudeStreamMessage | LocalEvent;
 /** reduceOrchestrator mutates; spreading gives React a new reference to render. */
 const reducer = (state: OrchestratorViewState, msg: Dispatchable): OrchestratorViewState => ({ ...reduceOrchestrator(state, msg) });
 
-export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000 }: AppProps) {
+export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000, cwd }: AppProps) {
   const [view, dispatch] = useReducer(reducer, undefined, initialViewState);
   const [runs, setRuns] = useState<RailRun[]>(() => watcher.runs());
   const [selected, setSelected] = useState(0);
@@ -51,7 +55,16 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000 }
   // The last notice, shown above the composer: worker actions happen while a
   // worker pane is selected, so the orchestrator transcript alone would hide them.
   const [flash, setFlash] = useState<{ text: string; error: boolean } | null>(null);
+  const [completionIndex, setCompletionIndex] = useState(0);
+  const [dismissed, setDismissed] = useState(false);
+  const [files, setFiles] = useState<string[]>([]);
+  // Sent messages, newest last, per session; -1 means "not browsing".
+  const historyRef = useRef<Record<string, string[]>>({});
+  const [historyAt, setHistoryAt] = useState(-1);
   const busy = useRef(false);
+  // ink-text-input also receives the ctrl keypress and would insert it as text;
+  // a shortcut sets this so the next change from the input is dropped.
+  const swallowNextChange = useRef(false);
 
   useEffect(() => {
     const onMessage = (msg: ClaudeStreamMessage): void => dispatch(msg);
@@ -117,6 +130,21 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000 }
     };
   }, [watcher, reapMs]);
 
+  useEffect(() => {
+    if (!cwd) return;
+    let stopped = false;
+    void listRepoFiles(cwd)
+      .then((found) => {
+        if (!stopped) setFiles(found);
+      })
+      .catch(() => {
+        // completion over files is a convenience; without it the rest still works
+      });
+    return () => {
+      stopped = true;
+    };
+  }, [cwd]);
+
   const items = useMemo(
     () => buildRail({ orchestrator: { turnActive: view.turnActive, exited: view.exited, pendingApprovals: approvals.length, model: view.model }, runs, now }),
     [view.turnActive, view.exited, approvals.length, view.model, runs, now],
@@ -126,6 +154,17 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000 }
   const target = current?.target;
   const currentRun: RailRun | undefined = target?.kind === "worker" ? runs.find((r) => r.runId === target.runId) : undefined;
 
+  const historyKey = target?.kind === "worker" ? target.runId : "orchestrator";
+  const completion: CompletionState | null = useMemo(() => {
+    if (dismissed || approvals.length > 0 || confirm || showHelp) return null;
+    return completionsFor(input, {
+      target: target?.kind === "worker" ? "worker" : "orchestrator",
+      workers: runs.map((r) => ({ name: r.state.name, detail: deriveStatus(r.state) })),
+      files,
+    });
+  }, [input, dismissed, approvals.length, confirm, showHelp, target, runs, files]);
+  const selectedCompletion = completion?.items[Math.min(completionIndex, completion.items.length - 1)];
+
   const notice = (text: string, error = false): void => {
     if (!text) return;
     setFlash({ text, error });
@@ -134,36 +173,95 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000 }
 
   const move = (delta: number): void => setSelected((i) => (items.length === 0 ? 0 : (i + delta + items.length) % items.length));
 
+  const recallHistory = (delta: number): void => {
+    const entries = historyRef.current[historyKey] ?? [];
+    if (entries.length === 0) return;
+    const next = historyAt === -1 ? (delta < 0 ? entries.length - 1 : -1) : historyAt + (delta < 0 ? -1 : 1);
+    if (next < 0 || next >= entries.length) {
+      setHistoryAt(-1);
+      setInput("");
+      return;
+    }
+    setHistoryAt(next);
+    setInput(entries[next]);
+    setDismissed(true);
+  };
+
+  const acceptCompletion = (): void => {
+    if (!completion || !selectedCompletion) return;
+    setInput(applySuggestion(input, completion, selectedCompletion));
+    setCompletionIndex(0);
+    setDismissed(true);
+  };
+
   // Only non-printable keys are bound; the composer owns everything else, so a
-  // message that starts with "q" cannot quit the app.
-  useInput((_ch, key) => {
+  // message that starts with "q" cannot quit the app. Commands get ctrl shortcuts.
+  useInput((ch, key) => {
+    if (key.tab && completion) {
+      acceptCompletion();
+      return;
+    }
     if (key.tab) {
       move(key.shift ? -1 : 1);
       return;
     }
+    if (key.ctrl && (ch === "n" || ch === "p")) {
+      move(ch === "n" ? 1 : -1);
+      return;
+    }
     if (key.escape) {
-      if (showHelp) setShowHelp(false);
+      if (completion) setDismissed(true);
+      else if (showHelp) setShowHelp(false);
       else if (view.turnActive) {
         void proc.interrupt();
         notice("· interrupt requested");
       }
       return;
     }
+    if (key.ctrl && SHORTCUTS[ch]) {
+      const spec = SHORTCUTS[ch];
+      swallowNextChange.current = true;
+      if (spec.takesArgument) {
+        if (target?.kind !== "worker") {
+          notice(`! ${spec.name} needs a worker selected (tab switches)`, true);
+          return;
+        }
+        setInput(`${spec.name} `);
+        setDismissed(true);
+        return;
+      }
+      run(spec.name);
+      return;
+    }
     if (approvals.length > 0 || confirm) return;
-    if (key.downArrow) move(1);
-    else if (key.upArrow) move(-1);
+    if (completion && (key.downArrow || key.upArrow)) {
+      const size = completion.items.length;
+      setCompletionIndex((i) => (key.downArrow ? (i + 1) % size : (i - 1 + size) % size));
+      return;
+    }
+    if (key.downArrow) recallHistory(1);
+    else if (key.upArrow) recallHistory(-1);
   });
 
-  const submit = (value: string): void => {
+  /** Run one composer line (also used by the ctrl shortcuts). */
+  const run = (value: string): void => {
     const text = value.trim();
     setInput("");
     setFlash(null);
+    setDismissed(false);
+    setCompletionIndex(0);
+    setHistoryAt(-1);
     if (!text || busy.current || confirm) return;
-    if (text === "/quit") {
+    const entries = (historyRef.current[historyKey] ??= []);
+    if (entries[entries.length - 1] !== text) entries.push(text);
+    if (entries.length > 100) entries.shift();
+    // long form or alias: /q, /h, /rm all resolve here
+    const global = text.startsWith("/") ? resolveCommand(text.split(/\s+/)[0]) : null;
+    if (global?.name === "/quit") {
       onQuit();
       return;
     }
-    if (text === "/help") {
+    if (global?.name === "/help") {
       setShowHelp(true);
       return;
     }
@@ -187,6 +285,23 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000 }
     }
     dispatch({ type: "sent", text });
     if (!proc.send(text)) notice("! orchestrator is not running", true);
+  };
+
+  /**
+   * Enter accepts the highlighted suggestion, unless accepting would change
+   * nothing — a fully typed command or mention then runs instead of sticking.
+   */
+  const submit = (value: string): void => {
+    if (completion && selectedCompletion) {
+      const completed = applySuggestion(value, completion, selectedCompletion);
+      if (completed !== value) {
+        setInput(completed);
+        setCompletionIndex(0);
+        setDismissed(true);
+        return;
+      }
+    }
+    run(value);
   };
 
   const approval = approvals[0];
@@ -244,9 +359,19 @@ export function App({ proc, watcher, onQuit, railPollMs = 500, reapMs = 15_000 }
               {flash.text}
             </Text>
           ) : null}
+          {completion ? <Suggestions items={completion.items} selectedIndex={Math.min(completionIndex, completion.items.length - 1)} /> : null}
           <Composer
             value={input}
-            onChange={setInput}
+            onChange={(next: string) => {
+              if (swallowNextChange.current) {
+                swallowNextChange.current = false;
+                return;
+              }
+              setInput(next);
+              setDismissed(false);
+              setCompletionIndex(0);
+              setHistoryAt(-1);
+            }}
             onSubmit={submit}
             target={target?.kind === "worker" ? workerLabel : "orchestrator"}
             hint={target?.kind === "worker" ? "type to steer · /answer · /followup · /stop · /remove · /help · /quit" : "/help · /quit"}

@@ -128,6 +128,15 @@ test("/remove on a settled worker with uncommitted changes asks first", async ()
   assert.equal(fs.existsSync(path.join(state.worktree, "scratch.txt")), true);
 }, { timeout: 60_000 });
 
+test("short aliases do the same as the long forms", async () => {
+  const { runDir, state } = mk({ pendingQuestion: { id: "q_1", question: "which?", options: null, context: null, askedAt: "t" } });
+  assert.match((await workerCommand({ runDir, state, input: "/a use argon2" })).notice, /answered db \(q_1\): use argon2/);
+  assert.match((await workerCommand({ runDir, state, input: "/f later please" })).notice, /follow-up queued for db: later please/);
+  assert.match((await workerCommand({ runDir, state, input: "/s" })).notice, /abort requested for db/);
+  assert.deepEqual(control(runDir).map((c) => c.type), ["answer", "follow_up", "abort"]);
+  assert.match((await workerCommand({ runDir, state, input: "/a" })).notice, /usage:/, "an alias with no argument still explains itself");
+});
+
 test("/remove without a fleet dir, and the updated unknown-command hint", async () => {
   const { runDir, state } = mk({ status: "settled" });
   assert.deepEqual(await workerCommand({ runDir, state, input: "/remove" }), { notice: "! /remove is not available here", error: true });

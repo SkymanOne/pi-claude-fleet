@@ -91,7 +91,7 @@ export async function cmdTui(args: TuiArgs): Promise<number> {
   proc.start();
   watcher.start({ snapshot: Boolean(saved?.sessionId) });
 
-  const app = render(<App proc={proc} watcher={watcher} onQuit={() => app.unmount()} />, { exitOnCtrlC: true });
+  const app = render(<App proc={proc} watcher={watcher} cwd={repoRoot ?? targetDir} onQuit={() => app.unmount()} />, { exitOnCtrlC: true });
 
   // The orchestrator must not outlive us, however we go down.
   const killChild = (): void => {

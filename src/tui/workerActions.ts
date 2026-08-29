@@ -6,6 +6,7 @@
 import { appendControl, deriveStatus, resumeHint, TERMINAL_STATES, type RunState } from "../state.js";
 import { cleanupRuns } from "../commands.js";
 import { gitRaw } from "../worktree.js";
+import { resolveCommand } from "./completions.js";
 
 export interface WorkerActionResult {
   notice: string;
@@ -43,27 +44,32 @@ export async function workerCommand(args: WorkerActionArgs): Promise<WorkerActio
   const status = deriveStatus(state);
   const finished = isTerminal(status);
 
-  if (input === "/stop") {
+  const [head, ...restWords] = input.split(/\s+/);
+  const spec = input.startsWith("/") ? resolveCommand(head) : null;
+  const command = spec?.name ?? (input.startsWith("/") ? head : null);
+  const argument = restWords.join(" ");
+
+  if (command === "/stop") {
     if (finished) return { notice: `! ${state.name} is ${status} — nothing to stop`, error: true };
     await appendControl(runDir, { type: "abort", message: null, source: "console" });
     return { notice: `■ abort requested for ${state.name}`, error: false };
   }
-  if (input.startsWith("/followup")) {
-    const message = input.slice("/followup".length).trim();
+  if (command === "/followup") {
+    const message = argument.trim();
     if (!message) return { notice: "! usage: /followup <message>", error: true };
     if (finished) return { notice: `! ${state.name} is ${status} — ${resumeHint(state, runDir)}`, error: true };
     await appendControl(runDir, { type: "follow_up", message, source: "console" });
     return { notice: `→ follow-up queued for ${state.name}: ${message}`, error: false };
   }
-  if (input.startsWith("/answer")) {
-    const { questionId, message } = parseAnswer(input.slice("/answer".length), state.pendingQuestion?.id ?? null);
+  if (command === "/answer") {
+    const { questionId, message } = parseAnswer(argument, state.pendingQuestion?.id ?? null);
     if (!message) return { notice: "! usage: /answer [<questionId>] <text>", error: true };
     if (finished) return { notice: `! ${state.name} is ${status} — nothing is waiting for an answer`, error: true };
     if (!questionId) return { notice: `! ${state.name} has no pending question — type a message to steer it instead`, error: true };
     await appendControl(runDir, { type: "answer", message, source: "console", questionId });
     return { notice: `→ answered ${state.name} (${questionId}): ${message}`, error: false };
   }
-  if (input === "/remove") {
+  if (command === "/remove") {
     if (!args.piFleetDir || !args.runId) return { notice: "! /remove is not available here", error: true };
     if (!finished) {
       return { notice: "", error: false, confirm: { message: `${state.name} is ${status}. Abort it and remove its worktree and branch?`, action: "remove" } };
@@ -79,7 +85,7 @@ export async function workerCommand(args: WorkerActionArgs): Promise<WorkerActio
     return removeWorker({ piFleetDir: args.piFleetDir, runId: args.runId, name: state.name, force: false });
   }
   if (input.startsWith("/")) {
-    return { notice: `! unknown command ${input.split(/\s+/)[0]} — /answer, /followup, /stop, /remove, /help, /quit`, error: true };
+    return { notice: `! unknown command ${head} — /answer, /followup, /stop, /remove, /help, /quit`, error: true };
   }
   if (finished) return { notice: `! ${state.name} is ${status} — ${resumeHint(state, runDir)}`, error: true };
   await appendControl(runDir, { type: "steer", message: input, source: "console" });

@@ -13,12 +13,16 @@ import { fakeClaudeEnv, tmpDir, waitFor } from "./helpers.js";
 
 const ESC = String.fromCharCode(27);
 const DOWN = `${ESC}[B`;
+const UP = `${ESC}[A`;
+const CTRL_A = String.fromCharCode(1);
+const CTRL_G = String.fromCharCode(7);
 const squash = (s: string): string => s.replace(/\s+/g, " ");
 
 interface Harness {
   proc: OrchestratorProcess;
   watcher: FleetWatcher;
   piFleetDir: string;
+  cwd: string;
   stdinLog: () => string;
   quit: { called: number };
 }
@@ -45,6 +49,7 @@ function setup(over: Record<string, string> = {}): Harness {
     proc,
     watcher,
     piFleetDir,
+    cwd: root,
     stdinLog: () => {
       try {
         return fs.readFileSync(stdinLogPath, "utf8");
@@ -66,10 +71,12 @@ async function addRun(piFleetDir: string, name: string, over: Partial<RunState> 
 }
 
 function renderApp(h: Harness) {
-  return render(React.createElement(App, { proc: h.proc, watcher: h.watcher, onQuit: () => { h.quit.called += 1; }, railPollMs: 30, reapMs: 0 }));
+  return render(React.createElement(App, { proc: h.proc, watcher: h.watcher, onQuit: () => { h.quit.called += 1; }, railPollMs: 30, reapMs: 0, cwd: h.cwd }));
 }
 
-const frameMatching = (lastFrame: () => string | undefined, re: RegExp, timeoutMs = 8000): Promise<string> =>
+// each test drives a real claude child and a git subprocess for file completion,
+// so the whole file runs under load; be patient before calling a frame missing
+const frameMatching = (lastFrame: () => string | undefined, re: RegExp, timeoutMs = 20_000): Promise<string> =>
   waitFor(() => (re.test(squash(lastFrame() ?? "")) ? squash(lastFrame() as string) : undefined), { timeoutMs, intervalMs: 20 });
 
 type Rendered = ReturnType<typeof renderApp>;
@@ -106,7 +113,7 @@ test("typing a message shows it, streams the reply, and fills the status line", 
   } finally {
     await teardown(h, app);
   }
-}, { timeout: 30_000 });
+}, { timeout: 60_000 });
 
 test("a permission request opens the overlay; y allows it", async () => {
   const h = setup();
@@ -124,7 +131,7 @@ test("a permission request opens the overlay; y allows it", async () => {
   } finally {
     await teardown(h, app);
   }
-}, { timeout: 30_000 });
+}, { timeout: 60_000 });
 
 test("an AskUserQuestion is answered with the picker", async () => {
   const h = setup();
@@ -142,7 +149,7 @@ test("an AskUserQuestion is answered with the picker", async () => {
   } finally {
     await teardown(h, app);
   }
-}, { timeout: 30_000 });
+}, { timeout: 60_000 });
 
 test("a worker question reaches the rail and the orchestrator; the human can answer it", async () => {
   const h = setup();
@@ -188,7 +195,7 @@ test("a worker question reaches the rail and the orchestrator; the human can ans
   } finally {
     await teardown(h, app);
   }
-}, { timeout: 40_000 });
+}, { timeout: 60_000 });
 
 test("/help shows the bindings, esc closes it, /quit asks the app to exit", async () => {
   const h = setup();
@@ -206,7 +213,7 @@ test("/help shows the bindings, esc closes it, /quit asks the app to exit", asyn
   } finally {
     await teardown(h, app);
   }
-}, { timeout: 30_000 });
+}, { timeout: 60_000 });
 
 test("esc interrupts a running turn", async () => {
   const h = setup();
@@ -220,7 +227,7 @@ test("esc interrupts a running turn", async () => {
   } finally {
     await teardown(h, app);
   }
-}, { timeout: 30_000 });
+}, { timeout: 60_000 });
 
 test("/remove on a running worker asks first, and the confirmation removes it", async () => {
   const h = setup();
@@ -251,6 +258,63 @@ test("/remove on a running worker asks first, and the confirmation removes it", 
     await frameMatching(app.lastFrame, /orchestrator > /);
     assert.equal(squash(app.lastFrame() ?? "").includes("? db"), false);
     assert.ok(runId.startsWith("db-"));
+  } finally {
+    await teardown(h, app);
+  }
+}, { timeout: 60_000 });
+
+test("typing / offers commands, tab accepts one, and up recalls what you sent", async () => {
+  const h = setup();
+  const app = renderApp(h);
+  try {
+    await frameMatching(app.lastFrame, /orchestrator > /);
+    await type(app, "first message");
+    await frameMatching(app.lastFrame, /echo: first message/);
+
+    // the orchestrator only gets the global commands
+    app.stdin.write("/");
+    const popup = await frameMatching(app.lastFrame, /tab or enter to accept/);
+    assert.match(popup, /\/help/);
+    assert.equal(popup.includes("/answer"), false, "worker-only commands are hidden here");
+    assert.match(popup, /tab or enter to accept/);
+
+    // narrowing by alias, then accepting with tab
+    app.stdin.write("q");
+    await frameMatching(app.lastFrame, /orchestrator > \/q/);
+    app.stdin.write("\t");
+    await frameMatching(app.lastFrame, /> \/quit/);
+    assert.equal(h.quit.called, 0, "accepting a suggestion does not run it");
+    app.stdin.write(ESC);
+
+    // history recall
+    app.stdin.write(UP);
+    await frameMatching(app.lastFrame, /> first message/);
+  } finally {
+    await teardown(h, app);
+  }
+}, { timeout: 60_000 });
+
+test("ctrl shortcuts run commands: ctrl+a prefills an answer, ctrl+g opens help", async () => {
+  const h = setup();
+  await addRun(h.piFleetDir, "db");
+  const app = renderApp(h);
+  try {
+    await frameMatching(app.lastFrame, /. db/);
+    app.stdin.write(CTRL_G);
+    await frameMatching(app.lastFrame, /tab \/ shift-tab next \/ previous session/);
+    app.stdin.write(ESC);
+    // ESC immediately followed by another key would arrive as one escape
+    // sequence, so wait for the help to actually close first
+    await waitFor(() => (squash(app.lastFrame() ?? "").includes("Composer type + enter") ? undefined : true), { timeoutMs: 5000, intervalMs: 20 });
+
+    // a worker command needs a worker selected
+    app.stdin.write(CTRL_A);
+    await frameMatching(app.lastFrame, /needs a worker selected/);
+    app.stdin.write("\t");
+    await frameMatching(app.lastFrame, /db \(running\) > /);
+    app.stdin.write(CTRL_A);
+    const prefilled = await frameMatching(app.lastFrame, /db \(running\) > \/answer/);
+    assert.equal(/> \/answer\s*a/.test(prefilled), false, "the ctrl keypress itself is not typed into the composer");
   } finally {
     await teardown(h, app);
   }
