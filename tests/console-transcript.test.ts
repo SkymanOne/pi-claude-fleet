@@ -56,6 +56,13 @@ test("applyEvent accepts the raw RPC message_update shape; text_end without cont
   assert.deepEqual(text(t), ["hey"]);
 });
 
+test("summarizeArgs falls back to name/target for fleet-style tools", () => {
+  assert.equal(summarizeArgs({ name: "add-auth", brief: "a long brief" }), "add-auth");
+  assert.equal(summarizeArgs({ target: "all", force: true }), "all");
+  assert.equal(summarizeArgs({ command: "ls", name: "x" }), "ls", "command still wins");
+  assert.equal(summarizeArgs({ force: true }), '{"force":true}');
+});
+
 test("summarizeArgs prefers command/path and clips long values", () => {
   assert.equal(summarizeArgs({ command: "ls -la" }), "ls -la");
   assert.equal(summarizeArgs({ path: "/a/b.ts", other: 1 }), "/a/b.ts");

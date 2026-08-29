@@ -25,7 +25,8 @@ function clip(s: string, n: number): string {
 export function summarizeArgs(args: unknown): string {
   if (!args || typeof args !== "object") return "";
   const a = args as Record<string, unknown>;
-  const primary = a.command ?? a.path ?? a.file_path ?? a.pattern ?? a.url;
+  // fleet tools take `name`/`target`; pi tools take the others
+  const primary = a.command ?? a.path ?? a.file_path ?? a.pattern ?? a.url ?? a.name ?? a.target;
   const raw = typeof primary === "string" ? primary : JSON.stringify(a);
   return clip(firstLine(raw), 80);
 }
