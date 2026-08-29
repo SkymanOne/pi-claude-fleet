@@ -185,6 +185,15 @@ program
   .action(async () => done(await cmdInstallClaudeSkill()));
 
 program
+  .command("mcp")
+  .description("serve the fleet tools over stdio as an MCP server (the TUI's orchestrator uses this)")
+  .option(...cwdOption)
+  .action(async (options: OptionValues) => {
+    const { runFleetMcp } = await import("./mcp/stdio.js");
+    done(await runFleetMcp({ cwd: options.cwd }));
+  });
+
+program
   .command("__monitor <piFleetDir> <runId>", { hidden: true })
   .action(async (piFleetDir: string, runId: string) => {
     const { runMonitor } = await import("./monitor.js");

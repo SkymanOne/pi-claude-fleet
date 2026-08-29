@@ -411,8 +411,12 @@ export interface MergeData {
   conflicts: string[];
 }
 
-/** Merge the worker branch into the checkout we're running from. Exit 5 on conflicts. */
-export async function mergeCore(args: { name: string; cwd?: string; noCommit?: boolean }): Promise<CommandResult<MergeData | null>> {
+/**
+ * Merge the worker branch into the checkout we're running from. Exit 5 on conflicts;
+ * with `abortOnConflict` the merge is rolled back (`git merge --abort`) so the
+ * checkout stays clean and the worker can rebase instead (the orchestrator never edits).
+ */
+export async function mergeCore(args: { name: string; cwd?: string; noCommit?: boolean; abortOnConflict?: boolean }): Promise<CommandResult<MergeData | null>> {
   const { run } = await resolveRun(args.name, args.cwd);
   const derived = deriveStatus(run.state);
   if (derived !== "settled") {
@@ -437,7 +441,17 @@ export async function mergeCore(args: { name: string; cwd?: string; noCommit?: b
     const conflicts = await gitRaw(["diff", "--name-only", "--diff-filter=U"], cwd);
     const files = conflicts.stdout.trim();
     if (files) {
-      err.push(`merge: conflicts in:\n${files}\nResolve them, then \`git add\` and \`git commit\` (or \`git merge --abort\`).`);
+      if (args.abortOnConflict) {
+        await gitRaw(["merge", "--abort"], cwd);
+        const base = run.state.baseCommit ? run.state.baseCommit.slice(0, 7) : "the base commit";
+        err.push(
+          `merge: conflicts in:\n${files}\nThe merge was aborted; the checkout is clean. ` +
+            `Have the worker rebase its branch ${run.state.branch} onto the current HEAD of ${cwd} (it was cut from ${base}) ` +
+            "in its own worktree, resolve the conflicts there, commit, and then merge again.",
+        );
+      } else {
+        err.push(`merge: conflicts in:\n${files}\nResolve them, then \`git add\` and \`git commit\` (or \`git merge --abort\`).`);
+      }
       return {
         code: MERGE_CONFLICT_EXIT,
         out: [],
