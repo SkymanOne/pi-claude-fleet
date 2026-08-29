@@ -7,6 +7,25 @@ import { initRepo, runCli, fakePiEnv, readState, firstRunId, fleetDirOf, waitFor
 const events = (runDir: string) =>
   fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
 
+/** On a timing failure, print what the monitor saw so the flake is diagnosable. */
+function dumpRun(runDir: string): string {
+  const parts: string[] = [];
+  for (const f of ["monitor.log", "state.json", "control.jsonl", "outbox.jsonl", "events.jsonl"]) {
+    let body = "(missing)";
+    try { body = fs.readFileSync(path.join(runDir, f), "utf8").split("\n").slice(-30).join("\n"); } catch { /* missing */ }
+    parts.push(`--- ${f} ---\n${body}`);
+  }
+  return parts.join("\n");
+}
+
+async function waitOrDump<T>(runDir: string, fn: () => T | undefined, opts: { timeoutMs: number }): Promise<T> {
+  try {
+    return await waitFor(fn, opts);
+  } catch (err) {
+    throw new Error(`${String(err)}\n${dumpRun(runDir)}`);
+  }
+}
+
 test("monitor mirrors worker questions/progress into state and events; answer resolves the block", async () => {
   const root = initRepo("pf-outbox-1-");
   const spawned = await runCli(["spawn", "w", "--cwd", root, "--no-worktree", "--", "t"],
@@ -15,7 +34,7 @@ test("monitor mirrors worker questions/progress into state and events; answer re
   const runId = firstRunId(root);
   const runDir = path.join(fleetDirOf(root), "runs", runId);
 
-  const pending = await waitFor(() => readState(root, runId).pendingQuestion ?? undefined, { timeoutMs: 15_000 });
+  const pending = await waitOrDump(runDir, () => readState(root, runId).pendingQuestion ?? undefined, { timeoutMs: 15_000 });
   assert.equal(pending.question, "bcrypt or argon2?");
   assert.deepEqual(pending.options, ["bcrypt", "argon2"]);
   assert.equal(pending.context, null);
@@ -35,8 +54,8 @@ test("monitor mirrors worker questions/progress into state and events; answer re
 
   const answered = await runCli(["answer", "w", "--cwd", root, "--", "argon2"]);
   assert.equal(answered.code, 0, answered.stderr);
-  await waitFor(() => (events(runDir).some((e) => e.type === "answer_delivered") ? true : undefined), { timeoutMs: 10_000 });
-  await waitFor(() => (TERMINAL.includes(readState(root, runId).status) ? true : undefined), { timeoutMs: 20_000 });
+  await waitOrDump(runDir, () => (events(runDir).some((e) => e.type === "answer_delivered") ? true : undefined), { timeoutMs: 10_000 });
+  await waitOrDump(runDir, () => (TERMINAL.includes(readState(root, runId).status) ? true : undefined), { timeoutMs: 20_000 });
 
   const state = readState(root, runId);
   assert.equal(state.status, "settled");

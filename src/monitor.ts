@@ -92,6 +92,8 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
   let abortRequests = 0;
   let lastTextTimer: NodeJS.Timeout | null = null;
   let shutdownTimers: NodeJS.Timeout[] = [];
+  // Assigned once the mailbox paths are known; drained on settle and finish too.
+  let pollMailboxes: () => void = () => {};
 
   const writeEvent = (obj: Record<string, unknown>): void => {
     try {
@@ -208,6 +210,9 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
       dirty = true;
     }
     if (ev.type === "agent_settled" && !settledHandled) {
+      // Everything the worker wrote before settling must be mirrored before
+      // observers can see the terminal status.
+      if (promptSent) pollMailboxes();
       settledHandled = true;
       state.status = pendingAbort ? "stopped" : "settled";
       state.settledAt = nowIso();
@@ -263,13 +268,11 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
   let controlOffset = 0;
   const handleControl = (msg: ControlMessage): void => {
     if (msg.type === "answer") {
-      // The worker's fleet_ask reads the answer from control.jsonl itself; we only record it.
+      // The worker's fleet_ask reads the answer from control.jsonl itself; we only
+      // record it. Never drop it: the worker may consume the answer and settle
+      // before this poll runs, and the record must still say who answered.
       if (typeof msg.message !== "string") return;
       const source = msg.source ?? "unknown";
-      if (settledHandled) {
-        writeEvent({ type: "control_dropped", control: msg.type, source, reason: "run already settled" });
-        return;
-      }
       const questionId = msg.questionId ?? null;
       writeEvent({ type: "answer_delivered", questionId, source, message: msg.message });
       recordSteering(state, { source, message: `answer(${questionId ?? "?"}): ${msg.message}`, ts: nowIso() });
@@ -323,7 +326,7 @@ export async function runMonitor(args: { piFleetDir: string; runId: string }): P
       void flushNow();
     }
   };
-  const pollMailboxes = (): void => {
+  pollMailboxes = (): void => {
     const { lines, offset } = readNewLines(controlPath, controlOffset);
     controlOffset = offset;
     for (const line of lines) {
