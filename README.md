@@ -1,20 +1,14 @@
 # pi-claude-fleet
 
-Lets Claude Code run [pi](https://github.com/earendil-works/pi-mono) coding agents as workers. Claude plans and writes the briefs; pi does the typing in an isolated git worktree; a structured report comes back; Claude reviews it and merges.
+A terminal app that runs a fleet of [pi](https://github.com/earendil-works/pi-mono) coding agents with Claude Code as the orchestrator.
 
-Three pieces ship in this package:
+You run `pi-fleet` in a repository. It starts Claude Code as a child process, gives it a set of fleet tools, and shows you both sides: your conversation with the orchestrator on one pane, every worker on a rail beside it. The orchestrator plans the work and spawns pi workers, each in its own git worktree. Workers report back through files. You can watch any worker, steer it, or answer its questions yourself, and the orchestrator finds out what you did.
 
-- The `pi-fleet` CLI. It starts detached `pi --mode rpc` workers, watches them, forwards steering messages, collects their reports, and merges their branches.
-- A pi extension and skill (`fleet-report`, `fleet-worker-report`) that tell every worker how and where to write its report.
-- A Claude Code skill (`pi-orchestrator`) that teaches the spawn, monitor, report, merge loop.
+Nothing runs inside a Claude Code session, and there is no skill to install. The orchestrator is an ordinary `claude -p` process that this app owns.
 
-You need Node 22 or newer and `pi` on your `PATH`.
+Requirements: Node 22 or newer, `pi` on your PATH, and `claude` (Claude Code 2.1.x) on your PATH and logged in.
 
 ## Install
-
-There are three things to install, and only the first is required. Run everything from a clone of this repo.
-
-### 1. The `pi-fleet` CLI (required)
 
 ```bash
 pnpm install && pnpm build   # compiles src/ to dist/
@@ -22,47 +16,82 @@ pnpm link --global           # puts `pi-fleet` on your PATH (npm users: npm inst
 pi-fleet --help              # verify
 ```
 
-The orchestrator skill runs `pi-fleet` from Claude Code's Bash tool, so it has to be on the PATH of the shell Claude Code uses. `pnpm unlink --global pi-claude-fleet` removes it.
+`pnpm unlink --global pi-claude-fleet` removes it.
 
-### 2. The Claude Code skill (`pi-orchestrator`)
+The pi-side extension and skill travel with the CLI: every worker is spawned with `--extension pi/extensions/fleet-worker.ts --skill pi/skills/fleet-worker-report`, so there is nothing to install on the pi side. If you also want the worker tools and skill available in ordinary pi sessions, `pi install /absolute/path/to/pi-claude-fleet` registers the package (add `-l` for a project-local install); the extension does nothing unless `PI_FLEET_RUN` is set.
 
-```bash
-pi-fleet install-claude-skill                 # symlinks claude/skills/pi-orchestrator into ~/.claude/skills/
-ls -la ~/.claude/skills/pi-orchestrator       # verify: a symlink back into this repo
-```
-
-Claude Code reads personal skills from `~/.claude/skills/<name>/SKILL.md`. Start a new Claude Code session; the skill is then available as `/pi-orchestrator` and Claude also loads it on its own when you ask it to delegate work to pi. Because it is a symlink, `git pull` in this repo updates the skill in place. The command refuses to overwrite anything at that path that it did not create; remove the old directory first if you have one.
-
-Prefer a per-project skill instead? Copy it into the repo you are orchestrating: `cp -R claude/skills/pi-orchestrator <repo>/.claude/skills/`. To uninstall the personal one: `rm ~/.claude/skills/pi-orchestrator` (it is only a link).
-
-### 3. The pi package (optional)
-
-You can skip this. `pi-fleet` already passes the worker extension and skill to every worker it spawns (`--extension pi/extensions/fleet-report.ts --skill pi/skills/fleet-worker-report`), so workers get the report protocol without any pi-side install.
-
-Install it anyway if you want to run pi as a worker by hand (`PI_FLEET_RUN=... PI_FLEET_DIR=... pi`) or want the `fleet-worker-report` skill visible in ordinary pi sessions:
-
-```bash
-pi install /absolute/path/to/pi-claude-fleet      # global: ~/.pi/agent/settings.json
-pi install -l /absolute/path/to/pi-claude-fleet   # or project-local: <repo>/.pi/settings.json
-pi list                                          # verify: the path appears under packages
-```
-
-pi references the directory in place (no copy), so edits here are live. The extension does nothing unless `PI_FLEET_RUN` is set, and it is safe to have it loaded both ways: the system-prompt block is only added once. Remove it with `pi remove /absolute/path/to/pi-claude-fleet` (add `-l` for a project-local install).
-
-## Quickstart
+## Using it
 
 ```bash
 cd your-repo
-pi-fleet spawn add-auth -- "Implement …; run the tests; commit; write your fleet report."
-pi-fleet wait add-auth --timeout 120      # exit 0 settled, 3 timeout, 4 stopped/error/dead
-pi-fleet report add-auth                  # the worker's report plus the steering log
-pi-fleet diff add-auth && pi-fleet merge add-auth
-pi-fleet cleanup add-auth
+pi-fleet
 ```
 
-To watch a worker, or nudge it mid-run, open a terminal and run `pi-fleet open` (a menu of runs) or `pi-fleet attach add-auth`. Anything you type is sent as a steering message; `/followup <msg>`, `/stop`, and `/quit` do what they say. Whatever you send shows up in the worker's report under "Steering received", so the orchestrator finds out too.
+Then talk to the orchestrator: *"Add token refresh to the auth module and update the tests."* It writes briefs, spawns workers, and reports back as they finish.
 
-## Commands
+```text
+┌ ○ orchestrator        > add token refresh, then tests ─────────────┐
+│ ● add-auth              ⚙ mcp__fleet__fleet_spawn add-auth        │
+│ ? add-tests             ↳ Spawned add-auth-20260829120000         │
+│                       I started add-auth. add-tests is asking     │
+│ blocked 2m            which fixture style to use.                 │
+│                       orchestrator >                              │
+├ sonnet · a1b2c3d4 · $0.12 · 3 turns · tab switch · esc interrupt ─┤
+└────────────────────────────────────────────────────────────────────┘
+```
+
+Keys: `tab` / `shift-tab` or the arrow keys switch between the orchestrator and the workers, `esc` interrupts the orchestrator's turn (or closes help), `ctrl-c` quits. Only non-printable keys are bound, so a message that starts with "q" does not quit the app.
+
+The composer at the bottom sends to whatever is selected. With the orchestrator selected it is a normal message. With a worker selected:
+
+| You type | What happens |
+|---|---|
+| any text | steers that worker (delivered after its current tool call) |
+| `/answer <text>` | answers the question it is blocked on (`/answer <questionId> <text>` to pick one) |
+| `/followup <text>` | queues a message for when it finishes its current work |
+| `/stop` | aborts it |
+| `/help`, `/quit` | this help, and quit |
+
+When the orchestrator wants to run something outside its allowlist, or asks you a question, an overlay appears: `y` allows once, `a` allows it for the session, `n` denies with a reason, and questions get an option picker.
+
+Quitting stops the orchestrator but leaves workers running; they are detached processes with their state on disk. `pi-fleet` reopens the console and resumes the same orchestrator session (`--fresh` starts a new one).
+
+Options: `--cwd <dir>`, `--model <model>`, `--fresh`, `--budget <usd>`, `--progress-events` (forward workers' progress notes to the orchestrator, off by default because they are chatty).
+
+## What the orchestrator can and cannot do
+
+It coordinates; it does not type code. `Edit`, `Write` and `NotebookEdit` are disabled for it. It can read the repository and run read-only git commands without asking; anything else prompts you. Merge conflicts go back to the worker as a rebase brief rather than being fixed in place.
+
+Its tools, all backed by the same code as the CLI subcommands:
+
+`fleet_spawn`, `fleet_status`, `fleet_wait`, `fleet_output`, `fleet_logs`, `fleet_send`, `fleet_followup`, `fleet_answer`, `fleet_stop`, `fleet_report`, `fleet_diff`, `fleet_merge`, `fleet_cleanup`.
+
+They are served by `pi-fleet mcp`, a stdio MCP server that Claude Code spawns itself. The orchestrator's role, the tool semantics and the event format live in [prompts/orchestrator.md](prompts/orchestrator.md).
+
+## How a worker talks back
+
+A worker never sees your conversation. It gets a brief, and it answers through files in `.pi-fleet/`:
+
+- Its **report** (`reports/<runId>.md`) with fixed sections: Status, Summary, What I did, Files changed, Verification, Decisions & assumptions, Steering received, Open questions, Suggested next step.
+- **`fleet_ask`**, a tool that posts a question and blocks until someone answers. The rail shows the worker as `?`, the orchestrator gets a `question` event, and either it or you can answer. If nobody answers within ten minutes the worker proceeds on its own judgment and records that under Decisions.
+- **`fleet_progress`**, one-line milestones.
+
+Everything a worker does becomes a fleet event, and the app injects those into the orchestrator's conversation as they happen:
+
+```text
+<fleet-event kind="settled" run="add-auth-20260829120000" name="add-auth" id="ev_…" ts="…">
+status: settled
+report: /repo/.pi-fleet/reports/add-auth-20260829120000.md (present)
+branch: pi-fleet/add-auth-9120000
+next: fleet_report name="add-auth"; then fleet_diff and fleet_merge, then the integration checks
+</fleet-event>
+```
+
+Kinds: `settled`, `stopped`, `error`, `dead`, `question`, `question_resolved`, `answered_by_console`, `console_steer`, `progress`, `snapshot`. Events that come from you (an answer or a steer you typed) are labelled as such, so the orchestrator reconciles instead of undoing your work. Worker text can never forge or close one of these blocks.
+
+## Headless commands
+
+The TUI is one client; the same fleet is driveable from scripts.
 
 | Command | What it does |
 |---|---|
@@ -71,29 +100,58 @@ To watch a worker, or nudge it mid-run, open a terminal and run `pi-fleet open` 
 | `wait <name> [--timeout s]` | block until the run reaches a terminal state |
 | `output <name> [--tail n]` | last assistant text, or the last n tool results |
 | `logs <name> [--tail n]` | tail of the raw RPC log |
-| `send`, `followup`, `stop` | steer, queue a follow-up, abort |
+| `send`, `followup`, `answer`, `stop` | steer, queue a follow-up, answer a question, abort |
 | `report <name>` | the final report with the steering log appended; exit 2 if there is none |
 | `diff <name> [--name-only]` | what the worker changed against its base commit |
 | `merge <name> [--no-commit]` | merge the worker's branch; exit 5 on conflicts |
 | `cleanup <name\|all> [--force]` | remove the worktree and branch, archive the run |
-| `open`, `attach <name>` | the interactive console (`attach` on a non-TTY just prints the captured tail) |
-| `install-claude-skill` | link the orchestrator skill for Claude Code |
+| `attach <name> [--tail n]` | print a worker's transcript tail |
+| `mcp` | serve the fleet tools over stdio (what the orchestrator runs) |
 
-Exit codes: 0 ok, 1 refusal or error, 2 no report, 3 wait timed out, 4 the run ended stopped/error/dead, 5 merge conflict. The full reference, including the state file layout, is in `claude/skills/pi-orchestrator/references/cli.md`.
+Exit codes: 0 ok, 1 refusal or error, 2 no report, 3 wait timed out, 4 the run ended stopped/error/dead, 5 merge conflict.
 
-## How it works
+## Files under `.pi-fleet/`
 
-`spawn` creates `<repo>/.pi-fleet/runs/<id>/` (git-ignored) and a worktree on the branch `pi-fleet/<name>-<short7>`, then launches a detached monitor process that owns `pi --mode rpc`. The monitor writes `events.jsonl`, `rpc.log`, and `state.json`, forwards any line appended to `control.jsonl` (`steer`, `follow_up`, `abort`, each tagged `orchestrator` or `console`) to pi, and shuts pi down once the run settles. Because the monitor is detached, the orchestrating Claude session can exit and come back later; state lives on disk, not in anyone's memory.
+`spawn` creates `<repo>/.pi-fleet/` and adds it to `.gitignore`. It is the audit trail; nothing else needs to read it.
 
-The worker sees `PI_FLEET_RUN` and `PI_FLEET_DIR` in its environment and the report protocol in its system prompt. Its report lands in `.pi-fleet/reports/<id>.md` with fixed sections: Status, Summary, What I did, Files changed, Verification, Decisions & assumptions, Steering received, Open questions, Suggested next step.
+| Path | What it holds |
+|---|---|
+| `runs/<id>/state.json` | the run's durable facts: status, worktree, branch, base commit, last tool and activity, steering log, pending question |
+| `runs/<id>/events.jsonl` | the transcript: selected pi RPC events plus fleet events (`steering_delivered`, `worker_question`, `worker_progress`, `answer_delivered`, …) |
+| `runs/<id>/control.jsonl` | inbox: `steer`, `follow_up`, `abort`, `answer` lines from the orchestrator or from you |
+| `runs/<id>/outbox.jsonl` | outbox: the worker's `question`, `progress` and `question_resolved` envelopes |
+| `runs/<id>/rpc.log`, `monitor.log` | raw pi stream and the monitor's own output |
+| `reports/<id>.md` | the worker's final report |
+| `orchestrator.json`, `orchestrator.log`, `orchestrator.prompt.md` | the claude session id and watcher cursors, the raw protocol log, the rendered prompt |
 
-One thing to know: `diff` and `merge` only see committed work. If a worker forgets to commit, `diff` warns you on stderr, and a non-forced `cleanup` refuses to delete the dirty worktree. Brief your workers to commit.
+Status is derived, never stored: a run whose monitor is gone reads as `dead`, and a running worker waiting on `fleet_ask` reads as `blocked`.
+
+One thing to know: `diff` and `merge` only see committed work. If a worker forgets to commit, `diff` warns on stderr and a non-forced `cleanup` refuses to delete the dirty worktree. Brief your workers to commit.
+
+## How it fits together
+
+```text
+pi-fleet (ink TUI)
+ ├── claude -p  (stream-json over stdio: messages in, transcript and permission
+ │              prompts out; the orchestrator's session id is saved for --resume)
+ │    └── pi-fleet mcp  (stdio MCP: the fleet_* tools, over .pi-fleet/)
+ ├── monitors  (detached; each owns one `pi --mode rpc` worker in its worktree)
+ └── watcher   (tails every run's state and events → the rail, and → <fleet-event>)
+```
+
+Each piece keeps its own state on disk, so the console can come and go without disturbing the workers.
 
 ## Development
 
 ```bash
-pnpm typecheck && pnpm test   # hermetic; uses tests/fixtures/fake-pi.mjs instead of a real model
-pnpm test:e2e                 # real pi and a real model, so it costs tokens; PI_FLEET_E2E_MODEL=<pattern> picks the model
+pnpm typecheck && pnpm test    # hermetic: fake pi and fake claude, no tokens spent
+pnpm test:e2e                  # real pi and real claude, so it costs money
 ```
 
-The design spec and the implementation plan (with a table of where the code deviates from the spec) are in `docs/superpowers/`.
+`pnpm test:e2e` runs three scenarios: a pi worker end to end, console steering mid-run, and the real orchestrator driving a worker through the MCP tools. Narrow it with `PI_FLEET_E2E_ONLY=pi|claude`, choose models with `PI_FLEET_E2E_MODEL` and `PI_FLEET_E2E_CLAUDE_MODEL` (default `haiku`), or skip the claude scenario with `PI_FLEET_E2E_NO_CLAUDE=1`.
+
+`scripts/spike-claude-protocol.ts` probes the real `claude` binary for the protocol facts this app depends on (whether permission prompts need a handshake, whether `mcp__fleet__*` suppresses them, how a mid-turn message is delivered). Its findings are recorded at the top of the file; re-run it after a Claude Code upgrade.
+
+Test knobs: `PI_FLEET_PI_BIN` and `PI_FLEET_CLAUDE_BIN` replace the two binaries, `PI_FLEET_DEV=1` makes the CLI re-invoke itself through tsx instead of `dist/`, and `PI_FLEET_ASK_TIMEOUT_MS` shortens a worker's `fleet_ask` wait.
+
+The design spec and the implementation plan are in `docs/superpowers/`; the plan's "Deviations from the spec" table is the quickest way to see where the code and the spec differ.

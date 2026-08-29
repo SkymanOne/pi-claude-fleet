@@ -1,8 +1,21 @@
-// Real-model end-to-end for pi-fleet. Requires `pi` on PATH with a working default provider.
-// Optional: PI_FLEET_E2E_MODEL=<pattern> (e.g. a cheap model) is passed to every spawn.
+/**
+ * Real end-to-end for pi-fleet. Scenarios 1-2 need `pi` on PATH with a working
+ * default provider; scenario 3 also drives the real `claude` binary and costs a
+ * few cents (skip it with PI_FLEET_E2E_NO_CLAUDE=1).
+ *
+ * Optional: PI_FLEET_E2E_MODEL=<pattern> for pi workers,
+ *           PI_FLEET_E2E_CLAUDE_MODEL=<alias> for the orchestrator (default haiku).
+ */
 import fs from "node:fs";
 import path from "node:path";
-import { initRepo, runCli, readState, firstRunId, fleetDirOf, waitFor } from "./helpers.js";
+import { once } from "node:events";
+import { initRepo, runCli, readState, firstRunId, fleetDirOf, waitFor, FAKE_PI } from "./helpers.js";
+import { OrchestratorProcess, type PermissionRequest } from "../src/orchestrator/process.js";
+import { fleetMcpConfig } from "../src/orchestrator/mcpConfig.js";
+import { writeRenderedPrompt } from "../src/orchestrator/prompt.js";
+import { FleetWatcher } from "../src/fleet/watcher.js";
+import { formatFleetBatch, type FleetEvent } from "../src/fleet/events.js";
+import { textOfAssistant, isResult, type ResultMessage } from "../src/orchestrator/protocol.js";
 
 const env: NodeJS.ProcessEnv = { ...process.env, PI_FLEET_DEV: "1" };
 delete env.PI_FLEET_PI_BIN;
@@ -88,7 +101,91 @@ async function scenarioSteering(): Promise<void> {
   check(cleanup.code === 0, `cleanup exit 0 ${cleanup.stderr.trim()}`);
 }
 
-await scenarioHello();
-await scenarioSteering();
+/**
+ * The real orchestrator, headless: claude drives fake pi workers through the
+ * fleet MCP server, and the watcher pushes the settled event back to it.
+ */
+async function scenarioOrchestrator(): Promise<void> {
+  console.log("scenario 3: claude orchestrates a worker through the fleet MCP tools");
+  const root = initRepo("pf-e2e-3-");
+  const piFleetDir = path.join(fs.realpathSync(root), ".pi-fleet");
+  fs.mkdirSync(path.join(piFleetDir, "runs"), { recursive: true });
+  fs.mkdirSync(path.join(piFleetDir, "reports"), { recursive: true });
+  console.log(`  repo ${root}`);
+  // fake pi keeps this scenario about the orchestrator, not about a model writing code
+  const childEnv: NodeJS.ProcessEnv = { ...process.env, PI_FLEET_DEV: "1", PI_FLEET_PI_BIN: `${process.execPath} ${FAKE_PI}`, FAKE_PI_DELAY_MS: "300" };
+  const promptFile = writeRenderedPrompt(piFleetDir, { fleetDir: piFleetDir, repoRoot: fs.realpathSync(root) });
+  const proc = new OrchestratorProcess({
+    cwd: fs.realpathSync(root),
+    promptFile,
+    mcpConfigJson: JSON.stringify(fleetMcpConfig(piFleetDir, childEnv)),
+    model: process.env.PI_FLEET_E2E_CLAUDE_MODEL ?? "haiku",
+    maxBudgetUsd: 0.5,
+    logPath: path.join(piFleetDir, "orchestrator.log"),
+    env: childEnv,
+  });
+  const watcher = new FleetWatcher({ piFleetDir, pollMs: 300, batchMs: 300 });
+  const injected: string[] = [];
+  const seen: FleetEvent[] = [];
+  watcher.on("batch", (events) => {
+    seen.push(...events);
+    const text = formatFleetBatch(events, watcher.batchLimit);
+    injected.push(text);
+    proc.send(text);
+  });
+  // the orchestrator only gets fleet tools and read-only git, so nothing here should prompt
+  const prompts: PermissionRequest[] = [];
+  proc.on("permission_request", (req) => {
+    prompts.push(req);
+    proc.allow(req.requestId, req.request.permission_suggestions);
+  });
+  const assistant: string[] = [];
+  proc.on("assistant", (msg) => assistant.push(textOfAssistant(msg)));
+
+  proc.start();
+  watcher.start();
+  try {
+    const first = once(proc, "result");
+    proc.send(
+      'Spawn a fleet worker named "hello" with worktree true and this brief: ' +
+        '"Create hello.txt containing hi, commit it, and write your fleet report." ' +
+        "Then stop and wait: do not call fleet_wait, and do not do anything else. Reply with the run id only.",
+    );
+    const [spawnResult] = (await first) as [ResultMessage];
+    check(isResult(spawnResult) && !spawnResult.is_error, `first turn finished (${spawnResult.subtype})`);
+    const runId = await waitFor(() => {
+      try {
+        return fs.readdirSync(path.join(piFleetDir, "runs"))[0];
+      } catch {
+        return undefined;
+      }
+    }, { timeoutMs: 180_000, intervalMs: 500 });
+    check(Boolean(runId), `worker spawned by the orchestrator (${runId})`);
+    check(prompts.length === 0, `no permission prompts for fleet tools (got ${prompts.length})`);
+
+    // the watcher must push the settled event, and the orchestrator must act on it
+    const settledTurn = once(proc, "result");
+    await waitFor(() => (seen.some((e) => e.kind === "settled") ? true : undefined), { timeoutMs: 180_000, intervalMs: 300 });
+    check(injected.some((t) => /<fleet-event kind="settled"/.test(t)), "a settled fleet event was injected");
+    const [reactResult] = (await settledTurn) as [ResultMessage];
+    check(!reactResult.is_error, `the orchestrator reacted to the event (${reactResult.subtype})`);
+    const text = `${assistant.join("\n")}\n${reactResult.result ?? ""}`;
+    check(/done/i.test(text), "the orchestrator read the report (mentions the worker's Status: done)");
+    console.log(`  info cost so far: $${proc.costUsd.toFixed(4)} over ${proc.numTurns} turns`);
+  } finally {
+    watcher.stop();
+    await proc.stop();
+    await runCli(["cleanup", "all", "--force", "--cwd", root], { env: childEnv, cwd: root });
+  }
+}
+
+// PI_FLEET_E2E_ONLY=pi|claude narrows the run; PI_FLEET_E2E_NO_CLAUDE=1 skips scenario 3.
+const only = process.env.PI_FLEET_E2E_ONLY;
+if (!only || only === "pi") {
+  await scenarioHello();
+  await scenarioSteering();
+}
+if (only === "pi" || process.env.PI_FLEET_E2E_NO_CLAUDE === "1") console.log("scenario 3: skipped");
+else await scenarioOrchestrator();
 console.log(failures === 0 ? "\nE2E PASSED" : `\nE2E FAILED (${failures} check(s))`);
 process.exit(failures === 0 ? 0 : 1);

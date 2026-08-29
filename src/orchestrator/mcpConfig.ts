@@ -16,14 +16,22 @@ export interface McpConfig {
 }
 
 /**
+ * An MCP stdio server is spawned with exactly the environment given here (the
+ * client does not merge the parent's), so the server needs the basics: PATH and
+ * HOME for `git`, TMPDIR and the locale for everything else. Deliberately
+ * narrow — the config travels on claude's command line, so no secrets go in it.
+ */
+const BASE_ENV_KEYS = ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "USER", "SHELL", "SystemRoot", "APPDATA"];
+/** Dev/test knobs, so workers spawned through MCP behave like ones spawned from the CLI under test. */
+const FLEET_ENV_KEYS = ["PI_FLEET_DEV", "PI_FLEET_PI_BIN", "PI_FLEET_ASK_POLL_MS", "PI_FLEET_ASK_TIMEOUT_MS"];
+
+/**
  * The `--mcp-config` document that makes claude spawn `pi-fleet mcp` over stdio.
  * No shell is involved (argv arrays), so paths with spaces need no quoting.
- * Dev/test knobs (tsx loader, fake pi) are passed through so workers spawned
- * from the MCP server behave like ones spawned from the CLI under test.
  */
 export function fleetMcpConfig(piFleetDir: string, env: NodeJS.ProcessEnv = process.env): McpConfig {
   const passthrough: Record<string, string> = { PI_FLEET_DIR: piFleetDir };
-  for (const key of ["PI_FLEET_DEV", "PI_FLEET_PI_BIN", "PI_FLEET_ASK_POLL_MS", "PI_FLEET_ASK_TIMEOUT_MS"]) {
+  for (const key of [...BASE_ENV_KEYS, ...FLEET_ENV_KEYS]) {
     const value = env[key];
     if (typeof value === "string" && value.length > 0) passthrough[key] = value;
   }
@@ -32,7 +40,8 @@ export function fleetMcpConfig(piFleetDir: string, env: NodeJS.ProcessEnv = proc
       fleet: {
         type: "stdio",
         command: process.execPath,
-        args: [...cliSpawnArgs(), "mcp"],
+        // the dev/tsx decision must follow the env we hand the child, not ours
+        args: [...cliSpawnArgs(env), "mcp"],
         env: passthrough,
         timeout: FLEET_MCP_TIMEOUT_MS,
       },

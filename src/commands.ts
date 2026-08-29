@@ -68,8 +68,8 @@ export type ControlSource = "orchestrator" | "console";
  *   tsx` cannot be resolved when the child's cwd is outside this package —
  *   the detached monitor inherits the orchestrator's cwd.
  */
-export function cliSpawnArgs(): string[] {
-  if (process.env.PI_FLEET_DEV === "1") {
+export function cliSpawnArgs(env: NodeJS.ProcessEnv = process.env): string[] {
+  if (env.PI_FLEET_DEV === "1") {
     const loader = fileURLToPath(import.meta.resolve("tsx"));
     return ["--import", loader, path.join(SRC_DIR, "cli.ts")];
   }
