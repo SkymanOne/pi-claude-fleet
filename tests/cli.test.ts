@@ -28,3 +28,15 @@ test("the Claude Code skill installer is gone; mcp and answer are advertised", a
   assert.match(help.stdout, /\bmcp\b/);
   assert.match(help.stdout, /\banswer\b/);
 });
+
+test("the root command opens the TUI and refuses a non-TTY with guidance", async () => {
+  const r = await runCli([]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /needs an interactive terminal/);
+  assert.match(r.stderr, /pi-fleet spawn <name>/);
+  const viaName = await runCli(["tui"]);
+  assert.equal(viaName.code, 1);
+  assert.match(viaName.stderr, /needs an interactive terminal/);
+  const help = await runCli(["--help"]);
+  assert.match(help.stdout, /tui \[options\]/);
+});

@@ -4,12 +4,13 @@ export interface KeyHelp {
   what: string;
 }
 
+// Only non-printable keys are bound: the composer is always focused, so a
+// letter binding would swallow the first character of a message.
 export const GLOBAL_KEYS: KeyHelp[] = [
   { keys: "tab / shift-tab", what: "next / previous session" },
-  { keys: "j / k", what: "next / previous session (empty composer)" },
-  { keys: "esc", what: "interrupt the orchestrator's turn" },
-  { keys: "?", what: "this help (empty composer)" },
-  { keys: "q / ctrl-c", what: "quit (workers keep running)" },
+  { keys: "up / down", what: "next / previous session" },
+  { keys: "esc", what: "interrupt the orchestrator turn (or close help)" },
+  { keys: "ctrl-c", what: "quit (workers keep running)" },
 ];
 
 export const COMPOSER_KEYS: KeyHelp[] = [
@@ -28,7 +29,7 @@ export const APPROVAL_KEYS: KeyHelp[] = [
   { keys: "↑/↓ + enter", what: "pick an answer (questions)" },
 ];
 
-export const HINT = "tab switch · esc interrupt · ? help · q quit";
+export const HINT = "tab switch · esc interrupt · /help · /quit";
 
 export function helpText(): string {
   const section = (title: string, rows: KeyHelp[]): string =>

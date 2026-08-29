@@ -10,15 +10,17 @@ export interface ConsoleLock {
 /** A lock older than this is a crashed console, not a live one. */
 export const LOCK_STALE_MS = 15_000;
 
-export function lockPath(runDir: string): string {
-  return path.join(runDir, "console.lock");
+export const CONSOLE_LOCK = "console.lock";
+
+export function lockPath(dir: string, name: string = CONSOLE_LOCK): string {
+  return path.join(dir, name);
 }
 
 /** Another live console's lock, or null (missing, malformed, stale, or ours). */
-export function readActiveLock(runDir: string, now: number = Date.now()): ConsoleLock | null {
+export function readActiveLock(dir: string, now: number = Date.now(), name: string = CONSOLE_LOCK): ConsoleLock | null {
   let raw: string;
   try {
-    raw = fs.readFileSync(lockPath(runDir), "utf8");
+    raw = fs.readFileSync(lockPath(dir, name), "utf8");
   } catch {
     return null;
   }
@@ -34,16 +36,16 @@ export function readActiveLock(runDir: string, now: number = Date.now()): Consol
   return { pid: lock.pid, ts: lock.ts };
 }
 
-export function writeLock(runDir: string): void {
-  fs.writeFileSync(lockPath(runDir), JSON.stringify({ pid: process.pid, ts: nowIso() }));
+export function writeLock(dir: string, name: string = CONSOLE_LOCK): void {
+  fs.writeFileSync(lockPath(dir, name), JSON.stringify({ pid: process.pid, ts: nowIso() }));
 }
 
 /** Write the lock now and refresh it periodically; the returned stop() removes it if still ours. */
-export function startLockHeartbeat(runDir: string, intervalMs = 5000): () => void {
-  writeLock(runDir);
+export function startLockHeartbeat(dir: string, intervalMs = 5000, name: string = CONSOLE_LOCK): () => void {
+  writeLock(dir, name);
   const timer = setInterval(() => {
     try {
-      writeLock(runDir);
+      writeLock(dir, name);
     } catch {
       // best effort
     }
@@ -52,8 +54,8 @@ export function startLockHeartbeat(runDir: string, intervalMs = 5000): () => voi
   return () => {
     clearInterval(timer);
     try {
-      const current = JSON.parse(fs.readFileSync(lockPath(runDir), "utf8"));
-      if (current.pid === process.pid) fs.unlinkSync(lockPath(runDir));
+      const current = JSON.parse(fs.readFileSync(lockPath(dir, name), "utf8"));
+      if (current.pid === process.pid) fs.unlinkSync(lockPath(dir, name));
     } catch {
       // already gone
     }

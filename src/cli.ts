@@ -178,6 +178,29 @@ program
   .option(...cwdOption)
   .action(async (name: string, options: OptionValues) => done(await cmdAttach({ name, cwd: options.cwd })));
 
+const tuiOptions = (cmd: Command): Command =>
+  cmd
+    .option(...cwdOption)
+    .option("--model <model>", "model for the orchestrator (claude model alias or id)")
+    .option("--fresh", "start a new orchestrator session instead of resuming the saved one")
+    .option("--budget <usd>", "stop the orchestrator after this much spend")
+    .option("--progress-events", "forward worker progress notes to the orchestrator");
+
+const runTui = async (options: OptionValues): Promise<void> => {
+  const { cmdTui } = await import("./tui/index.js");
+  done(
+    await cmdTui({
+      cwd: options.cwd,
+      model: options.model,
+      fresh: options.fresh,
+      budget: options.budget,
+      progressEvents: options.progressEvents,
+    }),
+  );
+};
+
+tuiOptions(program.command("tui", { isDefault: true }).description("open the fleet console (default)")).action(runTui);
+
 program
   .command("mcp")
   .description("serve the fleet tools over stdio as an MCP server (the TUI's orchestrator uses this)")
