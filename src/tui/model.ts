@@ -5,7 +5,8 @@
  */
 import { deriveView, modelLabel, type DerivedView, type RunState } from "../state.js";
 import { summarizeArgs } from "../console/transcript.js";
-import { firstLine, formatAge } from "../util.js";
+import { formatAge } from "../util.js";
+import { parseMarkdownBlock, oneLine, type MdLine, type Span } from "./markdown.js";
 import type { FleetEvent } from "../fleet/events.js";
 import {
   isSystemInit,
@@ -27,6 +28,10 @@ export type OrchestratorLineKind = "user" | "fleet" | "text" | "tool" | "tool_re
 export interface OrchestratorLine {
   kind: OrchestratorLineKind;
   text: string;
+  /** Styled segments for markdown-rendered lines; plain `text` is used when absent. */
+  spans?: Span[];
+  /** The markdown block element this line came from, so the view can style it. */
+  md?: MdLine["kind"];
 }
 
 export interface OrchestratorViewState {
@@ -72,9 +77,21 @@ export type LocalEvent =
 
 const MAX_LINES = 500;
 
+function trim(state: OrchestratorViewState): void {
+  if (state.lines.length > MAX_LINES) state.lines.splice(0, state.lines.length - MAX_LINES);
+}
+
 function push(state: OrchestratorViewState, kind: OrchestratorLineKind, text: string): void {
   for (const line of text.split("\n")) state.lines.push({ kind, text: line });
-  if (state.lines.length > MAX_LINES) state.lines.splice(0, state.lines.length - MAX_LINES);
+  trim(state);
+}
+
+/** Assistant prose is markdown; render it into styled lines rather than dumping the source. */
+function pushMarkdown(state: OrchestratorViewState, text: string): void {
+  for (const line of parseMarkdownBlock(text)) {
+    state.lines.push({ kind: "text", text: line.spans.map((s) => s.text).join(""), spans: line.spans, md: line.kind });
+  }
+  trim(state);
 }
 
 /** `settled add-auth · question db` — a fleet batch as one rail-friendly line. */
@@ -138,7 +155,7 @@ export function reduceOrchestrator(state: OrchestratorViewState, msg: ClaudeStre
     state.turnActive = true;
     state.partial = null;
     const text = textOfAssistant(msg).trim();
-    if (text) push(state, "text", text);
+    if (text) pushMarkdown(state, text);
     for (const tool of toolUsesOf(msg)) {
       state.toolNames[tool.id] = tool.name;
       push(state, "tool", `⚙ ${tool.name} ${summarizeArgs(tool.input)}`.trimEnd());
@@ -160,7 +177,9 @@ export function reduceOrchestrator(state: OrchestratorViewState, msg: ClaudeStre
     }
     for (const result of toolResultsOf(msg)) {
       const name = state.toolNames[result.toolUseId] ?? "tool";
-      const head = firstLine(result.text) || (result.isError ? "(error)" : "(no output)");
+      // tool output can be one enormous line (a whole state.json, a report);
+      // the transcript shows a bounded preview, the tools show the rest
+      const head = oneLine(result.text) || (result.isError ? "(error)" : "(no output)");
       push(state, "tool_result", `  ↳ ${name}: ${head}`);
     }
     return state;

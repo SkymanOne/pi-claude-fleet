@@ -52,11 +52,36 @@ test("a turn: init, our echo, deltas, assistant text and tools, tool results, re
     "text|Spawning add-auth.",
     "text|Two steps.",
     "tool|⚙ mcp__fleet__fleet_spawn add-auth",
-    "tool_result|  ↳ mcp__fleet__fleet_spawn: Spawned add-auth-2026",
+    "tool_result|  ↳ mcp__fleet__fleet_spawn: Spawned add-auth-2026 more",
   ]);
   assert.equal(s.turnActive, false);
   assert.equal(s.costUsd, 0.25);
   assert.equal(s.numTurns, 3);
+});
+
+test("assistant markdown is rendered into styled spans, and huge tool output is bounded", () => {
+  const s = feed([
+    init(),
+    { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "## Findings\n\n1. **medium** — `commands.ts:346` is risky\n\nDone." }] }, parent_tool_use_id: null },
+    { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "t9", name: "mcp__fleet__fleet_status", input: {} }] }, parent_tool_use_id: null },
+    {
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t9", content: JSON.stringify({ lastAssistantText: "y".repeat(4000) }) }] },
+      parent_tool_use_id: null,
+    },
+  ]);
+  const md = s.lines.filter((l) => l.kind === "text");
+  assert.deepEqual(md.map((l) => l.md), ["heading", "text", "bullet", "text", "text"]);
+  assert.equal(md[0].text, "Findings");
+  assert.ok(md[0].spans?.every((sp) => sp.bold));
+  assert.ok(md[2].spans?.some((sp) => sp.bold && sp.text === "medium"));
+  assert.ok(md[2].spans?.some((sp) => sp.code && sp.text === "commands.ts:346"));
+  assert.equal(md[2].text, "1. medium — commands.ts:346 is risky", "the plain text has no markdown syntax left");
+
+  const result = s.lines.find((l) => l.kind === "tool_result")!;
+  assert.ok(result.text.length < 260, `tool result stays bounded (was ${result.text.length})`);
+  assert.ok(result.text.endsWith("…"));
+  assert.equal(result.text.includes("\n"), false);
 });
 
 test("a user message we did not send is rendered; a second init is quiet", () => {
