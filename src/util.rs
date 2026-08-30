@@ -54,6 +54,11 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Serialize `value` as pretty JSON, write it to `<path>.tmp-<pid>-<n>` in the
 /// same directory, fsync, and rename over `path`. Readers see either the old
 /// file or the new one, never a half-written one.
+///
+/// # Errors
+///
+/// Returns `std::io::Error` when serialization fails, or when the write,
+/// fsync or rename fails.
 pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -74,6 +79,10 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Resul
 
 /// Append one JSON line. A single small `write` under O_APPEND keeps
 /// concurrent appenders from interleaving mid-line.
+///
+/// # Errors
+///
+/// Returns `std::io::Error` when serialization or the append fails.
 pub fn append_json_line<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     let line = serde_json::to_string(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -81,6 +90,10 @@ pub fn append_json_line<T: Serialize>(path: &Path, value: &T) -> std::io::Result
 }
 
 /// Append raw text, creating the file when missing.
+///
+/// # Errors
+///
+/// Returns `std::io::Error` when the file cannot be opened or written.
 pub fn append_text(path: &Path, text: &str) -> std::io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(text.as_bytes())
@@ -89,9 +102,8 @@ pub fn append_text(path: &Path, text: &str) -> std::io::Result<()> {
 /// Newest-last tail of a JSONL file; unparsable lines are skipped silently.
 /// A missing file reads as empty — logs are optional by nature.
 pub fn read_jsonl_tail<T: DeserializeOwned>(path: &Path, n: usize) -> Vec<T> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(_) => return Vec::new(),
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
     };
     let lines: Vec<&str> = raw.split('\n').filter(|l| !l.is_empty()).collect();
     lines
@@ -175,10 +187,7 @@ pub fn branch_for(name: &str, run_id: &str) -> String {
 
 /// Text up to the first newline.
 pub fn first_line(s: &str) -> &str {
-    match s.find('\n') {
-        Some(idx) => &s[..idx],
-        None => s,
-    }
+    s.find('\n').map_or(s, |idx| &s[..idx])
 }
 
 /// Compact human age: `30s`, `5m`, `2h`, `3d`.
@@ -254,10 +263,10 @@ pub fn new_id(prefix: &str) -> String {
 /// inside a multi-byte sequence), so the lossy decode below only ever kicks
 /// in for files that were not valid UTF-8 to begin with.
 pub fn read_new_lines(path: &Path, offset: u64) -> (Vec<String>, u64) {
-    let size = match std::fs::metadata(path) {
-        Ok(meta) => meta.len(),
-        Err(_) => return (Vec::new(), offset),
+    let Ok(meta) = std::fs::metadata(path) else {
+        return (Vec::new(), offset);
     };
+    let size = meta.len();
     if size <= offset {
         return (Vec::new(), offset);
     }

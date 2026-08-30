@@ -174,10 +174,7 @@ pub async fn remove_worktree(
     force: bool,
 ) -> anyhow::Result<RemoveWorktreeResult> {
     let mut result = RemoveWorktreeResult::default();
-    if !worktree_path.exists() {
-        // Best effort; a prune failure is not worth failing cleanup over.
-        let _ = git_raw(&["worktree", "prune"], repo_root).await;
-    } else {
+    if worktree_path.exists() {
         let mut args: Vec<&str> = vec!["worktree", "remove"];
         if force {
             args.push("--force");
@@ -195,6 +192,9 @@ pub async fn remove_worktree(
             );
         }
         // non-force: other failures are reported via the result, not thrown.
+    } else {
+        // Best effort; a prune failure is not worth failing cleanup over.
+        let _ = git_raw(&["worktree", "prune"], repo_root).await;
     }
     if let Some(branch) = branch {
         let delete = if force { "-D" } else { "-d" };
@@ -329,9 +329,9 @@ pub(crate) mod test_support {
     use std::time::{Duration, Instant};
 
     /// How long a transient-prone git call may keep being retried.
-    pub(crate) const RETRY_BOUND: Duration = Duration::from_secs(10);
+    pub const RETRY_BOUND: Duration = Duration::from_secs(10);
     /// Pause between retries.
-    pub(crate) const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+    pub const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
     /// Run `git args` in `dir` with a test identity (commits must work on a
     /// machine with no git config), retrying within [`RETRY_BOUND`]: a git
@@ -340,7 +340,7 @@ pub(crate) mod test_support {
     /// anything, and the bound keeps a real breakage from hanging the suite.
     /// Only ever used for setup commands whose retry is safe (`git init` is
     /// idempotent; a failed command left nothing behind to half-apply).
-    pub(crate) fn git_sync(dir: &Path, args: &[&str]) {
+    pub fn git_sync(dir: &Path, args: &[&str]) {
         let deadline = Instant::now() + RETRY_BOUND;
         loop {
             let attempt = std::process::Command::new("git")
@@ -373,7 +373,7 @@ pub(crate) mod test_support {
     }
 
     /// A unique throwaway directory under the OS temp dir.
-    pub(crate) fn tmp_dir(name: &str) -> PathBuf {
+    pub fn tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "{name}-{}-{}",
             std::process::id(),

@@ -572,7 +572,7 @@ pub fn resume_hint(state: &RunState, run_dir: &Path) -> String {
 /// The fleet dir a state file points at, re-materialized as [`FleetPaths`].
 #[must_use]
 pub fn fleet_paths_of(state: &RunState) -> FleetPaths {
-    FleetPaths::new(state.fleet_dir.clone())
+    FleetPaths::new(&state.fleet_dir)
 }
 
 #[cfg(test)]

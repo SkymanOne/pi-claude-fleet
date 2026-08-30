@@ -163,6 +163,11 @@ impl FleetPaths {
     /// Returns whether the `.gitignore` gained an entry. Subdirectories
     /// (`runs/`, `orchestrator/`) are created here too: they are part of the
     /// fixed layout and callers otherwise race to make them.
+    ///
+    /// # Errors
+    ///
+    /// Returns `std::io::Error` when a layout directory cannot be created or
+    /// the `.gitignore` entry cannot be written.
     pub fn ensure(&self) -> std::io::Result<bool> {
         std::fs::create_dir_all(&self.root)?;
         std::fs::create_dir_all(self.runs_dir())?;
@@ -180,15 +185,23 @@ fn git_root_of(dir: &Path) -> PathBuf {
         .output()
         .ok()
         .filter(|out| out.status.success())
-        .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
-        .unwrap_or_else(|| dir.to_path_buf())
+        .map_or_else(
+            || dir.to_path_buf(),
+            |out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()),
+        )
 }
 
 /// Append `entry` to `<root>/.gitignore` unless a line already covers it.
 ///
 /// Introduces the `# parl` marker on first touch. Returns whether the file
 /// changed. Ported from the TypeScript `ensureGitignoreEntry`.
+///
+/// # Errors
+///
+/// Returns `std::io::Error` when the `.gitignore` cannot be opened or
+/// written.
 pub fn ensure_gitignore_entry(root: &Path, entry: &str) -> std::io::Result<bool> {
+    use std::io::Write;
     let gitignore_path = root.join(".gitignore");
     let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
     let lines: Vec<String> = content.split('\n').map(|l| l.trim().to_string()).collect();
@@ -206,7 +219,6 @@ pub fn ensure_gitignore_entry(root: &Path, entry: &str) -> std::io::Result<bool>
         .create(true)
         .append(true)
         .open(&gitignore_path)?;
-    use std::io::Write;
     file.write_all(format!("{prefix}{addition}").as_bytes())?;
     Ok(true)
 }

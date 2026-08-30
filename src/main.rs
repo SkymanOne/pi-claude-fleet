@@ -84,109 +84,100 @@ async fn dispatch(cli: Cli) -> std::process::ExitCode {
             session,
             tools,
             exclude_tools,
-        }) => {
-            finish(
-                ops::spawn::spawn_run(ops::spawn::SpawnRequest {
-                    name,
-                    brief: brief.join(" "),
-                    cwd,
-                    model,
-                    provider,
-                    thinking,
-                    worktree: !no_worktree,
-                    base,
-                    skill,
-                    append_system_prompt,
-                    session,
-                    tools,
-                    exclude_tools,
-                })
-                .await,
-            )
-            .await
-        }
+        }) => finish(
+            ops::spawn::spawn_run(ops::spawn::SpawnRequest {
+                name,
+                brief: brief.join(" "),
+                cwd,
+                model,
+                provider,
+                thinking,
+                worktree: !no_worktree,
+                base,
+                skill,
+                append_system_prompt,
+                session,
+                tools,
+                exclude_tools,
+            })
+            .await,
+        ),
         Some(Command::Status {
             name,
             json,
             all,
             cwd,
-        }) => finish(ops::query::status(name.as_deref(), cwd.as_deref(), json, all).await).await,
+        }) => finish(ops::query::status(name.as_deref(), cwd.as_deref(), json, all).await),
         Some(Command::Wait { name, timeout, cwd }) => {
-            finish(ops::query::wait(&name, cwd.as_deref(), timeout).await).await
+            finish(ops::query::wait(&name, cwd.as_deref(), timeout).await)
         }
         Some(Command::Output { name, tail, cwd }) => {
-            finish(ops::query::output(&name, cwd.as_deref(), tail).await).await
+            finish(ops::query::output(&name, cwd.as_deref(), tail).await)
         }
         Some(Command::Logs { name, tail, cwd }) => {
-            finish(ops::query::logs(&name, cwd.as_deref(), tail).await).await
+            finish(ops::query::logs(&name, cwd.as_deref(), tail).await)
         }
         Some(Command::Send { name, message, cwd }) => {
-            finish(ops::steer::send(&name, cwd.as_deref(), &message.join(" ")).await).await
+            finish(ops::steer::send(&name, cwd.as_deref(), &message.join(" ")).await)
         }
         Some(Command::Followup { name, message, cwd }) => {
-            finish(ops::steer::followup(&name, cwd.as_deref(), &message.join(" ")).await).await
+            finish(ops::steer::followup(&name, cwd.as_deref(), &message.join(" ")).await)
         }
         Some(Command::Answer {
             name,
             message,
             question,
             cwd,
-        }) => {
-            finish(
-                ops::steer::answer(
-                    &name,
-                    cwd.as_deref(),
-                    question.as_deref(),
-                    &message.join(" "),
-                )
-                .await,
+        }) => finish(
+            ops::steer::answer(
+                &name,
+                cwd.as_deref(),
+                question.as_deref(),
+                &message.join(" "),
             )
-            .await
-        }
-        Some(Command::Stop { name, cwd }) => {
-            finish(ops::steer::stop(&name, cwd.as_deref()).await).await
-        }
+            .await,
+        ),
+        Some(Command::Stop { name, cwd }) => finish(ops::steer::stop(&name, cwd.as_deref()).await),
         Some(Command::Report { name, cwd }) => {
-            finish(ops::query::report(&name, cwd.as_deref()).await).await
+            finish(ops::query::report(&name, cwd.as_deref()).await)
         }
         Some(Command::Diff {
             name,
             name_only,
             cwd,
-        }) => finish(ops::integrate::diff(&name, cwd.as_deref(), name_only).await).await,
+        }) => finish(ops::integrate::diff(&name, cwd.as_deref(), name_only).await),
         Some(Command::Merge {
             name,
             no_commit,
             cwd,
-        }) => finish(ops::integrate::merge(&name, cwd.as_deref(), no_commit).await).await,
+        }) => finish(ops::integrate::merge(&name, cwd.as_deref(), no_commit).await),
         Some(Command::Cleanup { target, force, cwd }) => {
-            finish(ops::integrate::cleanup(&target, cwd.as_deref(), force).await).await
+            finish(ops::integrate::cleanup(&target, cwd.as_deref(), force).await)
         }
         Some(Command::Attach { name, tail, cwd }) => {
-            finish(ops::query::attach(&name, cwd.as_deref(), tail).await).await
+            finish(ops::query::attach(&name, cwd.as_deref(), tail).await)
         }
-        Some(Command::Mcp { cwd }) => finish(mcp::server::serve_stdio(cwd.as_deref()).await).await,
+        Some(Command::Mcp { cwd }) => finish(mcp::server::serve_stdio(cwd.as_deref()).await),
         Some(Command::Monitor { fleet_dir, run }) => {
-            finish(worker::monitor::run_monitor(&fleet_dir, &run).await).await
+            finish(worker::monitor::run_monitor(&fleet_dir, &run).await)
         }
         Some(Command::OrchestratorMonitor { fleet_dir }) => {
-            finish(orch::monitor::run_orchestrator_monitor(&fleet_dir).await).await
+            finish(orch::monitor::run_orchestrator_monitor(&fleet_dir).await)
         }
     }
 }
 
 async fn tui_arm(options: tui::app::TuiOptions) -> std::process::ExitCode {
-    finish(tui::app::run_app(options).await).await
+    finish(tui::app::run_app(options).await)
 }
 
-async fn finish(result: anyhow::Result<ExitCode>) -> std::process::ExitCode {
-    match result {
-        Ok(code) => code.into(),
-        Err(err) => {
+fn finish(result: anyhow::Result<ExitCode>) -> std::process::ExitCode {
+    result
+        .unwrap_or_else(|err| {
             eprintln!("parl: {err:#}");
-            ExitCode::Error.into()
-        }
-    }
+            ExitCode::Error
+        })
+        .into()
 }
 
 #[cfg(test)]
