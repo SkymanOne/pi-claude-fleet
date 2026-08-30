@@ -41,15 +41,15 @@ Your choices are remembered, so a restarted orchestrator comes back with the sam
 
 ## Coming and going
 
-Quitting closes the console, nothing else. The orchestrator and its workers are detached processes with their state on disk, so `parl` reopens where you left off: the same claude session, still mid-thought if it was working, with its transcript replayed. A permission prompt raised while no console was open is still waiting for you when you return.
+Quitting closes the console, nothing else. The orchestrators and their workers are detached processes with their state on disk, so `parl` reopens where you left off: the most recently used orchestrator session, still mid-thought if it was working, with its transcript replayed. A permission prompt raised while no console was open is still waiting for you when you return.
 
-If the orchestrator is no longer running, after a reboot or a `/shutdown`, a new one resumes the same claude session under the transcript you already had, with a line marking the seam. `--fresh` is the way to start over.
+If that orchestrator is no longer running, after a reboot or a `/shutdown`, a new one resumes the same claude session under the transcript you already had, with a line marking the seam. `--fresh` is the way to start over.
 
 ## What the orchestrator will not do
 
 It coordinates the work and never types code. `Edit`, `Write` and `NotebookEdit` are disabled for it. It can read the repository and run read-only git commands without asking. Anything else prompts you. Merge conflicts go back to the worker as a rebase brief rather than being fixed in place.
 
-Its brief ships inside the binary, and no file is ever copied into your project. To run a different one, point `$PARL_PROMPT` at a file, or drop one at `<repo>/.parl/orchestrator.md` or `~/.config/parl/orchestrator.md`. Whatever it was actually told, placeholders filled in, is written to `.parl/orchestrator/prompt.md` for you to read.
+Its brief ships inside the binary, and no file is ever copied into your project. To run a different one, point `$PARL_PROMPT` at a file, or drop one at `<repo>/.parl/orchestrator.md` or `~/.parl/orchestrator.md`. Whatever it was actually told, placeholders filled in, is written to `.parl/orchestrators/<session>/prompt.md` for you to read (one directory per orchestrator session). User-level defaults — `[orchestrator] model`, `[worker] model`/`provider`, `[limits] max_workers_per_session` — live in `~/.parl/config.toml`.
 
 ## Where the state lives
 
