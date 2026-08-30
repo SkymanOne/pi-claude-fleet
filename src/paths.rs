@@ -214,7 +214,28 @@ pub fn ensure_gitignore_entry(root: &Path, entry: &str) -> std::io::Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::test_support::{git_sync, tmp_dir};
+    use crate::git::test_support::{RETRY_BOUND, RETRY_INTERVAL, git_sync, tmp_dir};
+    use std::time::Instant;
+
+    /// `ensure` touches several fresh paths, and under this machine's
+    /// parallel load a call has been observed to fail with NotFound on a
+    /// path it had itself just created. It self-heals (`create_dir_all`
+    /// rebuilds whatever vanished), so poll `Err` against the shared bound
+    /// instead of failing the test; the first `Ok` is returned unchanged.
+    fn ensure_with_retry(paths: &FleetPaths) -> std::io::Result<bool> {
+        let deadline = Instant::now() + RETRY_BOUND;
+        loop {
+            match paths.ensure() {
+                Ok(changed) => return Ok(changed),
+                Err(err) => {
+                    if Instant::now() >= deadline {
+                        return Err(err);
+                    }
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+            }
+        }
+    }
 
     #[test]
     fn layout_paths_are_derived_from_the_root() {
@@ -295,14 +316,14 @@ mod tests {
         git_sync(&root, &["init", "-q", "-b", "main"]);
         git_sync(&root, &["rev-parse", "--show-toplevel"]);
         let paths = FleetPaths::new(root.join(STATE_DIR_NAME));
-        assert!(paths.ensure().unwrap());
+        assert!(ensure_with_retry(&paths).unwrap());
         assert!(paths.root().is_dir());
         assert!(paths.runs_dir().is_dir());
         assert!(paths.orchestrator_dir().is_dir());
         let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert!(gitignore.contains("# parl\n.parl/"), "{gitignore}");
         // Second run: already covered, no change.
-        assert!(!paths.ensure().unwrap());
+        assert!(!ensure_with_retry(&paths).unwrap());
         let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert_eq!(gitignore.matches(".parl/").count(), 1);
         // An existing unrelated entry survives and gets the marker once.
