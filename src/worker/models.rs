@@ -146,13 +146,16 @@ mod tests {
     }
 
     /// The `sh <script>` listing can transiently come back empty under
-    /// full-suite parallel load (the spawn fails a moment after the script is
-    /// written). The production code correctly refuses to cache an empty
-    /// listing — an empty answer means pi could not be asked, never a
-    /// definitive none — so the test polls until a real one arrives; a
-    /// listing that never fills still fails the test, via the bound.
+    /// full-suite parallel load (the spawn fails, or hangs out its full
+    /// internal [`LIST_TIMEOUT`]). The production code correctly refuses to
+    /// cache an empty listing — an empty answer means pi could not be asked,
+    /// never a definitive none — so the test polls until a real one arrives.
+    /// The bound has to outlive one full timed-out attempt plus the shared
+    /// retry budget, or the first slow attempt eats the whole window and the
+    /// poll never gets a second try; a listing that never fills still fails
+    /// the test, via the bound.
     async fn listed_models(pi: &str) -> Vec<String> {
-        let deadline = Instant::now() + RETRY_BOUND;
+        let deadline = Instant::now() + RETRY_BOUND + 2 * LIST_TIMEOUT;
         loop {
             let models = list_models(pi).await;
             if !models.is_empty() {
