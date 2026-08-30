@@ -534,6 +534,207 @@ fn mcp_serves_the_fleet_tools_over_stdio() {
 }
 
 // ---------------------------------------------------------------------------
+// 5. Requirements that travel inside the binary.
+// ---------------------------------------------------------------------------
+
+/// The orchestrator prompt is embedded in the binary and renders with every
+/// placeholder substituted.
+#[test]
+fn the_embedded_orchestrator_prompt_renders_with_placeholders_substituted() {
+    use parl::orch::prompt::{PromptVars, render_orchestrator_prompt};
+
+    assert!(
+        parl::orch::prompt::ORCHESTRATOR_PROMPT_TEMPLATE.contains("{{FLEET_DIR}}"),
+        "the shipped template is the placeholdered source"
+    );
+    let rendered = render_orchestrator_prompt(&PromptVars {
+        fleet_dir: "/repo/.parl".into(),
+        repo_root: "/repo".into(),
+        max_workers: Some(2),
+        bin_name: None,
+    });
+    assert!(rendered.starts_with("# Fleet orchestrator"), "{rendered}");
+    assert!(
+        !rendered.contains("{{"),
+        "all placeholders rendered: {rendered}"
+    );
+    assert!(rendered.contains("`/repo/.parl`"), "{rendered}");
+    assert!(rendered.contains("`/repo`"), "{rendered}");
+    assert!(rendered.contains("At most 2 workers"), "{rendered}");
+    assert!(rendered.contains("`parl`"), "{rendered}");
+}
+
+/// The override chain: `$PARL_PROMPT` wins, then `<repo>/.parl/orchestrator.md`,
+/// then `~/.config/parl/orchestrator.md`, then the embedded copy. A dangling
+/// `$PARL_PROMPT` is an error, never a silent fallback. The home directory is
+/// injected, so the real `$HOME` is never touched.
+#[test]
+fn the_prompt_override_chain_resolves_in_order() {
+    use parl::orch::prompt::resolve_prompt_source;
+
+    let (_tmp, repo) = plain_dir();
+    let parl_dir = repo.join(parl::paths::STATE_DIR_NAME);
+    std::fs::create_dir_all(&parl_dir).unwrap();
+    let home_tmp = tempfile::tempdir().unwrap();
+    let home = home_tmp.path();
+
+    // Nothing anywhere: the embedded copy.
+    assert_eq!(
+        resolve_prompt_source(None, &repo, Some(home)).unwrap(),
+        None
+    );
+
+    // ~/.config/parl/orchestrator.md next.
+    let user = home.join(".config/parl/orchestrator.md");
+    std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+    std::fs::write(&user, "user override").unwrap();
+    assert_eq!(
+        resolve_prompt_source(None, &repo, Some(home)).unwrap(),
+        Some(user.clone())
+    );
+
+    // <repo>/.parl/orchestrator.md beats the user config.
+    let repo_override = parl_dir.join("orchestrator.md");
+    std::fs::write(&repo_override, "repo override").unwrap();
+    assert_eq!(
+        resolve_prompt_source(None, &repo, Some(home)).unwrap(),
+        Some(repo_override)
+    );
+
+    // $PARL_PROMPT (a path) beats everything.
+    let env_file = repo.join("custom.md");
+    std::fs::write(&env_file, "env override").unwrap();
+    assert_eq!(
+        resolve_prompt_source(Some(env_file.to_str().unwrap()), &repo, Some(home)).unwrap(),
+        Some(env_file)
+    );
+
+    // A dangling $PARL_PROMPT is user intent gone wrong: an error.
+    let err = resolve_prompt_source(
+        Some(repo.join("missing.md").to_str().unwrap()),
+        &repo,
+        Some(home),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("not a file"), "{err}");
+
+    // The rendered prompt honours the repo override (no $PARL_PROMPT in this
+    // environment), so what claude reads is the override, rendered.
+    if std::env::var_os(parl::paths::env_var("PROMPT")).is_none() {
+        let rendered = parl::orch::prompt::render_prompt(&parl_dir, &repo).unwrap();
+        assert!(
+            rendered.contains("repo override") && !rendered.contains("{{"),
+            "{rendered}"
+        );
+    }
+}
+
+/// Spawning copies nothing prompt-shaped into the project: the repo only
+/// gains the gitignored state dir and the `.gitignore` entry.
+#[test]
+fn spawning_copies_nothing_into_the_project() {
+    let _serial = serial();
+    let (_tmp, root) = init_repo();
+    let run_id = spawn_ok(&root, "copycat", "b", &fake_pi(), &[], &["--no-worktree"]);
+    reap_monitor(&root, &run_id);
+
+    let status = StdCommand::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout).trim(),
+        "?? .gitignore",
+        "the only project change is the gitignore entry"
+    );
+    for outside in [
+        root.join("orchestrator.md"),
+        root.join("prompt.md"),
+        root.join("prompts"),
+    ] {
+        assert!(!path_exists(&outside), "{}", outside.display());
+    }
+}
+
+/// The pi worker extension and report skill are materialized from the
+/// binary into the fleet dir — never read from a source checkout — and pi is
+/// invoked with those paths. A stale file is rewritten; an identical one is
+/// left alone.
+#[test]
+fn the_worker_extension_is_materialized_from_the_binary() {
+    use parl::worker::monitor::{FLEET_EXTENSION_TS, FLEET_SKILL_MD};
+
+    let _serial = serial();
+    let (_tmp, root) = init_repo();
+    let fleet = root
+        .canonicalize()
+        .unwrap()
+        .join(parl::paths::STATE_DIR_NAME);
+    let extension = fleet.join("pi/extensions/fleet-worker.ts");
+    let skill = fleet.join("pi/skills/fleet-worker-report/SKILL.md");
+
+    // A stale extension (different contents) must be rewritten; an identical
+    // skill must be left alone (content-identical, so no write, no mtime
+    // bump — the sleep guards against coarse-grained filesystem timestamps).
+    std::fs::create_dir_all(extension.parent().unwrap()).unwrap();
+    std::fs::write(&extension, "// stale install\n").unwrap();
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(&skill, FLEET_SKILL_MD).unwrap();
+    let skill_mtime = std::fs::metadata(&skill).unwrap().modified().unwrap();
+    std::thread::sleep(Duration::from_millis(1200));
+
+    let argv_file = root.join("argv.json");
+    let run_id = spawn_ok(
+        &root,
+        "extworker",
+        "b",
+        &fake_pi(),
+        &[("FAKE_PI_ARGV_FILE", argv_file.to_str().unwrap())],
+        &["--no-worktree"],
+    );
+    settled(&root, "extworker");
+    reap_monitor(&root, &run_id);
+
+    // Rewritten from the embedded copy:
+    assert_eq!(
+        std::fs::read_to_string(&extension).unwrap(),
+        FLEET_EXTENSION_TS,
+        "a stale extension is replaced with the binary's copy"
+    );
+    // The identical skill was not touched:
+    assert_eq!(std::fs::read_to_string(&skill).unwrap(), FLEET_SKILL_MD);
+    assert_eq!(
+        std::fs::metadata(&skill).unwrap().modified().unwrap(),
+        skill_mtime,
+        "an identical file is left alone"
+    );
+
+    // pi was invoked with the materialized paths, which live under the
+    // fleet dir — not the source checkout's `pi/` tree.
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(&argv_file).unwrap()).unwrap();
+    let pair = |flag: &str| {
+        argv.iter()
+            .rposition(|a| a == flag)
+            .map(|at| argv[at + 1].as_str())
+    };
+    assert_eq!(
+        pair("--extension"),
+        Some(extension.to_str().unwrap()),
+        "{argv:?}"
+    );
+    assert_eq!(pair("--skill"), Some(skill.to_str().unwrap()), "{argv:?}");
+    assert!(extension.starts_with(&fleet), "{extension:?}");
+    // The materialized files are the worker protocol: the skill keeps the
+    // report template, the extension speaks the PARL layout.
+    assert!(FLEET_SKILL_MD.starts_with("---\nname: fleet-worker-report\n"));
+    assert!(FLEET_SKILL_MD.contains("## Steering received"));
+    assert!(FLEET_EXTENSION_TS.contains("PARL_RUN"));
+    assert!(!FLEET_EXTENSION_TS.contains("PI_FLEET"));
+}
+
+// ---------------------------------------------------------------------------
 // 4. The `.parl` layout — gitignore hygiene and the orchestrator's half.
 // ---------------------------------------------------------------------------
 
