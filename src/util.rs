@@ -1,0 +1,429 @@
+//! Shared helpers: ids, timestamps, atomic writes, JSONL framing.
+//!
+//! Ported from the TypeScript `src/util.ts`; the behaviours its tests pin down
+//! (framing across chunk boundaries, offsets that never split a line, atomic
+//! rename) carry over unchanged.
+
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use time::macros::format_description;
+
+/// Worker branches are cut as `<prefix>/<name>-<last 7 of the run id>`.
+pub const BRANCH_PREFIX: &str = "parl";
+
+/// Result of [`split_json_lines`]: complete lines plus the unfinished tail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitResult {
+    pub lines: Vec<String>,
+    pub rest: String,
+}
+
+/// Strict JSONL framing: split on `\n` only, strip one trailing `\r`.
+/// A chunk boundary may fall anywhere; the partial tail comes back as `rest`
+/// and is prepended to the next chunk.
+pub fn split_json_lines(chunk: &str, prev_rest: &str) -> SplitResult {
+    let buffer = format!("{prev_rest}{chunk}");
+    let mut lines = Vec::new();
+    let mut rest = buffer.as_str();
+    while let Some(idx) = rest.find('\n') {
+        let mut line = &rest[..idx];
+        rest = &rest[idx + 1..];
+        if let Some(stripped) = line.strip_suffix('\r') {
+            line = stripped;
+        }
+        lines.push(line.to_string());
+    }
+    SplitResult {
+        lines,
+        rest: rest.to_string(),
+    }
+}
+
+/// Monotonic-per-process sequence so overlapping writes from one process
+/// never share a temp path.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Serialize `value` as pretty JSON, write it to `<path>.tmp-<pid>-<n>` in the
+/// same directory, fsync, and rename over `path`. Readers see either the old
+/// file or the new one, never a half-written one.
+pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(
+        "{}.tmp-{}-{seq}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    let mut file = File::create(&tmp)?;
+    file.write_all(json.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+}
+
+/// Append one JSON line. A single small `write` under O_APPEND keeps
+/// concurrent appenders from interleaving mid-line.
+pub fn append_json_line<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let line = serde_json::to_string(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    append_text(path, &format!("{line}\n"))
+}
+
+/// Append raw text, creating the file when missing.
+pub fn append_text(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(text.as_bytes())
+}
+
+/// Newest-last tail of a JSONL file; unparsable lines are skipped silently.
+/// A missing file reads as empty — logs are optional by nature.
+pub fn read_jsonl_tail<T: DeserializeOwned>(path: &Path, n: usize) -> Vec<T> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(_) => return Vec::new(),
+    };
+    let lines: Vec<&str> = raw.split('\n').filter(|l| !l.is_empty()).collect();
+    lines
+        .iter()
+        .rev()
+        .take(n)
+        .rev()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Last `n` lines of a text file, without the trailing newline.
+pub fn tail_text(path: &Path, n_lines: usize) -> String {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let body = raw.strip_suffix('\n').unwrap_or(&raw);
+    if body.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = body.split('\n').collect();
+    let start = lines.len().saturating_sub(n_lines);
+    lines[start..].join("\n")
+}
+
+/// Current time as RFC3339 UTC with exactly millisecond precision
+/// (`2026-08-30T12:00:00.000Z`), matching the old JS `toISOString()`.
+pub fn now_iso() -> String {
+    iso_at(OffsetDateTime::now_utc())
+}
+
+/// Same format, for a fixed instant (tests, reproducible envelopes).
+pub fn iso_at(at: OffsetDateTime) -> String {
+    let fmt =
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
+    // Rendering a UTC datetime with this description cannot fail.
+    at.format(&fmt).unwrap_or_default()
+}
+
+/// Milliseconds since the Unix epoch.
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse an RFC3339 timestamp into milliseconds since the epoch.
+pub fn parse_ts_ms(ts: &str) -> Option<i64> {
+    OffsetDateTime::parse(ts, &Rfc3339)
+        .ok()
+        .map(|dt| (dt.unix_timestamp_nanos() / 1_000_000) as i64)
+}
+
+/// `YYYYMMDDHHMMSS` in UTC — the 14-digit run stamp.
+fn stamp(at: OffsetDateTime) -> String {
+    let fmt = format_description!("[year][month][day][hour][minute][second]");
+    at.format(&fmt).unwrap_or_default()
+}
+
+/// Run id for a worker started now: `<name>-<14-digit UTC stamp>`.
+pub fn run_id_for(name: &str) -> String {
+    run_id_for_at(name, OffsetDateTime::now_utc())
+}
+
+/// [`run_id_for`] at a fixed instant.
+pub fn run_id_for_at(name: &str, at: OffsetDateTime) -> String {
+    format!("{name}-{}", stamp(at))
+}
+
+/// Last 7 characters of a run id, as used in branch names.
+pub fn short7(run_id: &str) -> &str {
+    let start = run_id.len().saturating_sub(7);
+    &run_id[start..]
+}
+
+/// The worker's branch: `parl/<name>-<short7>`.
+pub fn branch_for(name: &str, run_id: &str) -> String {
+    format!("{BRANCH_PREFIX}/{name}-{}", short7(run_id))
+}
+
+/// Text up to the first newline.
+pub fn first_line(s: &str) -> &str {
+    match s.find('\n') {
+        Some(idx) => &s[..idx],
+        None => s,
+    }
+}
+
+/// Compact human age: `30s`, `5m`, `2h`, `3d`.
+pub fn format_age(ms: i64) -> String {
+    if ms < 60_000 {
+        format!("{}s", ms.div_euclid(1000))
+    } else if ms < 3_600_000 {
+        format!("{}m", ms.div_euclid(60_000))
+    } else if ms < 86_400_000 {
+        format!("{}h", ms.div_euclid(3_600_000))
+    } else {
+        format!("{}d", ms.div_euclid(86_400_000))
+    }
+}
+
+/// Run/branch-safe name: lowercase kebab-case, no leading/trailing hyphens.
+pub fn sanitize_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut pending_dash = false;
+    for c in name.to_lowercase().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(c);
+        } else {
+            pending_dash = true;
+        }
+    }
+    out
+}
+
+fn base36(mut value: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".to_string();
+    }
+    let mut out = Vec::new();
+    while value > 0 {
+        out.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// Short unique id: `<prefix>_<time36>_<random6>`; sortable enough for logs.
+pub fn new_id(prefix: &str) -> String {
+    let millis = now_ms().max(0) as u64;
+    let random: u64 = rand::random();
+    format!(
+        "{prefix}_{}_{:06}",
+        base36(millis),
+        base36(random % 36u64.pow(6))
+    )
+}
+
+/// Read the complete lines appended to `path` after byte `offset`.
+///
+/// The returned offset sits just past the last `\n` seen, so a partial
+/// trailing line is re-read on the next call instead of being split. An
+/// offset produced here is always a UTF-8 char boundary (`\n` cannot appear
+/// inside a multi-byte sequence), so the lossy decode below only ever kicks
+/// in for files that were not valid UTF-8 to begin with.
+pub fn read_new_lines(path: &Path, offset: u64) -> (Vec<String>, u64) {
+    let size = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(_) => return (Vec::new(), offset),
+    };
+    if size <= offset {
+        return (Vec::new(), offset);
+    }
+    let mut buf = vec![0u8; (size - offset) as usize];
+    let Ok(mut file) = File::open(path) else {
+        return (Vec::new(), offset);
+    };
+    if file.seek(SeekFrom::Start(offset)).is_err() || file.read_exact(&mut buf).is_err() {
+        // Shrank between stat and read; treat as nothing new this round.
+        return (Vec::new(), offset);
+    }
+    let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') else {
+        return (Vec::new(), offset);
+    };
+    let text = String::from_utf8_lossy(&buf[..=last_nl]);
+    let result = split_json_lines(&text, "");
+    (
+        result.lines.into_iter().filter(|l| !l.is_empty()).collect(),
+        offset + last_nl as u64 + 1,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            new_id("t").replace('_', "")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn split_json_lines_strict_framing_across_chunk_boundaries() {
+        let payload = "{\"a\":\"xy\"}\n{\"b\":\"c\"}\r\n";
+        let mut rest = String::new();
+        let mut acc = Vec::new();
+        for chunk in [&payload[..7], &payload[7..]] {
+            let mut r = split_json_lines(chunk, &rest);
+            acc.append(&mut r.lines);
+            rest = r.rest;
+        }
+        assert_eq!(acc, vec!["{\"a\":\"xy\"}", "{\"b\":\"c\"}"]);
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn split_json_lines_u2028_is_not_a_delimiter() {
+        let r = split_json_lines("{\"a\":\"x\u{2028}y\"}\n", "");
+        assert_eq!(r.lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&r.lines[0]).unwrap();
+        assert_eq!(parsed["a"], "x\u{2028}y");
+    }
+
+    #[test]
+    fn split_json_lines_keeps_incomplete_tail() {
+        let r = split_json_lines("{\"a\":1}\n{\"b\":", "");
+        assert_eq!(r.lines, vec!["{\"a\":1}"]);
+        assert_eq!(r.rest, "{\"b\":");
+    }
+
+    #[test]
+    fn atomic_write_json_round_trips_without_tmp_files() {
+        let dir = tmp_dir("parl-util-");
+        let path = dir.join("state.json");
+        atomic_write_json(&path, &serde_json::json!({ "a": 1 })).unwrap();
+        atomic_write_json(&path, &serde_json::json!({ "a": 2 })).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&raw).unwrap(),
+            serde_json::json!({ "a": 2 })
+        );
+        let mut entries: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec!["state.json"]);
+    }
+
+    #[test]
+    fn append_json_line_then_read_jsonl_tail_returns_newest_last_slice() {
+        let dir = tmp_dir("parl-util-");
+        let path = dir.join("events.jsonl");
+        for i in 0..5 {
+            append_json_line(&path, &serde_json::json!({ "i": i })).unwrap();
+        }
+        let tail: Vec<serde_json::Value> = read_jsonl_tail(&path, 3);
+        let got: Vec<i64> = tail.iter().map(|v| v["i"].as_i64().unwrap()).collect();
+        assert_eq!(got, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn run_id_and_branch_formats_are_utc() {
+        let at = OffsetDateTime::parse("2026-08-28T14:15:30Z", &Rfc3339).unwrap();
+        let id = run_id_for_at("auth-worker", at);
+        assert_eq!(id, "auth-worker-20260828141530");
+        assert_eq!(short7(&id), "8141530");
+        assert_eq!(branch_for("auth-worker", &id), "parl/auth-worker-8141530");
+        assert_eq!(first_line("a\nb"), "a");
+        assert_eq!(first_line("solo"), "solo");
+    }
+
+    #[test]
+    fn now_iso_has_millisecond_precision() {
+        let ts = now_iso();
+        assert_eq!(ts.len(), 24, "{ts}");
+        assert!(ts.ends_with('Z'), "{ts}");
+        assert_eq!(&ts[10..11], "T");
+        assert_eq!(&ts[19..20], ".");
+        assert!(parse_ts_ms(&ts).is_some());
+    }
+
+    #[test]
+    fn format_age_renders_compact_ages() {
+        assert_eq!(format_age(30_000), "30s");
+        assert_eq!(format_age(5 * 60_000), "5m");
+        assert_eq!(format_age(125 * 60_000), "2h");
+        assert_eq!(format_age(3 * 86_400_000), "3d");
+    }
+
+    #[test]
+    fn sanitize_name_kebab_cases() {
+        assert_eq!(sanitize_name("Auth Worker 2!"), "auth-worker-2");
+        assert_eq!(sanitize_name("--x--"), "x");
+        assert_eq!(sanitize_name("über"), "ber");
+    }
+
+    #[test]
+    fn new_id_has_prefix_time_and_random_parts() {
+        let id = new_id("m");
+        let mut parts = id.split('_');
+        assert_eq!(parts.next(), Some("m"));
+        let time = parts.next().unwrap();
+        let rand = parts.next().unwrap();
+        assert!(!time.is_empty());
+        assert_eq!(rand.len(), 6);
+        assert!(id.starts_with("m_"));
+    }
+
+    #[test]
+    fn read_new_lines_advances_only_past_complete_lines() {
+        let dir = tmp_dir("parl-util-");
+        let path = dir.join("inbox.jsonl");
+        std::fs::write(&path, "{\"a\":1}\n{\"b\":").unwrap();
+        let (lines, offset) = read_new_lines(&path, 0);
+        assert_eq!(lines, vec!["{\"a\":1}"]);
+        assert_eq!(offset, 8);
+        // Multi-byte character split across calls must survive the boundary.
+        append_text(&path, "\"é\"}\r\n").unwrap();
+        let (lines, offset2) = read_new_lines(&path, offset);
+        assert_eq!(lines, vec!["{\"b\":\"é\"}"]);
+        assert_eq!(offset2, std::fs::metadata(&path).unwrap().len());
+        let (lines, offset3) = read_new_lines(&path, offset2);
+        assert!(lines.is_empty());
+        assert_eq!(offset3, offset2);
+        let (lines, offset4) = read_new_lines(&dir.join("missing.jsonl"), 0);
+        assert!(lines.is_empty());
+        assert_eq!(offset4, 0);
+    }
+
+    #[test]
+    fn tail_text_ignores_the_trailing_newline() {
+        let dir = tmp_dir("parl-util-");
+        let path = dir.join("rpc.log");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        assert_eq!(tail_text(&path, 2), "b\nc");
+        assert_eq!(tail_text(&path, 10), "a\nb\nc");
+        std::fs::write(&path, "a\nb").unwrap();
+        assert_eq!(tail_text(&path, 1), "b");
+        assert_eq!(tail_text(&dir.join("missing"), 3), "");
+    }
+}

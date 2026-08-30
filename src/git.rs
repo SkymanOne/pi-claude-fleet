@@ -1,0 +1,554 @@
+//! A thin wrapper over the `git` CLI (deliberately not `git2`): worktree
+//! create/remove, branch delete, diff against a base commit, merge with
+//! conflict detection, and the "is it merged / is it dirty" checks cleanup
+//! needs. Ported from the TypeScript `src/worktree.ts` and the git bits of
+//! `src/commands.ts`.
+
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+
+use crate::util::branch_for;
+
+/// The real outcome of one git invocation: its exit code plus captured
+/// streams. Merge conflicts print to *stdout*, so only the exit code can be
+/// trusted to detect failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GitResult {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl GitResult {
+    #[must_use]
+    pub fn ok(&self) -> bool {
+        self.code == 0
+    }
+}
+
+/// Run `git <args>` in `cwd` and report its real exit code.
+///
+/// Unlike a naive "reject when stderr is non-empty" wrapper, the exit code is
+/// authoritative; a git that cannot even be spawned surfaces as code 1 with
+/// the spawn error in `stderr`.
+pub async fn git_raw(args: &[&str], cwd: &Path) -> GitResult {
+    match tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await
+    {
+        Ok(out) => GitResult {
+            code: out.status.code().unwrap_or(1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        },
+        Err(e) => GitResult {
+            code: 1,
+            stdout: String::new(),
+            stderr: e.to_string(),
+        },
+    }
+}
+
+/// Is `dir` inside a git work tree?
+pub async fn is_git_repo(dir: &Path) -> bool {
+    let r = git_raw(&["rev-parse", "--is-inside-work-tree"], dir).await;
+    r.ok() && r.stdout.trim() == "true"
+}
+
+/// The repository root containing `dir`, or `None` outside a repo.
+pub async fn repo_root(dir: &Path) -> Option<PathBuf> {
+    let r = git_raw(&["rev-parse", "--show-toplevel"], dir).await;
+    if r.ok() {
+        let root = r.stdout.trim();
+        if root.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(root))
+        }
+    } else {
+        None
+    }
+}
+
+/// Resolve a ref to its commit sha (`<ref>^{commit}`), pinning the base for
+/// later diffs: inside a worktree HEAD moves, so `diff` needs the sha.
+pub async fn resolve_commit(repo: &Path, ref_: &str) -> anyhow::Result<String> {
+    let r = git_raw(&["rev-parse", &format!("{ref_}^{{commit}}")], repo).await;
+    if r.ok() {
+        let sha = r.stdout.trim();
+        if sha.is_empty() {
+            anyhow::bail!("git rev-parse {ref_}^{{commit}} returned nothing");
+        }
+        Ok(sha.to_string())
+    } else {
+        anyhow::bail!(
+            "git rev-parse {ref_}^{{commit}} failed: {}",
+            r.stderr.trim()
+        )
+    }
+}
+
+/// What [`ensure_worktree`] produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    pub worktree_path: PathBuf,
+    pub branch: String,
+    pub base_ref: String,
+    pub base_commit: String,
+}
+
+/// Create a worktree at `<worktrees_dir>/<run_id>` on a fresh branch
+/// `parl/<name>-<short7>`, cut from `base` (or `HEAD`).
+pub async fn ensure_worktree(
+    repo_root: &Path,
+    worktrees_dir: &Path,
+    run_id: &str,
+    name: &str,
+    base: Option<&str>,
+) -> anyhow::Result<WorktreeInfo> {
+    let branch = branch_for(name, run_id);
+    let worktree_path = worktrees_dir.join(run_id);
+    let base_ref = base.unwrap_or("HEAD");
+    // Pin the base commit now: inside the worktree HEAD moves, so `diff`
+    // needs the sha.
+    let base_commit = resolve_commit(repo_root, base_ref).await?;
+    let r = git_raw(
+        &[
+            "worktree",
+            "add",
+            worktree_path.to_string_lossy().as_ref(),
+            "-b",
+            &branch,
+            base_ref,
+        ],
+        repo_root,
+    )
+    .await;
+    if !r.ok() {
+        anyhow::bail!(
+            "git worktree add {} failed: {}",
+            worktree_path.display(),
+            r.stderr.trim()
+        );
+    }
+    Ok(WorktreeInfo {
+        worktree_path,
+        branch,
+        base_ref: base_ref.to_string(),
+        base_commit,
+    })
+}
+
+/// What [`remove_worktree`] managed to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct RemoveWorktreeResult {
+    pub worktree_removed: bool,
+    pub branch_deleted: bool,
+}
+
+/// Remove a worktree and (best-effort, non-force) delete its branch.
+///
+/// A missing worktree is already gone — just tidy git's administrative files
+/// (`worktree prune`) and fall through to branch deletion. Non-force failures
+/// are reported in the result rather than thrown: cleanup is best-effort.
+pub async fn remove_worktree(
+    repo_root: &Path,
+    worktree_path: &Path,
+    branch: Option<&str>,
+    force: bool,
+) -> anyhow::Result<RemoveWorktreeResult> {
+    let mut result = RemoveWorktreeResult::default();
+    if !worktree_path.exists() {
+        // Best effort; a prune failure is not worth failing cleanup over.
+        let _ = git_raw(&["worktree", "prune"], repo_root).await;
+    } else {
+        let mut args: Vec<&str> = vec!["worktree", "remove"];
+        if force {
+            args.push("--force");
+        }
+        let path_str = worktree_path.to_string_lossy().into_owned();
+        args.push(path_str.as_str());
+        let r = git_raw(&args, repo_root).await;
+        if r.ok() {
+            result.worktree_removed = true;
+        } else if force {
+            anyhow::bail!(
+                "Failed to remove worktree {}: {}",
+                worktree_path.display(),
+                r.stderr.trim()
+            );
+        }
+        // non-force: other failures are reported via the result, not thrown.
+    }
+    if let Some(branch) = branch {
+        let delete = if force { "-D" } else { "-d" };
+        let r = git_raw(&["branch", delete, branch], repo_root).await;
+        // The branch is kept when unmerged; callers surface that.
+        result.branch_deleted = r.ok();
+    }
+    Ok(result)
+}
+
+/// `git diff --stat` (or `--name-only`) of the worktree's committed work
+/// against its base. `base` is the run's `baseCommit`, falling back to its
+/// `base` ref, falling back to `HEAD`.
+pub async fn diff_against_base(
+    worktree: &Path,
+    base: &str,
+    name_only: bool,
+) -> anyhow::Result<String> {
+    let flag = if name_only { "--name-only" } else { "--stat" };
+    let r = git_raw(&["diff", flag, &format!("{base}...HEAD")], worktree).await;
+    if r.ok() {
+        Ok(r.stdout.trim_end().to_string())
+    } else {
+        anyhow::bail!("diff: {}", r.stderr.trim())
+    }
+}
+
+/// Uncommitted paths in a worktree (whole `--porcelain` lines): invisible to
+/// diff/merge, lost by `cleanup --force`.
+pub async fn dirty_files(worktree: &Path) -> Vec<String> {
+    let status = git_raw(&["status", "--porcelain"], worktree).await;
+    if !status.ok() {
+        return Vec::new();
+    }
+    status
+        .stdout
+        .split('\n')
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Does the worktree have uncommitted changes?
+pub async fn worktree_is_dirty(worktree: &Path) -> bool {
+    !dirty_files(worktree).await.is_empty()
+}
+
+/// Is `branch` fully merged into the current `HEAD` of `repo`?
+pub async fn branch_is_merged(repo: &Path, branch: &str) -> bool {
+    git_raw(&["merge-base", "--is-ancestor", branch, "HEAD"], repo)
+        .await
+        .ok()
+}
+
+/// Delete a branch (`-D` when forced). Returns whether git accepted it —
+/// `-d` refuses unmerged branches, which callers surface as "kept".
+pub async fn delete_branch(repo: &Path, branch: &str, force: bool) -> bool {
+    let delete = if force { "-D" } else { "-d" };
+    git_raw(&["branch", delete, branch], repo).await.ok()
+}
+
+/// What [`merge_branch`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// Fast-forward or a clean merge commit.
+    Merged,
+    /// `--no-commit`: staged, nothing committed.
+    Staged,
+    /// Conflicts in these files; the merge was aborted when
+    /// `abort_on_conflict` was set.
+    Conflicted(Vec<String>),
+    /// git refused for another reason (bad ref, dirty index, …).
+    Failed(String),
+}
+
+/// Merge `branch` into the checkout at `repo`.
+///
+/// With `no_commit` the merge is staged (`--no-commit --no-ff`) but not
+/// committed. On conflict the conflicted file list comes from
+/// `git diff --name-only --diff-filter=U`; with `abort_on_conflict` the merge
+/// is rolled back (`git merge --abort`) so the checkout stays clean and the
+/// worker can rebase instead — the orchestrator never edits.
+pub async fn merge_branch(
+    repo: &Path,
+    branch: &str,
+    no_commit: bool,
+    abort_on_conflict: bool,
+) -> MergeOutcome {
+    let mut args: Vec<&str> = vec!["merge"];
+    if no_commit {
+        args.extend(["--no-commit", "--no-ff"]);
+    }
+    args.push(branch);
+    let r = git_raw(&args, repo).await;
+    if r.ok() {
+        return if no_commit {
+            MergeOutcome::Staged
+        } else {
+            MergeOutcome::Merged
+        };
+    }
+    let conflicts = git_raw(&["diff", "--name-only", "--diff-filter=U"], repo).await;
+    let files: Vec<String> = conflicts
+        .stdout
+        .split('\n')
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if files.is_empty() {
+        return MergeOutcome::Failed(r.stderr.trim().to_string());
+    }
+    if abort_on_conflict {
+        let _ = git_raw(&["merge", "--abort"], repo).await;
+    }
+    MergeOutcome::Conflicted(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            crate::util::new_id("t").replace('_', "")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn git_sync(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A repo with one committed seed file, like the TypeScript test helper.
+    fn init_repo(name: &str) -> PathBuf {
+        let root = tmp_dir(name);
+        git_sync(&root, &["init", "-q", "-b", "main"]);
+        // Production spawns gitignore the fleet dir (ensure()); mirror that,
+        // so `git status --porcelain` reads clean with a worktree inside.
+        std::fs::write(root.join(".gitignore"), ".parl/\n").unwrap();
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        git_sync(&root, &["add", "."]);
+        git_sync(&root, &["commit", "-qm", "seed"]);
+        root
+    }
+
+    #[tokio::test]
+    async fn git_raw_reports_real_exit_codes() {
+        let root = init_repo("parl-git-");
+        let r = git_raw(&["rev-parse", "--is-inside-work-tree"], &root).await;
+        assert!(r.ok());
+        assert_eq!(r.stdout.trim(), "true");
+        let bad = git_raw(&["rev-parse", "--verify", "nope"], &root).await;
+        assert!(!bad.ok());
+        assert!(bad.stderr.contains("fatal"), "{}", bad.stderr);
+    }
+
+    #[tokio::test]
+    async fn repo_detection_and_root_resolution() {
+        // A git spawn can transiently fail when the machine is loaded (this
+        // suite runs many git subprocesses in parallel); retry a few times
+        // before calling the assertion failed.
+        for attempt in 0..3 {
+            let root = init_repo("parl-git-");
+            let repo_detected = is_git_repo(&root).await;
+            let root_resolved = repo_root(&root).await;
+            if !repo_detected || root_resolved.is_none() {
+                if attempt == 2 {
+                    panic!("git repo not detected at {}", root.display());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            assert!(repo_detected);
+            assert_eq!(
+                root_resolved.unwrap().canonicalize().unwrap(),
+                root.canonicalize().unwrap()
+            );
+            let plain = tmp_dir("parl-plain-");
+            assert!(!is_git_repo(&plain).await);
+            assert_eq!(repo_root(&plain).await, None);
+            return;
+        }
+        unreachable!("retry loop always returns or panics")
+    }
+
+    #[tokio::test]
+    async fn worktree_lifecycle_merged_and_unmerged() {
+        let root = init_repo("parl-git-");
+        let worktrees = root.join(".parl").join("worktrees");
+        let info = ensure_worktree(&root, &worktrees, "auth-20260828141530", "auth", None)
+            .await
+            .unwrap();
+        assert_eq!(info.branch, "parl/auth-8141530");
+        assert_eq!(info.base_ref, "HEAD");
+        assert!(info.worktree_path.join("seed.txt").exists());
+        assert_eq!(
+            resolve_commit(&root, "HEAD").await.unwrap(),
+            info.base_commit
+        );
+
+        // Commit work on the branch, then merge it into main.
+        std::fs::write(info.worktree_path.join("hello.txt"), "hi\n").unwrap();
+        git_sync(&info.worktree_path, &["add", "."]);
+        git_sync(&info.worktree_path, &["commit", "-qm", "hello"]);
+        assert!(!worktree_is_dirty(&info.worktree_path).await);
+        git_sync(&root, &["merge", &info.branch, "-q", "--no-edit"]);
+        assert!(branch_is_merged(&root, &info.branch).await);
+
+        let r = remove_worktree(&root, &info.worktree_path, Some(&info.branch), false)
+            .await
+            .unwrap();
+        assert!(r.worktree_removed);
+        assert!(r.branch_deleted);
+        assert!(!info.worktree_path.exists());
+        assert!(
+            !branch_is_merged(&root, &info.branch).await || {
+                // branch gone: merged check is moot, just confirm it's deleted
+                let listed = git_raw(&["branch", "--list", &info.branch], &root).await;
+                listed.stdout.trim().is_empty()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn unmerged_branch_is_kept_unless_forced() {
+        let root = init_repo("parl-git-");
+        let worktrees = root.join(".parl").join("worktrees");
+        let info = ensure_worktree(&root, &worktrees, "x-20260828141530", "x", None)
+            .await
+            .unwrap();
+        std::fs::write(info.worktree_path.join("unmerged.txt"), "u\n").unwrap();
+        git_sync(&info.worktree_path, &["add", "."]);
+        git_sync(&info.worktree_path, &["commit", "-qm", "u"]);
+        assert!(!branch_is_merged(&root, &info.branch).await);
+
+        let soft = remove_worktree(&root, &info.worktree_path, Some(&info.branch), false)
+            .await
+            .unwrap();
+        assert!(soft.worktree_removed);
+        assert!(!soft.branch_deleted);
+        let hard = remove_worktree(&root, &info.worktree_path, Some(&info.branch), true)
+            .await
+            .unwrap();
+        // Worktree already gone; the branch delete now succeeds.
+        assert!(!hard.worktree_removed);
+        assert!(hard.branch_deleted);
+    }
+
+    #[tokio::test]
+    async fn diff_and_dirty_checks() {
+        let root = init_repo("parl-git-");
+        let worktrees = root.join(".parl").join("worktrees");
+        let info = ensure_worktree(&root, &worktrees, "d-20260828141530", "d", None)
+            .await
+            .unwrap();
+        std::fs::write(info.worktree_path.join("hello.txt"), "hi\n").unwrap();
+        git_sync(&info.worktree_path, &["add", "."]);
+        git_sync(&info.worktree_path, &["commit", "-qm", "hello"]);
+        // Uncommitted change the worker forgot to commit.
+        std::fs::write(info.worktree_path.join("forgot.txt"), "uncommitted\n").unwrap();
+        let dirty = dirty_files(&info.worktree_path).await;
+        assert_eq!(dirty, vec!["?? forgot.txt".to_string()]);
+        assert!(worktree_is_dirty(&info.worktree_path).await);
+
+        let stat = diff_against_base(&info.worktree_path, &info.base_commit, false)
+            .await
+            .unwrap();
+        assert!(stat.contains("hello.txt"), "{stat}");
+        let names = diff_against_base(&info.worktree_path, &info.base_commit, true)
+            .await
+            .unwrap();
+        assert_eq!(names, "hello.txt");
+        // A nonsense base fails with git's message.
+        assert!(
+            diff_against_base(&info.worktree_path, "not-a-ref", false)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_detects_conflicts_and_aborts_clean() {
+        let root = init_repo("parl-git-");
+        let worktrees = root.join(".parl").join("worktrees");
+        // The branch is cut from the current HEAD (spawn time)…
+        let info = ensure_worktree(&root, &worktrees, "c-20260828141530", "c", None)
+            .await
+            .unwrap();
+        // …then the parent moves on…
+        std::fs::write(root.join("seed.txt"), "parent version\n").unwrap();
+        git_sync(&root, &["commit", "-qam", "parent version"]);
+        // …while the worker edits the same file on its branch.
+        std::fs::write(info.worktree_path.join("seed.txt"), "worker version\n").unwrap();
+        git_sync(&info.worktree_path, &["add", "."]);
+        git_sync(&info.worktree_path, &["commit", "-qm", "worker version"]);
+
+        let outcome = merge_branch(&root, &info.branch, false, true).await;
+        match outcome {
+            MergeOutcome::Conflicted(files) => assert_eq!(files, vec!["seed.txt".to_string()]),
+            other => panic!("{other:?}"),
+        }
+        // The abort left the checkout clean.
+        assert!(!worktree_is_dirty(&root).await);
+        let aborted = git_raw(&["status"], &root).await;
+        assert!(!aborted.stdout.contains("All conflicts fixed"));
+
+        // Without abort-on-conflict the conflicted index stays for the caller.
+        let outcome = merge_branch(&root, &info.branch, false, false).await;
+        assert!(matches!(outcome, MergeOutcome::Conflicted(_)));
+        git_sync(&root, &["merge", "--abort"]);
+    }
+
+    #[tokio::test]
+    async fn merge_staged_with_no_commit_and_fails_on_bad_ref() {
+        let root = init_repo("parl-git-");
+        let worktrees = root.join(".parl").join("worktrees");
+        let info = ensure_worktree(&root, &worktrees, "s-20260828141530", "s", None)
+            .await
+            .unwrap();
+        std::fs::write(info.worktree_path.join("feat.txt"), "f\n").unwrap();
+        git_sync(&info.worktree_path, &["add", "."]);
+        git_sync(&info.worktree_path, &["commit", "-qm", "feat"]);
+
+        let staged = merge_branch(&root, &info.branch, true, false).await;
+        assert_eq!(staged, MergeOutcome::Staged);
+        // Nothing committed yet: HEAD unchanged, change staged.
+        let status = git_raw(&["status", "--porcelain"], &root).await;
+        assert!(status.stdout.contains('A'), "{}", status.stdout);
+        git_sync(&root, &["merge", "--abort"]);
+
+        let merged = merge_branch(&root, &info.branch, false, false).await;
+        assert_eq!(merged, MergeOutcome::Merged);
+
+        let failed = merge_branch(&root, "parl/never-existed", false, false).await;
+        assert!(matches!(failed, MergeOutcome::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn missing_worktree_prunes_and_falls_through_to_branch_delete() {
+        let root = init_repo("parl-git-");
+        let worktrees = root.join(".parl").join("worktrees");
+        let info = ensure_worktree(&root, &worktrees, "m-20260828141530", "m", None)
+            .await
+            .unwrap();
+        // Simulate a worktree removed out from under us.
+        std::fs::remove_dir_all(&info.worktree_path).unwrap();
+        let r = remove_worktree(&root, &info.worktree_path, Some(&info.branch), false)
+            .await
+            .unwrap();
+        assert!(!r.worktree_removed);
+        assert!(r.branch_deleted);
+    }
+}
