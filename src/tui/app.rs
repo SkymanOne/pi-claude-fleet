@@ -420,6 +420,14 @@ impl Console {
         self.refresh_rows();
     }
 
+    /// Drop a worker's diff stat — its worktree went away, or the diff no
+    /// longer applies to the run.
+    pub fn clear_diff_stat(&mut self, run_id: &str) {
+        if self.diff_stats.remove(run_id).is_some() {
+            self.refresh_rows();
+        }
+    }
+
     /// Repository files for `@` completion.
     pub fn set_files(&mut self, files: Vec<String>) {
         self.files = files;
@@ -600,6 +608,23 @@ impl Console {
     #[must_use]
     pub fn selected_row(&self) -> Option<&DashboardRow> {
         self.rows.get(self.selected)
+    }
+
+    /// Select the session by dashboard key (`orchestrator` or a run id);
+    /// `false` when no such row exists, leaving the selection where it was
+    /// (the caller falls back to the orchestrator). This is how the console
+    /// acts on the remembered `lastSession` preference at open.
+    pub fn select_target(&mut self, key: &str) -> bool {
+        let Some(index) = self.rows.iter().position(|row| row.key == key) else {
+            return false;
+        };
+        if self.selected != index {
+            self.selected = index;
+            // the search belonged to the session that was open
+            self.search = None;
+            self.scroll = None;
+        }
+        true
     }
 
     fn run_state(&self, run_id: &str) -> Option<&RunState> {
@@ -2590,6 +2615,36 @@ mod tests {
         assert_eq!(c.selected(), 1, "1-9 jumps to the nth session");
         c.handle_key(ch('9'));
         assert_eq!(c.selected(), 1, "out of range jumps nowhere");
+    }
+
+    // -- selection and diff stats --------------------------------------------
+
+    #[test]
+    fn select_target_picks_a_row_by_key_and_refuses_unknown_keys() {
+        let mut c = test_console();
+        c.set_runs(vec![running_run("auth-20260830000000", "auth")]);
+        assert_eq!(c.selected(), 0, "the orchestrator starts selected");
+        assert!(c.select_target("auth-20260830000000"));
+        assert_eq!(c.selected(), 1);
+        assert_eq!(
+            c.selected_target(),
+            SessionTarget::Worker("auth-20260830000000".into())
+        );
+        assert!(c.select_target("orchestrator"));
+        assert_eq!(c.selected(), 0);
+        // an unknown key leaves the selection alone: the caller falls back
+        assert!(!c.select_target("ghost-20260830000000"));
+        assert_eq!(c.selected(), 0);
+    }
+
+    #[test]
+    fn diff_stats_show_on_a_row_and_clear_again() {
+        let mut c = test_console();
+        c.set_runs(vec![running_run("auth-20260830000000", "auth")]);
+        c.set_diff_stat("auth-20260830000000", "+12 −3");
+        assert_eq!(c.rows()[1].diff_stat.as_deref(), Some("+12 −3"));
+        c.clear_diff_stat("auth-20260830000000");
+        assert_eq!(c.rows()[1].diff_stat, None);
     }
 
     #[test]

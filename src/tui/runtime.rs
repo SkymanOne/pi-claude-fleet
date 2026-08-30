@@ -45,6 +45,11 @@ fn repo_cwd(fleet: &FleetPaths) -> String {
         .into_owned()
 }
 
+/// The dashboard's diff-stat refresh cadence: `diff` shells out to git once
+/// per run, so this is a background nicety the poll loop catches up on, not
+/// a per-tick duty.
+const DIFF_STAT_MS: i64 = 10_000;
+
 // ---------------------------------------------------------------------------
 // Terminal install / teardown
 
@@ -169,6 +174,11 @@ struct Poll {
     /// cursors are the memory that keeps a reopened console from replaying
     /// fleet events the orchestrator has already heard.
     watcher: FleetWatcher,
+    /// The diff stats the runtime last fed the console; the mirror is what
+    /// decides whether a row needs redrawing.
+    diff_stats: HashMap<String, String>,
+    /// When the diff stats were last computed (the throttle).
+    diff_at: i64,
 }
 
 impl Poll {
@@ -180,6 +190,8 @@ impl Poll {
             orch_offset: 0,
             worker_offsets: HashMap::new(),
             watcher,
+            diff_stats: HashMap::new(),
+            diff_at: 0,
         }
     }
 
@@ -266,6 +278,71 @@ impl Poll {
         };
         session.watcher.cursors = self.watcher.cursors();
         let _ = crate::orch::session::save(self.fleet.root(), &mut session);
+    }
+
+    /// Refresh the dashboard's diff stats, on the [`DIFF_STAT_MS`] cadence:
+    /// one `ops::integrate::diff` per live run (it shells out to git), the
+    /// result compacted to the `+12 −3` a row can carry, and only real
+    /// changes pushed at the console.
+    async fn refresh_diff_stats(&mut self, console: &mut Console) {
+        let now = now_ms();
+        if now - self.diff_at < DIFF_STAT_MS {
+            return;
+        }
+        self.diff_at = now;
+        let repo_root = repo_cwd(&self.fleet);
+        for run in &self.runs {
+            if run.state.status == crate::fleet::run::RunStatus::Archived {
+                continue;
+            }
+            let stat = match crate::ops::integrate::diff_core(
+                &run.run_id,
+                Some(repo_root.as_ref()),
+                false,
+            )
+            .await
+            {
+                Ok(result) if result.code == ExitCode::Ok => compact_stat(&result.data.text),
+                _ => None,
+            };
+            match stat {
+                Some(stat) if self.diff_stats.get(&run.run_id) != Some(&stat) => {
+                    console.set_diff_stat(&run.run_id, stat.clone());
+                    self.diff_stats.insert(run.run_id.clone(), stat);
+                }
+                Some(_) => {}
+                None => {
+                    if self.diff_stats.remove(&run.run_id).is_some() {
+                        console.clear_diff_stat(&run.run_id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `git diff --stat` ends with a summary like
+/// ` 1 file changed, 12 insertions(+), 3 deletions(-)`; the dashboard row
+/// shows that as `+12 −3`. None when nothing was inserted or deleted — no
+/// worktree, no changes, or an unreadable diff all leave the row clean.
+fn compact_stat(stat: &str) -> Option<String> {
+    let summary = stat.lines().last()?.trim();
+    let mut plus = None;
+    let mut minus = None;
+    for part in summary.split(',') {
+        if let Some((count, what)) = part.trim().split_once(' ')
+            && let Ok(count) = count.parse::<u64>()
+        {
+            if what.starts_with("insertion") {
+                plus = Some(count);
+            } else if what.starts_with("deletion") {
+                minus = Some(count);
+            }
+        }
+    }
+    match (plus, minus) {
+        (None, None) => None,
+        (plus, minus) => Some(format!("+{} −{}", plus.unwrap_or(0), minus.unwrap_or(0))),
     }
 }
 
@@ -386,6 +463,13 @@ pub async fn run_console(
     poll.tail_events(&mut console);
     console.set_files(list_repo_files(&repo_root).await);
 
+    // the session open when the console last closed, when it still exists —
+    // otherwise the dashboard starts on the orchestrator, as ever
+    let remembered = console.prefs().last_session.clone();
+    if let Some(key) = remembered {
+        console.select_target(&key);
+    }
+
     let started = match ensure_orchestrator(&fleet, &options) {
         Ok(true) => {
             console.notice("· orchestrator monitor started", false);
@@ -452,6 +536,7 @@ pub async fn run_console(
                 console.set_orchestrator_state(poll.orch.clone());
                 poll.tail_events(&mut console);
                 poll.forward_fleet_events(&mut console).await;
+                poll.refresh_diff_stats(&mut console).await;
             }
             _ = heartbeat.tick() => lock.refresh(),
         }
@@ -808,5 +893,132 @@ mod tests {
         poll.forward_fleet_events(&mut console).await;
         assert_eq!(count_kind(&fleet, "question"), 1);
         assert_eq!(count_kind(&fleet, "settled"), 1);
+    }
+
+    // -- the dashboard's diff stat -------------------------------------------
+
+    #[test]
+    fn compact_stat_reduces_git_stat_output_to_plus_minus() {
+        let multiline =
+            " hello.rs | 12 +++++++-----\n 1 file changed, 12 insertions(+), 3 deletions(-)";
+        assert_eq!(compact_stat(multiline).as_deref(), Some("+12 −3"));
+        assert_eq!(
+            compact_stat(" 2 files changed, 1 insertion(+), 5 deletions(-)").as_deref(),
+            Some("+1 −5")
+        );
+        assert_eq!(
+            compact_stat(" 1 file changed, 4 insertions(+)").as_deref(),
+            Some("+4 −0")
+        );
+        assert_eq!(
+            compact_stat(" 1 file changed, 2 deletions(-)").as_deref(),
+            Some("+0 −2")
+        );
+        // nothing to show: no changes, no worktree, empty
+        assert_eq!(compact_stat("(no changes)"), None);
+        assert_eq!(
+            compact_stat("not applicable (run has no isolated worktree)"),
+            None
+        );
+        assert_eq!(compact_stat(""), None);
+    }
+
+    #[tokio::test]
+    async fn diff_stats_reach_the_dashboard_throttled() {
+        let tmp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let root = tmp.path().to_path_buf();
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"], &root);
+        std::fs::write(root.join(".gitignore"), ".parl/\n").unwrap();
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        git(&["add", "."], &root);
+        git(&["commit", "-qm", "seed"], &root);
+
+        let fleet = FleetPaths::new(root.join(".parl"));
+        std::fs::create_dir_all(fleet.orchestrator_dir()).unwrap();
+        let run_id = "auth-20260830000000";
+        let info = crate::git::ensure_worktree(
+            &root,
+            &fleet.root().join("worktrees"),
+            run_id,
+            "auth",
+            None,
+        )
+        .await
+        .unwrap();
+        let run_dir = fleet.root().join("runs").join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut state = crate::fleet::run::RunState::new(
+            fleet.root().to_string_lossy().as_ref(),
+            run_id,
+            "auth",
+            root.to_string_lossy().as_ref(),
+            "brief",
+            None,
+            Some(info.branch.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        state.status = crate::fleet::run::RunStatus::Running;
+        state.pid = Some(std::process::id() as i32);
+        state.worktree = Some(info.worktree_path.to_string_lossy().into_owned());
+        state.base_commit = Some(info.base_commit.clone());
+        crate::fleet::run::save_state(&run_dir, &state).unwrap();
+
+        // the worker commits one file: the row carries +1 −0
+        std::fs::write(info.worktree_path.join("auth.rs"), "fn main() {}\n").unwrap();
+        git(&["add", "."], &info.worktree_path);
+        git(&["commit", "-qm", "auth"], &info.worktree_path);
+
+        let mut console = Console::new(fleet.clone());
+        let mut poll = poll_for(&fleet, HashMap::new());
+        poll.reload_runs();
+        console.set_runs(poll.runs.clone());
+        poll.refresh_diff_stats(&mut console).await;
+        let row = console.rows().iter().find(|row| row.key == run_id).unwrap();
+        assert_eq!(row.diff_stat.as_deref(), Some("+1 −0"));
+
+        // more committed work inside the throttle window: not recomputed yet
+        std::fs::write(info.worktree_path.join("more.rs"), "fn more() {}\n").unwrap();
+        git(&["add", "."], &info.worktree_path);
+        git(&["commit", "-qm", "more"], &info.worktree_path);
+        poll.refresh_diff_stats(&mut console).await;
+        let row = console.rows().iter().find(|row| row.key == run_id).unwrap();
+        assert_eq!(row.diff_stat.as_deref(), Some("+1 −0"), "throttled");
+    }
+
+    #[tokio::test]
+    async fn a_run_without_a_worktree_shows_no_diff_stat() {
+        let (_tmp, fleet, _run_id) = fleet_with_run("bare");
+        let mut console = Console::new(fleet.clone());
+        let mut poll = poll_for(&fleet, HashMap::new());
+        poll.reload_runs();
+        console.set_runs(poll.runs.clone());
+        poll.refresh_diff_stats(&mut console).await;
+        let row = console.rows().last().unwrap();
+        assert_eq!(row.diff_stat, None);
     }
 }
