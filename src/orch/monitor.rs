@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -46,6 +46,11 @@ const STREAM_FLUSH_MS: u64 = 150;
 const MISSING_DIR_POLLS: u32 = 2;
 
 /// Run the orchestrator monitor for the fleet rooted at `fleet_dir`.
+///
+/// # Errors
+///
+/// Returns an error when the monitor cannot boot (unreadable session record,
+/// unwritable prompt or MCP config), or when the run loop itself fails.
 pub async fn run_orchestrator_monitor(fleet_dir: &Path) -> anyhow::Result<ExitCode> {
     let monitor = Monitor::boot(fleet_dir)?;
     monitor.run().await?;
@@ -62,19 +67,23 @@ pub fn load_orchestrator_state(fleet_dir: &Path) -> Option<OrchestratorState> {
 
 /// Append one command to the orchestrator's inbox (the console's side of the
 /// mailbox); the monitor picks it up within its poll interval.
-pub async fn append_command(
-    fleet_dir: &Path,
-    command: &OrchestratorCommand,
-) -> std::io::Result<()> {
+///
+/// # Errors
+///
+/// Returns an I/O error when the inbox cannot be created or written.
+pub fn append_command(fleet_dir: &Path, command: &OrchestratorCommand) -> std::io::Result<()> {
     append_envelope(
         fleet_dir,
         &command.to_envelope(crate::fleet::envelope::Party::Console),
     )
-    .await
 }
 
 /// Append a pre-built envelope to the orchestrator's inbox.
-pub async fn append_envelope(fleet_dir: &Path, envelope: &Envelope) -> std::io::Result<()> {
+///
+/// # Errors
+///
+/// Returns an I/O error when the inbox cannot be created or written.
+pub fn append_envelope(fleet_dir: &Path, envelope: &Envelope) -> std::io::Result<()> {
     let path = FleetPaths::new(fleet_dir).orchestrator_inbox();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -122,7 +131,7 @@ pub struct Monitor {
     prompt_file: String,
     /// The `--mcp-config` document pointing claude at this binary's MCP server.
     mcp_config_json: String,
-    monitor_pid: i32,
+    pid: i32,
     /// The model asked for at launch; claude's own default when none.
     launch_model: Option<String>,
     budget_usd: Option<f64>,
@@ -182,7 +191,7 @@ impl Monitor {
             cwd,
             prompt_file: prompt_file.to_string_lossy().into_owned(),
             mcp_config_json,
-            monitor_pid: i32::try_from(std::process::id()).unwrap_or(1),
+            pid: i32::try_from(std::process::id()).unwrap_or(1),
             launch_model: launch.model.clone(),
             budget_usd: launch.budget_usd,
             paths,
@@ -208,7 +217,7 @@ impl Monitor {
 
     /// Lock the shared state even if a previous holder panicked.
     fn shared(&self) -> std::sync::MutexGuard<'_, Shared> {
-        self.shared.lock().unwrap_or_else(|err| err.into_inner())
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Build a claude child for the current session. After a restart the
@@ -252,13 +261,13 @@ impl Monitor {
     fn start_child(
         self: &Arc<Self>,
         fresh: bool,
-    ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<ProcEvent>> {
+    ) -> tokio::sync::mpsc::UnboundedReceiver<ProcEvent> {
         let remote = self.shared().record.launch.remote_control.clone();
         let (proc, rx) = self.new_process(remote, fresh);
         {
             let mut sh = self.shared();
             sh.process = Some(proc.clone());
-            sh.state.pid = Some(self.monitor_pid);
+            sh.state.pid = Some(self.pid);
             sh.dirty = true;
         }
         proc.start();
@@ -275,10 +284,15 @@ impl Monitor {
             }
         };
         self.write_notice(text, None);
-        Ok(rx)
+        rx
     }
 
     /// Run the monitor until the claude child ends for good.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the first child cannot be started or the run
+    /// loop's own bookkeeping fails.
     pub async fn run(self: &Arc<Self>) -> anyhow::Result<()> {
         // `fresh` is a one-shot launch instruction: consume it so a restarted
         // monitor resumes instead of starting over.
@@ -286,7 +300,7 @@ impl Monitor {
         if fresh {
             self.save_record();
         }
-        let mut rx = self.start_child(fresh)?;
+        let mut rx = self.start_child(fresh);
         self.spawn_timers();
 
         while let Some(event) = rx.recv().await {
@@ -321,7 +335,7 @@ impl Monitor {
                     if let Some(restart) = restart
                         && !self.shared().shutting_down
                     {
-                        rx = self.restart_child(restart);
+                        rx = self.restart_child(&restart);
                         continue;
                     }
                     self.record_exit(&info);
@@ -331,7 +345,7 @@ impl Monitor {
                 // process.rs has already marked the child gone, so record the
                 // end instead of waiting on a child that never was.
                 ProcEvent::Error(message) => {
-                    self.write_notice(message.clone(), Some(true));
+                    self.write_notice(message, Some(true));
                     self.record_exit(&ExitInfo {
                         code: None,
                         signal: None,
@@ -419,7 +433,7 @@ impl Monitor {
             sh.state.capabilities = init.capabilities.clone();
             sh.state.mcp_servers = init.mcp_servers.clone();
             sh.record.session_id = Some(init.session_id.clone());
-            sh.record.pid = Some(self.monitor_pid);
+            sh.record.pid = Some(self.pid);
             sh.record.model = sh.state.model.clone();
             sh.record.claude_version = sh.state.claude_version.clone();
             sh.dirty = true;
@@ -804,7 +818,7 @@ impl Monitor {
 
     /// Replace the claude child for a flag change: the session is resumed in
     /// place and no console ever sees an exit.
-    fn restart_child(&self, restart: Restart) -> mpsc::UnboundedReceiver<ProcEvent> {
+    fn restart_child(&self, restart: &Restart) -> mpsc::UnboundedReceiver<ProcEvent> {
         {
             let mut sh = self.shared();
             sh.state.remote_control = restart.remote_control.clone();
@@ -864,7 +878,7 @@ fn dir_is_missing(path: &Path) -> bool {
 }
 
 /// How a console answered, as the transcript's `how` field spells it.
-fn decision_how(decision: &PermissionDecisionRecord) -> &'static str {
+const fn decision_how(decision: &PermissionDecisionRecord) -> &'static str {
     match decision {
         PermissionDecisionRecord::Allow { .. } => "allow",
         PermissionDecisionRecord::Deny { .. } => "deny",
@@ -911,7 +925,7 @@ mod tests {
             model: Some("fable".into()),
             budget_usd: Some(5.0),
             permission_mode: Some("acceptEdits".into()),
-            remote_control: Some("".into()),
+            remote_control: Some(String::new()),
             fresh: Some(true),
         };
         session::save(&fleet, &mut record).unwrap();
@@ -923,8 +937,9 @@ mod tests {
         assert_eq!(sh.state.remote_control, Some(String::new()));
         assert_eq!(monitor.launch_model.as_deref(), Some("fable"));
         assert_eq!(monitor.budget_usd, Some(5.0));
-        assert_eq!(sh.state.pid, Some(monitor.monitor_pid));
+        assert_eq!(sh.state.pid, Some(monitor.pid));
         assert_eq!(sh.state.pending_requests, Vec::new());
+        drop(sh);
         // The boot wrote the durable files a console reads back.
         assert!(fleet.join("orchestrator/prompt.md").is_file());
         assert!(load_orchestrator_state(&fleet).is_some());

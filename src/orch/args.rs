@@ -131,24 +131,22 @@ pub fn build_claude_args(o: &ClaudeArgsOptions) -> Vec<String> {
         args.push(format!("{budget}"));
     }
     // variadic lists go last so they cannot swallow a following option's value
-    let disallowed: Vec<String> = match &o.disallowed_tools {
-        Some(list) => list.clone(),
-        None => DEFAULT_DISALLOWED_TOOLS
+    let disallowed = o.disallowed_tools.clone().unwrap_or_else(|| {
+        DEFAULT_DISALLOWED_TOOLS
             .iter()
             .map(ToString::to_string)
-            .collect(),
-    };
+            .collect()
+    });
     if !disallowed.is_empty() {
         args.push("--disallowedTools".into());
         args.extend(disallowed);
     }
-    let allowed: Vec<String> = match &o.allowed_tools {
-        Some(list) => list.clone(),
-        None => DEFAULT_ALLOWED_TOOLS
+    let allowed = o.allowed_tools.clone().unwrap_or_else(|| {
+        DEFAULT_ALLOWED_TOOLS
             .iter()
             .map(ToString::to_string)
-            .collect(),
-    };
+            .collect()
+    });
     if !allowed.is_empty() {
         args.push("--allowedTools".into());
         args.extend(allowed);

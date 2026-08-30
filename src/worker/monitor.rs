@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -147,6 +147,10 @@ pub fn report_reminder(fleet_dir: &Path, run_id: &str) -> String {
 
 /// Write the embedded extension and skill into the fleet dir, only when the
 /// file is missing or its contents differ, and return their paths.
+///
+/// # Errors
+///
+/// Returns an I/O error when either file cannot be written.
 pub fn materialize_worker_files(paths: &FleetPaths) -> std::io::Result<(PathBuf, PathBuf)> {
     let extension = paths.pi_extension();
     let skill = paths.pi_skill();
@@ -240,7 +244,7 @@ struct Shared {
 }
 
 impl Shared {
-    fn finished(&self) -> bool {
+    const fn finished(&self) -> bool {
         self.finished
     }
 }
@@ -267,6 +271,11 @@ pub struct Monitor {
 
 /// Run the monitor for one run until the worker process exits. The CLI-level
 /// exit code is always ok — how the run ended lives in `run.json`.
+///
+/// # Errors
+///
+/// Returns an error when the monitor cannot boot (unreadable or uncreatable
+/// fleet files), or the run loop's own bookkeeping fails.
 pub async fn run_monitor(fleet_dir: &Path, run_id: &str) -> anyhow::Result<ExitCode> {
     let monitor = Monitor::boot(fleet_dir, run_id)?;
     monitor.run().await?;
@@ -324,7 +333,7 @@ impl Monitor {
     fn shared(&self) -> MutexGuard<'_, Shared> {
         // A poisoned lock means a task panicked mid-mutation; the state is
         // still ours to fix up, so recover the guard instead of panicking.
-        self.shared.lock().unwrap_or_else(|err| err.into_inner())
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     async fn run(self: &Arc<Self>) -> anyhow::Result<()> {
@@ -500,7 +509,7 @@ impl Monitor {
         let _ = append_text(&self.pi_log_path, &format!("{line}\n"));
         match parse_line(line) {
             Some(RpcMessage::Response(response)) => self.handle_response(response).await,
-            Some(RpcMessage::Ui(request)) => self.handle_ui_request(request).await,
+            Some(RpcMessage::Ui(request)) => self.handle_ui_request(request),
             Some(RpcMessage::Event(event)) => self.handle_event(&event).await,
             None => {}
         }
@@ -697,7 +706,7 @@ impl Monitor {
         }
     }
 
-    async fn handle_ui_request(self: &Arc<Self>, request: ExtensionUiRequest) {
+    fn handle_ui_request(self: &Arc<Self>, request: ExtensionUiRequest) {
         if !request.is_dialog() {
             // notify/setStatus/setWidget/setTitle/set_editor_text need no
             // reply: record and move on.
@@ -717,7 +726,7 @@ impl Monitor {
                 question: question.clone(),
                 options: request.options.clone(),
                 context: None,
-                asked_at: asked_at.clone(),
+                asked_at,
             });
             sh.state.last_activity = Some(now_iso());
             sh.dialogs.push(DialogRecord {
@@ -744,7 +753,7 @@ impl Monitor {
         match decoded {
             Decoded::Steer(message) => self.deliver_steering("steer", envelope, message).await,
             Decoded::FollowUp(message) => {
-                self.deliver_steering("follow_up", envelope, message).await
+                self.deliver_steering("follow_up", envelope, message).await;
             }
             Decoded::Command(message) => {
                 let source = envelope.from.to_string();
@@ -867,13 +876,13 @@ impl Monitor {
                     "model": model_id,
                     "provider": provider,
                 }));
-                let resolved = match provider {
-                    Some(provider) => Ok(provider.to_string()),
-                    None => {
+                let resolved = provider.map_or_else(
+                    || {
                         let models = self.shared().available_models.clone();
                         resolve_provider(&models, model_id)
-                    }
-                };
+                    },
+                    |provider| Ok(provider.to_string()),
+                );
                 match resolved {
                     Ok(provider) => {
                         self.send(&RpcCommand::SetModel {
@@ -935,7 +944,7 @@ impl Monitor {
         self.flush_now();
     }
 
-    async fn handle_outbox(self: &Arc<Self>, envelope: &Envelope) {
+    fn handle_outbox(self: &Arc<Self>, envelope: &Envelope) {
         let Some(decoded) = envelope.decode() else {
             return;
         };
@@ -994,11 +1003,15 @@ impl Monitor {
     }
 
     /// Drain both mailboxes once. Guarded by a mutex because the poller task
-    /// and the settle drain can race.
+    /// and the settle drain can race. The lock covers only the offset reads
+    /// and writes — never the per-envelope handling, which awaits.
     async fn poll_mailboxes(self: &Arc<Self>) {
-        let mut offsets = self.mailboxes.lock().await;
-        let (lines, offset) = read_new_lines(&self.inbox_path, offsets.0);
-        offsets.0 = offset;
+        let lines = {
+            let mut offsets = self.mailboxes.lock().await;
+            let (lines, offset) = read_new_lines(&self.inbox_path, offsets.0);
+            offsets.0 = offset;
+            lines
+        };
         for line in lines {
             let Some(envelope) = Envelope::parse_line(&line) else {
                 continue;
@@ -1007,13 +1020,17 @@ impl Monitor {
                 self.handle_inbox(&envelope, decoded).await;
             }
         }
-        let (lines, offset) = read_new_lines(&self.outbox_path, offsets.1);
-        offsets.1 = offset;
+        let lines = {
+            let mut offsets = self.mailboxes.lock().await;
+            let (lines, offset) = read_new_lines(&self.outbox_path, offsets.1);
+            offsets.1 = offset;
+            lines
+        };
         for line in lines {
             let Some(envelope) = Envelope::parse_line(&line) else {
                 continue;
             };
-            self.handle_outbox(&envelope).await;
+            self.handle_outbox(&envelope);
         }
     }
 
@@ -1174,14 +1191,15 @@ impl Monitor {
                 let lines: Vec<&str> = stderr.split('\n').filter(|line| !line.is_empty()).collect();
                 let start = lines.len().saturating_sub(8);
                 let tail = lines[start..].join("\n");
-                let reason = match spawn_error {
-                    Some(err) => format!("failed to start pi: {err}"),
-                    None => format!(
-                        "pi exited with code {} before settling",
-                        code.map(|c| c.to_string())
-                            .unwrap_or_else(|| "unknown".to_string())
-                    ),
-                };
+                let reason = spawn_error.map_or_else(
+                    || {
+                        format!(
+                            "pi exited with code {} before settling",
+                            code.map_or_else(|| "unknown".to_string(), |c| c.to_string())
+                        )
+                    },
+                    |err| format!("failed to start pi: {err}"),
+                );
                 let error = sh.state.error.clone().unwrap_or_else(|| {
                     if tail.is_empty() {
                         reason

@@ -31,7 +31,7 @@ const TERMINAL_VIEWS: [DerivedView; 4] = [
     DerivedView::Dead,
 ];
 
-fn kind_by_view(view: DerivedView) -> Option<FleetEventKind> {
+const fn kind_by_view(view: DerivedView) -> Option<FleetEventKind> {
     match view {
         DerivedView::Settled => Some(FleetEventKind::Settled),
         DerivedView::Stopped => Some(FleetEventKind::Stopped),
@@ -115,7 +115,7 @@ impl FleetWatcher {
 
     /// Events per batch, for whoever renders the batch.
     #[must_use]
-    pub fn batch_limit(&self) -> usize {
+    pub const fn batch_limit(&self) -> usize {
         self.max_per_batch
     }
 
@@ -161,11 +161,11 @@ impl FleetWatcher {
         if snapshot && !live.is_empty() {
             let summary = live
                 .iter()
-                .map(|r| match self.asking_question(&r.state) {
-                    Some(question) => {
-                        format!("{} ({}, asking: {question})", r.state.name, r.view)
-                    }
-                    None => format!("{} ({})", r.state.name, r.view),
+                .map(|r| {
+                    Self::asking_question(&r.state).map_or_else(
+                        || format!("{} ({})", r.state.name, r.view),
+                        |question| format!("{} ({}, asking: {question})", r.state.name, r.view),
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
@@ -184,7 +184,7 @@ impl FleetWatcher {
 
     /// What a blocked run is waiting on: a `fleet_ask` question or a pi
     /// extension dialog. Either way the orchestrator should know.
-    fn asking_question(&self, state: &RunState) -> Option<String> {
+    fn asking_question(state: &RunState) -> Option<String> {
         state
             .pending_question
             .as_ref()
@@ -277,9 +277,8 @@ impl FleetWatcher {
 
     /// One `events.jsonl` line from a run, turned into fleet events.
     fn on_run_event(&mut self, run_id: &str, state: &RunState, ev: &Value) {
-        let kind = match ev.get("type").and_then(Value::as_str) {
-            Some(kind) => kind,
-            None => return,
+        let Some(kind) = ev.get("type").and_then(Value::as_str) else {
+            return;
         };
         match kind {
             "worker_question" => {
@@ -487,8 +486,8 @@ mod tests {
         (run_id, run_dir, state)
     }
 
-    fn append_event(run_dir: &std::path::Path, event: Value) {
-        crate::util::append_json_line(&run_dir.join("events.jsonl"), &event).unwrap();
+    fn append_event(run_dir: &std::path::Path, event: &Value) {
+        crate::util::append_json_line(&run_dir.join("events.jsonl"), event).unwrap();
     }
 
     fn watcher(fleet_dir: &std::path::Path) -> FleetWatcher {
@@ -560,27 +559,27 @@ mod tests {
         w.start(false);
         append_event(
             &run_dir,
-            json!({"type":"worker_question","questionId":"q_1","question":"bcrypt or argon2?","options":["bcrypt","argon2"],"context":"brief says secure only"}),
+            &json!({"type":"worker_question","questionId":"q_1","question":"bcrypt or argon2?","options":["bcrypt","argon2"],"context":"brief says secure only"}),
         );
         append_event(
             &run_dir,
-            json!({"type":"answer_delivered","questionId":"q_1","source":"orchestrator","message":"argon2"}),
+            &json!({"type":"answer_delivered","questionId":"q_1","source":"orchestrator","message":"argon2"}),
         );
         append_event(
             &run_dir,
-            json!({"type":"steering_delivered","source":"orchestrator","message":"use tabs"}),
+            &json!({"type":"steering_delivered","source":"orchestrator","message":"use tabs"}),
         );
         append_event(
             &run_dir,
-            json!({"type":"worker_progress","message":"tests pass"}),
+            &json!({"type":"worker_progress","message":"tests pass"}),
         );
         append_event(
             &run_dir,
-            json!({"type":"worker_question_resolved","questionId":"q_1","how":"answered"}),
+            &json!({"type":"worker_question_resolved","questionId":"q_1","how":"answered"}),
         );
         append_event(
             &run_dir,
-            json!({"type":"tool_execution_end","toolName":"bash"}),
+            &json!({"type":"tool_execution_end","toolName":"bash"}),
         );
         w.tick();
         assert_eq!(kinds(&w.take_batch()), vec![FleetEventKind::Question]);
@@ -588,15 +587,15 @@ mod tests {
         // the human's interventions are the news
         append_event(
             &run_dir,
-            json!({"type":"answer_delivered","questionId":"q_2","source":"console","message":"argon2"}),
+            &json!({"type":"answer_delivered","questionId":"q_2","source":"console","message":"argon2"}),
         );
         append_event(
             &run_dir,
-            json!({"type":"steering_delivered","source":"console","message":"use spaces"}),
+            &json!({"type":"steering_delivered","source":"console","message":"use spaces"}),
         );
         append_event(
             &run_dir,
-            json!({"type":"worker_question_resolved","questionId":"q_3","how":"timeout"}),
+            &json!({"type":"worker_question_resolved","questionId":"q_3","how":"timeout"}),
         );
         w.tick();
         let events = w.take_batch();
@@ -639,7 +638,7 @@ mod tests {
         run::save_state(&run_dir, &state).unwrap();
         append_event(
             &run_dir,
-            json!({"type":"worker_question","questionId":"q_9","question":"which db?"}),
+            &json!({"type":"worker_question","questionId":"q_9","question":"which db?"}),
         );
 
         let mut first = watcher(&fleet_dir);
@@ -660,7 +659,7 @@ mod tests {
 
         append_event(
             &run_dir,
-            json!({"type":"worker_question","questionId":"q_10","question":"which cache?"}),
+            &json!({"type":"worker_question","questionId":"q_10","question":"which cache?"}),
         );
         let mut second = FleetWatcher::new(FleetWatcherOptions {
             fleet_dir: fleet_dir.clone(),
@@ -678,7 +677,7 @@ mod tests {
 
         // a third watcher with the second's cursors sees only the snapshot
         let mut third = FleetWatcher::new(FleetWatcherOptions {
-            fleet_dir: fleet_dir.clone(),
+            fleet_dir,
             cursors: second.cursors(),
             ..FleetWatcherOptions::default()
         });
@@ -706,23 +705,23 @@ mod tests {
         let (_run_id, run_dir, _state) = add_running_run(&fleet_dir, "slow");
         let mut off = watcher(&fleet_dir);
         off.start(false);
-        append_event(&run_dir, json!({"type":"worker_progress","message":"one"}));
+        append_event(&run_dir, &json!({"type":"worker_progress","message":"one"}));
         off.tick();
         assert!(off.take_batch().is_empty());
         let cursors = off.cursors();
 
         let mut on = FleetWatcher::new(FleetWatcherOptions {
-            fleet_dir: fleet_dir.clone(),
+            fleet_dir,
             cursors,
             progress_events: true,
             progress_throttle_ms: 10_000,
             ..FleetWatcherOptions::default()
         });
         on.start(false);
-        append_event(&run_dir, json!({"type":"worker_progress","message":"two"}));
+        append_event(&run_dir, &json!({"type":"worker_progress","message":"two"}));
         append_event(
             &run_dir,
-            json!({"type":"worker_progress","message":"three"}),
+            &json!({"type":"worker_progress","message":"three"}),
         );
         on.tick();
         let events = on.take_batch();
@@ -761,7 +760,7 @@ mod tests {
         w.start(true);
         append_event(
             &run_dir,
-            json!({"type":"worker_dialog","questionId":"u-1","method":"select","question":"Pick one","options":["a","b"]}),
+            &json!({"type":"worker_dialog","questionId":"u-1","method":"select","question":"Pick one","options":["a","b"]}),
         );
         w.tick();
         let events = w.take_batch();

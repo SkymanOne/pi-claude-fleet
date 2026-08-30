@@ -60,7 +60,8 @@ pub fn version_supported(version: Option<&str>) -> bool {
 }
 
 /// `claude --version` against the real environment.
-pub async fn check_claude_version() -> VersionCheck {
+#[must_use]
+pub fn check_claude_version() -> VersionCheck {
     check_claude_version_with_spec(std::env::var(env_var("CLAUDE_BIN")).ok().as_deref())
 }
 

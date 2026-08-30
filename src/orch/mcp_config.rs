@@ -53,12 +53,20 @@ const PARL_ENV_KEYS: &[&str] = &[
 ///
 /// The `parl mcp` server: no shell is involved (argv arrays), so paths with
 /// spaces need no quoting.
+///
+/// # Errors
+///
+/// Returns an error when the current executable cannot be located.
 pub fn parl_binary() -> anyhow::Result<PathBuf> {
     std::env::current_exe().context("locate the parl binary for the fleet MCP server")
 }
 
 /// The `--mcp-config` document that makes claude spawn `parl mcp` over stdio,
 /// with the environment inherited from this process.
+///
+/// # Errors
+///
+/// Returns an error when the current executable cannot be located.
 pub fn fleet_mcp_config(binary: &Path, fleet_dir: &Path) -> anyhow::Result<Value> {
     Ok(fleet_mcp_config_with(binary, fleet_dir, &|key| {
         std::env::var(key).ok().filter(|value| !value.is_empty())
