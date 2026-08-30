@@ -74,10 +74,6 @@ impl Fleet {
         self.write_state_with(|state| state.status = status);
     }
 
-    fn state(&self) -> RunState {
-        run::load_state(&self.paths.run_dir(&self.run_id)).unwrap()
-    }
-
     fn inbox(&self) -> Vec<Envelope> {
         let raw = std::fs::read_to_string(self.paths.run_inbox(&self.run_id)).unwrap_or_default();
         raw.lines()
