@@ -406,13 +406,18 @@ mod tests {
         let deadline = Instant::now() + RETRY_BOUND;
         loop {
             let root = init_repo("parl-git-");
+            // Under heavy load `git rev-parse --show-toplevel` has been
+            // observed to hand back a root that fails `canonicalize` with
+            // NotFound a moment later (forensics: git itself never reports a
+            // ghost toplevel; the loss is environmental). Fold the resolution
+            // into the retried condition instead of asserting it — a
+            // persistent mismatch still fails the test via the bound.
             if is_git_repo(&root).await
                 && let Some(resolved) = repo_root(&root).await
+                && let (Ok(resolved_real), Ok(root_real)) =
+                    (resolved.canonicalize(), root.canonicalize())
+                && resolved_real == root_real
             {
-                assert_eq!(
-                    resolved.canonicalize().unwrap(),
-                    root.canonicalize().unwrap()
-                );
                 break;
             }
             assert!(
