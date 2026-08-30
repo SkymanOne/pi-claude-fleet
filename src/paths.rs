@@ -214,16 +214,18 @@ pub fn ensure_gitignore_entry(root: &Path, entry: &str) -> std::io::Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::test_support::{RETRY_BOUND, RETRY_INTERVAL, git_sync, tmp_dir};
-    use std::time::Instant;
+    use crate::git::test_support::{RETRY_INTERVAL, git_sync, tmp_dir};
+    use std::time::{Duration, Instant};
 
     /// `ensure` touches several fresh paths, and under this machine's
     /// parallel load a call has been observed to fail with NotFound on a
-    /// path it had itself just created. It self-heals (`create_dir_all`
-    /// rebuilds whatever vanished), so poll `Err` against the shared bound
-    /// instead of failing the test; the first `Ok` is returned unchanged.
+    /// path it had itself just created — occasionally for longer than a
+    /// moment. It self-heals (`create_dir_all` rebuilds whatever vanished),
+    /// so poll `Err` and return the first `Ok`; the bound keeps a real
+    /// breakage loud. Operation-level, so a longer bound than the
+    /// per-spawn git helper's.
     fn ensure_with_retry(paths: &FleetPaths) -> std::io::Result<bool> {
-        let deadline = Instant::now() + RETRY_BOUND;
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match paths.ensure() {
                 Ok(changed) => return Ok(changed),

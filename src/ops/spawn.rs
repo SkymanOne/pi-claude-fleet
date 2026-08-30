@@ -221,6 +221,29 @@ mod tests {
     use super::*;
     use crate::git::test_support::{git_sync, tmp_dir};
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    /// `create_run` drives several real git spawns, and under this machine's
+    /// parallel-suite load a fresh repo has been observed to read as "not a
+    /// git repository" to a mid-test spawn that earlier spawns had just used
+    /// fine. Each attempt is self-contained — a new run id every second, so
+    /// no collision with a failed attempt's leftovers — so poll `Err` and
+    /// return the first `Ok`; a persistent failure surfaces as the last Err.
+    async fn create_run_with_retry(request: &SpawnRequest) -> anyhow::Result<CreatedRun> {
+        // Operation-level, so a longer bound than the per-spawn helper's.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match create_run(request).await {
+                Ok(created) => return Ok(created),
+                Err(err) => {
+                    if Instant::now() >= deadline {
+                        return Err(err);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
 
     fn init_repo(name: &str) -> PathBuf {
         let root = tmp_dir(name);
@@ -252,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn create_run_builds_layout_worktree_and_initial_state() {
         let root = init_repo("parl-spawn-");
-        let created = create_run(&request("auth-worker", "create hello", &root, true))
+        let created = create_run_with_retry(&request("auth-worker", "create hello", &root, true))
             .await
             .unwrap();
         assert!(
@@ -293,7 +316,9 @@ mod tests {
     #[tokio::test]
     async fn create_run_in_a_plain_directory_runs_in_place() {
         let dir = tmp_dir("parl-spawn-plain-");
-        let created = create_run(&request("flat", "b", &dir, true)).await.unwrap();
+        let created = create_run_with_retry(&request("flat", "b", &dir, true))
+            .await
+            .unwrap();
         assert_eq!(created.worktree_path, None);
         assert_eq!(created.state.branch, None);
         assert!(!created.state.is_git);
@@ -304,7 +329,7 @@ mod tests {
     #[tokio::test]
     async fn create_run_skips_the_worktree_when_asked() {
         let root = init_repo("parl-spawn-");
-        let created = create_run(&request("nowt", "b", &root, false))
+        let created = create_run_with_retry(&request("nowt", "b", &root, false))
             .await
             .unwrap();
         assert_eq!(created.worktree_path, None);
