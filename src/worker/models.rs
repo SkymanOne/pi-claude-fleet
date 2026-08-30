@@ -6,7 +6,7 @@
 //! (Ported from the TypeScript `src/models.ts`.)
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::paths::env_var;
@@ -30,12 +30,12 @@ pub fn pi_bin_spec() -> String {
 
 /// Model names pi reports, or an empty list when it cannot be asked.
 pub async fn list_models(pi_bin: &str) -> Vec<String> {
-    if let Some(cached) = CACHE
+    let cached = CACHE
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .get(pi_bin)
-        .cloned()
-    {
+        .cloned();
+    if let Some(cached) = cached {
         return cached;
     }
     let mut argv = pi_bin.split_whitespace();
@@ -44,11 +44,10 @@ pub async fn list_models(pi_bin: &str) -> Vec<String> {
     };
     let mut command = tokio::process::Command::new(bin);
     command.args(argv).arg("--list-models");
-    let output = match tokio::time::timeout(LIST_TIMEOUT, command.output()).await {
-        Ok(Ok(output)) => output,
+    let Ok(Ok(output)) = tokio::time::timeout(LIST_TIMEOUT, command.output()).await else {
         // Spawn failure, or the child outlived its welcome (dropping the
         // future kills it): either way pi is unaskable.
-        Ok(Err(_)) | Err(_) => return Vec::new(),
+        return Vec::new();
     };
     // "provider  model  context  max-out  thinking  images" — the name is the
     // second whitespace column, under a header line.
@@ -65,7 +64,7 @@ pub async fn list_models(pi_bin: &str) -> Vec<String> {
     if !names.is_empty() {
         CACHE
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(pi_bin.to_string(), names.clone());
     }
     names
@@ -73,6 +72,11 @@ pub async fn list_models(pi_bin: &str) -> Vec<String> {
 
 /// `None` when the model is fine or pi cannot be asked; otherwise a message
 /// naming the closest models, so the caller can pick one straight away.
+///
+/// # Errors
+///
+/// Never today: an unaskable pi reports `Ok(None)`, and the signature keeps
+/// room for a hard failure in the listing path.
 pub async fn check_model(pi_bin: &str, pattern: Option<&str>) -> anyhow::Result<Option<String>> {
     let Some(pattern) = pattern.filter(|p| !p.is_empty()) else {
         return Ok(None);
@@ -120,6 +124,7 @@ fn shares_stem(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use crate::util::new_id;
+    use std::fmt::Write as _;
     use std::path::PathBuf;
 
     fn write_fake_pi(body: &str) -> PathBuf {
@@ -135,12 +140,14 @@ mod tests {
     }
 
     fn listing_script(rows: &[&str]) -> String {
-        let body: String = rows.iter().map(|r| format!("  echo '{r}'\n")).collect();
-        write_fake_pi(&format!(
-            "#!/bin/sh\ncase \" $* \" in *--list-models*)\n  echo 'provider           model                context'\n{body};;\nesac\n"
-        ))
-        .to_string_lossy()
-        .into_owned()
+        let mut body = String::from(
+            "#!/bin/sh\ncase \" $* \" in *--list-models*)\n  echo 'provider           model                context'\n",
+        );
+        for r in rows {
+            let _ = writeln!(body, "  echo '{r}'");
+        }
+        body.push_str(";;\nesac\n");
+        write_fake_pi(&body).to_string_lossy().into_owned()
     }
 
     #[tokio::test]

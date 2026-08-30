@@ -23,6 +23,10 @@ pub type ProtocolMessage = Value;
 
 /// Decode one stdout line of the claude stream. Malformed JSON is an error;
 /// callers that must tolerate junk lines use [`parse_claude_line`].
+///
+/// # Errors
+///
+/// Returns an error when `line` is not valid JSON.
 pub fn decode_message(line: &str) -> anyhow::Result<ProtocolMessage> {
     serde_json::from_str(line).map_err(|e| anyhow::anyhow!("malformed claude stream line: {e}"))
 }
@@ -228,7 +232,7 @@ pub fn is_system_init(msg: &Value) -> bool {
 #[must_use]
 pub fn is_control_request(msg: &Value) -> bool {
     msg.get("type").and_then(Value::as_str) == Some("control_request")
-        && msg.get("request_id").map(Value::is_string).unwrap_or(false)
+        && msg.get("request_id").is_some_and(Value::is_string)
 }
 
 /// A control request asking permission to use a tool.
@@ -313,8 +317,7 @@ fn blocks_of(msg: &Value) -> &[Value] {
     msg.get("message")
         .and_then(|m| m.get("content"))
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
+        .map_or(&[], Vec::as_slice)
 }
 
 /// A `tool_use` block: the model calls a tool.
@@ -436,10 +439,7 @@ pub fn is_replayed_user_message(msg: &Value) -> bool {
     !msg.get("isSynthetic")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        && msg
-            .get("parent_tool_use_id")
-            .map(Value::is_null)
-            .unwrap_or(false)
+        && msg.get("parent_tool_use_id").is_some_and(Value::is_null)
         && user_text(msg).is_some()
 }
 
@@ -468,7 +468,7 @@ pub fn user_message(text: &str) -> Value {
 
 /// A successful control response carrying an arbitrary payload.
 #[must_use]
-pub fn control_response(request_id: &str, response: Value) -> Value {
+pub fn control_response(request_id: &str, response: &Value) -> Value {
     json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":response}})
 }
 
@@ -485,13 +485,13 @@ pub fn allow_response(
     if let Some(perms) = updated_permissions.filter(|p| !p.is_empty()) {
         decision.insert("updatedPermissions".into(), Value::Array(perms.to_vec()));
     }
-    control_response(request_id, Value::Object(decision))
+    control_response(request_id, &Value::Object(decision))
 }
 
 /// Deny a tool call with a reason shown to the model.
 #[must_use]
 pub fn deny_response(request_id: &str, message: &str) -> Value {
-    control_response(request_id, json!({"behavior":"deny","message":message}))
+    control_response(request_id, &json!({"behavior":"deny","message":message}))
 }
 
 /// AskUserQuestion is answered by allowing the tool with the original
@@ -508,7 +508,7 @@ pub fn ask_user_question_response(request_id: &str, input: Value, answers: Value
 
 /// A control request: `interrupt`, `set_permission_mode`, `initialize`, …
 #[must_use]
-pub fn control_request(request_id: &str, request: Value) -> Value {
+pub fn control_request(request_id: &str, request: &Value) -> Value {
     json!({"type":"control_request","request_id":request_id,"request":request})
 }
 
@@ -520,7 +520,7 @@ pub fn interrupt_request(request_id: &str, cancel_queued: bool) -> Value {
     } else {
         json!({"subtype":"interrupt"})
     };
-    control_request(request_id, body)
+    control_request(request_id, &body)
 }
 
 /// Change how prompts are handled mid-session.
@@ -528,7 +528,7 @@ pub fn interrupt_request(request_id: &str, cancel_queued: bool) -> Value {
 pub fn set_permission_mode_request(request_id: &str, mode: &str) -> Value {
     control_request(
         request_id,
-        json!({"subtype":"set_permission_mode","mode":mode}),
+        &json!({"subtype":"set_permission_mode","mode":mode}),
     )
 }
 
@@ -537,16 +537,16 @@ pub fn set_permission_mode_request(request_id: &str, mode: &str) -> Value {
 /// `apply_flag_settings`, which succeeds without validating.
 #[must_use]
 pub fn set_model_request(request_id: &str, model: &str) -> Value {
-    control_request(request_id, json!({"subtype":"set_model","model":model}))
+    control_request(request_id, &json!({"subtype":"set_model","model":model}))
 }
 
 /// Merge settings into the running session — `effort`, say. Unlike sending
 /// `/effort` as a message, this changes nothing in the conversation.
 #[must_use]
-pub fn apply_flag_settings_request(request_id: &str, settings: Value) -> Value {
+pub fn apply_flag_settings_request(request_id: &str, settings: &Value) -> Value {
     control_request(
         request_id,
-        json!({"subtype":"apply_flag_settings","settings":settings}),
+        &json!({"subtype":"apply_flag_settings","settings":settings}),
     )
 }
 
@@ -558,7 +558,7 @@ pub fn initialize_request(request_id: &str, extra: Value) -> Value {
     if let Value::Object(map) = extra {
         body.extend(map);
     }
-    control_request(request_id, Value::Object(body))
+    control_request(request_id, &Value::Object(body))
 }
 
 /// Serialize one message as a single JSON line.
@@ -589,7 +589,8 @@ fn base36(mut value: u64) -> String {
 #[must_use]
 pub fn new_request_id() -> String {
     let seq = REQUEST_SEQ.fetch_add(1, Ordering::Relaxed);
-    let millis = crate::util::now_ms().max(0) as u64;
+    // now_ms() is i64 epoch millis; clamp negatives to 0, then widen to u64.
+    let millis = u64::try_from(crate::util::now_ms().max(0)).unwrap_or_default();
     let random: u64 = rand::random();
     format!(
         "req_{}_{}_{:0>6}",
@@ -754,7 +755,7 @@ mod tests {
         assert!(!is_ask_user_question(&body));
         let as_ask = CanUseToolRequest {
             tool_name: "AskUserQuestion".into(),
-            ..body.clone()
+            ..body
         };
         assert!(is_ask_user_question(&as_ask));
 

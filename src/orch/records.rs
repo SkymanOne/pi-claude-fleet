@@ -214,7 +214,7 @@ pub struct OrchestratorState {
 /// The version stamped on freshly created state.
 const STATE_VERSION: u8 = 1;
 
-fn default_version() -> u8 {
+const fn default_version() -> u8 {
     STATE_VERSION
 }
 
@@ -372,7 +372,12 @@ impl EventRecord {
                 error: body.get("error").and_then(Value::as_bool),
             },
             "exit" => OrchestratorEvent::Exit {
-                code: body.get("code").and_then(Value::as_i64).map(|c| c as i32),
+                // codes are written as i32 by us; a wider foreign value is
+                // treated as unknown rather than wrapped
+                code: body
+                    .get("code")
+                    .and_then(Value::as_i64)
+                    .and_then(|c| i32::try_from(c).ok()),
                 signal: body
                     .get("signal")
                     .filter(|v| !v.is_null())
@@ -400,6 +405,10 @@ fn string_field(body: &Map<String, Value>, key: &str) -> String {
 ///
 /// Errors are the caller's problem: the transcript is best effort, and
 /// `state.json` is what matters.
+///
+/// # Errors
+///
+/// Returns an I/O error when the file cannot be created or appended to.
 pub fn append_record(events_path: &Path, record: &EventRecord) -> std::io::Result<()> {
     append_json_line(events_path, record)
 }
@@ -415,7 +424,7 @@ pub struct Transcript {
 impl Transcript {
     /// A writer appending to `path`.
     #[must_use]
-    pub fn new(path: PathBuf) -> Self {
+    pub const fn new(path: PathBuf) -> Self {
         Self {
             path,
             pending_text: String::new(),
@@ -428,6 +437,10 @@ impl Transcript {
     }
 
     /// Write any pending text as one `stream_text` record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the record cannot be appended.
     pub fn flush_text(&mut self) -> std::io::Result<bool> {
         if self.pending_text.is_empty() {
             return Ok(false);
@@ -441,6 +454,10 @@ impl Transcript {
     }
 
     /// Append one record, flushing pending text first so ordering stays sane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when either record cannot be appended.
     pub fn write(&mut self, event: &OrchestratorEvent) -> std::io::Result<()> {
         self.flush_text()?;
         append_record(&self.path, &event.to_record())
@@ -700,7 +717,7 @@ mod tests {
             "type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]},
             "parent_tool_use_id":null,"session_id":"s",
         });
-        let event = OrchestratorEvent::Passthrough(claude_msg.clone());
+        let event = OrchestratorEvent::Passthrough(claude_msg);
         let record = event.to_record();
         let line = serde_json::to_string(&record).unwrap();
         let parsed: EventRecord = serde_json::from_str(&line).unwrap();

@@ -121,6 +121,11 @@ pub fn load(fleet_dir: &Path) -> Option<OrchestratorSession> {
 }
 
 /// Persist the session, stamping `last_used_at`.
+///
+/// # Errors
+///
+/// Returns an I/O error when the fleet directory cannot be created or the
+/// session file cannot be written.
 pub fn save(fleet_dir: &Path, session: &mut OrchestratorSession) -> std::io::Result<()> {
     session.last_used_at = now_iso();
     let mut to_write = session.clone();
@@ -177,7 +182,7 @@ mod tests {
             model: Some("fable".into()),
             budget_usd: Some(5.0),
             permission_mode: Some("acceptEdits".into()),
-            remote_control: Some("".into()),
+            remote_control: Some(String::new()),
             fresh: Some(true),
         };
         save(&fleet, &mut session).unwrap();

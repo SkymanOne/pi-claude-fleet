@@ -62,14 +62,13 @@ pub fn render_prompt_template(template: &str, vars: &PromptVars) -> String {
         let key = caps
             .get(1)
             .map_or(String::new(), |m| m.as_str().to_string());
-        values
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, value)| value.clone())
-            .unwrap_or_else(|| {
+        values.iter().find(|(k, _)| *k == key).map_or_else(
+            || {
                 caps.get(0)
                     .map_or(String::new(), |m| m.as_str().to_string())
-            })
+            },
+            |(_, value)| value.clone(),
+        )
     })
     .into_owned()
 }
@@ -85,6 +84,10 @@ fn placeholder_regex() -> Option<&'static regex::Regex> {
 /// user intent, and silently falling back would hide the mistake.
 ///
 /// The env value and home directory are injectable (tests).
+///
+/// # Errors
+///
+/// Returns an error when `$PARL_PROMPT` points at something that is not a file.
 pub fn resolve_prompt_source(
     parl_prompt: Option<&str>,
     repo_root: &Path,
@@ -114,6 +117,10 @@ pub fn resolve_prompt_source(
 }
 
 /// [`resolve_prompt_source`] against the real environment.
+///
+/// # Errors
+///
+/// Returns an error when `$PARL_PROMPT` points at something that is not a file.
 pub fn prompt_source(repo_root: &Path) -> anyhow::Result<Option<PathBuf>> {
     resolve_prompt_source(
         std::env::var(env_var("PROMPT")).ok().as_deref(),
@@ -123,6 +130,10 @@ pub fn prompt_source(repo_root: &Path) -> anyhow::Result<Option<PathBuf>> {
 }
 
 /// Render the prompt for the fleet rooted at `fleet_dir` working in `repo_root`.
+///
+/// # Errors
+///
+/// Returns an error when the resolved override cannot be read.
 pub fn render_prompt(fleet_dir: &Path, repo_root: &Path) -> anyhow::Result<String> {
     let template = match prompt_source(repo_root)? {
         Some(path) => std::fs::read_to_string(&path)?,
@@ -141,6 +152,10 @@ pub fn render_prompt(fleet_dir: &Path, repo_root: &Path) -> anyhow::Result<Strin
 
 /// Render and write to `<fleetDir>/orchestrator/prompt.md` (what
 /// `--append-system-prompt-file` reads); returns the path.
+///
+/// # Errors
+///
+/// Returns an error when the prompt cannot be rendered or the file written.
 pub fn write_prompt(fleet_dir: &Path, repo_root: &Path) -> anyhow::Result<PathBuf> {
     let target = prompt_path(fleet_dir);
     if let Some(parent) = target.parent() {
@@ -187,7 +202,7 @@ mod tests {
         ] {
             assert!(text.contains(&format!("`{tool}`")), "mentions {tool}");
         }
-        assert!(text.contains(r##"<fleet-event kind="settled""##), "{text}");
+        assert!(text.contains(r#"<fleet-event kind="settled""#), "{text}");
         for kind in [
             "settled",
             "stopped",
@@ -299,7 +314,7 @@ mod tests {
         std::fs::write(&repo_override, "repo").unwrap();
         assert_eq!(
             resolve_prompt_source(None, &repo, Some(&home)).unwrap(),
-            Some(repo_override.clone())
+            Some(repo_override)
         );
         // $PARL_PROMPT beats everything
         let env_file = repo.join("custom-prompt.md");

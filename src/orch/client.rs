@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::Context as _;
 use tokio::sync::mpsc;
@@ -71,7 +71,7 @@ pub struct OrchestratorClientOptions {
 impl OrchestratorClientOptions {
     /// Options for a console in `cwd`.
     #[must_use]
-    pub fn new(fleet_dir: PathBuf, cwd: PathBuf) -> Self {
+    pub const fn new(fleet_dir: PathBuf, cwd: PathBuf) -> Self {
         Self {
             fleet_dir,
             cwd,
@@ -103,15 +103,12 @@ struct ClientInner {
 
 impl ClientInner {
     fn send(&mut self, event: ClientEvent) {
-        match &self.sender {
-            Some(sender) => {
-                let _ = sender.send(event);
-            }
-            None => {
-                self.buffered.push(event);
-                while self.buffered.len() > MAX_BUFFERED_RECORDS {
-                    self.buffered.remove(0);
-                }
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(event);
+        } else {
+            self.buffered.push(event);
+            while self.buffered.len() > MAX_BUFFERED_RECORDS {
+                self.buffered.remove(0);
             }
         }
     }
@@ -147,7 +144,7 @@ impl OrchestratorClient {
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, ClientInner> {
-        self.inner.lock().unwrap_or_else(|err| err.into_inner())
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Receive events from here on, plus everything held before this call —
@@ -178,6 +175,11 @@ impl OrchestratorClient {
     ///
     /// A fresh start clears the transcript; otherwise the existing one is
     /// replayed. Returns whether it attached to a live monitor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the orchestrator directory cannot be created or
+    /// the monitor cannot be spawned.
     pub fn start(self: &Arc<Self>) -> anyhow::Result<bool> {
         let paths = self.paths();
         std::fs::create_dir_all(paths.orchestrator_dir())?;
@@ -192,7 +194,7 @@ impl OrchestratorClient {
             } else {
                 // a control file from a dead monitor would be replayed by the new one
                 let _ = std::fs::remove_file(paths.orchestrator_inbox());
-                self.trim_transcript(&paths.orchestrator_events());
+                Self::trim_transcript(&paths.orchestrator_events());
             }
             self.spawn_monitor()?;
         }
@@ -212,25 +214,27 @@ impl OrchestratorClient {
     }
 
     fn poll_task(&self) -> MutexGuard<'_, Option<tokio::task::JoinHandle<()>>> {
-        self.poll_task.lock().unwrap_or_else(|err| err.into_inner())
+        self.poll_task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Stop the poll loop; the monitor itself keeps running.
     pub fn stop(&self) {
-        if let Some(task) = self.poll_task().take() {
+        let task = self.poll_task().take();
+        if let Some(task) = task {
             task.abort();
         }
     }
 
     /// One pass over the monitor's files. Public so tests drive it by hand.
     pub fn tick(&self) {
-        let (lines, offset) = {
+        let lines = {
             let mut inner = self.inner();
             let (lines, offset) = read_new_lines(&self.paths().orchestrator_events(), inner.offset);
             inner.offset = offset;
-            (lines, offset)
+            lines
         };
-        let _ = offset;
         let mut inner = self.inner();
         for line in lines {
             let Ok(record) = serde_json::from_str::<EventRecord>(&line) else {
@@ -277,11 +281,21 @@ impl OrchestratorClient {
     }
 
     /// Ask the monitor to shut the orchestrator down for good.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the command cannot be written to the
+    /// orchestrator's inbox (no monitor, or an unwritable fleet directory).
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.command(&OrchestratorCommand::Stop).await
     }
 
     /// A user turn for the orchestrator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the command cannot be written to the
+    /// orchestrator's inbox.
     pub async fn send(&self, text: &str) -> anyhow::Result<()> {
         self.command(&OrchestratorCommand::User {
             text: text.to_string(),
@@ -289,10 +303,18 @@ impl OrchestratorClient {
         .await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the command cannot be written to the
+    /// orchestrator's inbox.
     pub async fn interrupt(&self) -> anyhow::Result<()> {
         self.command(&OrchestratorCommand::Interrupt).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the command cannot be written to the
+    /// orchestrator's inbox.
     pub async fn set_effort(&self, level: &str) -> anyhow::Result<()> {
         self.command(&OrchestratorCommand::Effort {
             level: level.to_string(),
@@ -300,6 +322,10 @@ impl OrchestratorClient {
         .await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the command cannot be written to the
+    /// orchestrator's inbox.
     pub async fn set_permission_mode(&self, mode: &str) -> anyhow::Result<()> {
         self.command(&OrchestratorCommand::PermissionMode {
             mode: mode.to_string(),
@@ -309,6 +335,11 @@ impl OrchestratorClient {
 
     /// Switch the orchestrator's model live; claude validates the name itself
     /// and its error text is surfaced verbatim in the transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the command cannot be written to the
+    /// orchestrator's inbox.
     pub async fn set_model(&self, name: &str) -> anyhow::Result<()> {
         self.command(&OrchestratorCommand::Model {
             name: name.to_string(),
@@ -319,6 +350,11 @@ impl OrchestratorClient {
     /// Remote Control is a launch flag, so the monitor gives the session a
     /// new claude child with it set. The monitor stays up and the conversation
     /// is resumed, so nothing here restarts and no console sees an exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the command cannot be written to the
+    /// orchestrator's inbox.
     pub async fn enable_remote_control(&self, name: &str) -> anyhow::Result<()> {
         self.command(&OrchestratorCommand::RemoteControl {
             name: Some(name.to_string()),
@@ -327,6 +363,11 @@ impl OrchestratorClient {
     }
 
     /// Allow a pending tool call, optionally adopting claude's suggested rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the command cannot be written to the
+    /// orchestrator's inbox.
     pub async fn allow(
         &self,
         request_id: &str,
@@ -342,6 +383,11 @@ impl OrchestratorClient {
     }
 
     /// Deny a pending tool call with a reason shown to the model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the command cannot be written to the
+    /// orchestrator's inbox.
     pub async fn deny(&self, request_id: &str, message: &str) -> anyhow::Result<()> {
         self.command(&OrchestratorCommand::Permission {
             request_id: request_id.to_string(),
@@ -353,6 +399,11 @@ impl OrchestratorClient {
     }
 
     /// Answer an AskUserQuestion (answers keyed by question text).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the command cannot be written to the
+    /// orchestrator's inbox.
     pub async fn answer_question(
         &self,
         request_id: &str,
@@ -367,12 +418,11 @@ impl OrchestratorClient {
 
     async fn command(&self, command: &OrchestratorCommand) -> anyhow::Result<()> {
         append_command(&self.options.fleet_dir, command)
-            .await
             .context("cannot write to the orchestrator inbox")
     }
 
     /// Keep the transcript restorable without letting it grow forever.
-    fn trim_transcript(&self, events_path: &std::path::Path) {
+    fn trim_transcript(events_path: &std::path::Path) {
         let Ok(raw) = std::fs::read_to_string(events_path) else {
             return; // no transcript yet, or unreadable: nothing to trim
         };
@@ -413,7 +463,7 @@ impl OrchestratorClient {
             session::load(&self.options.fleet_dir)
                 .unwrap_or_else(|| OrchestratorSession::new(&cwd_string))
         };
-        session_record.cwd = cwd_string.clone();
+        session_record.cwd = cwd_string;
         session_record.launch = LaunchOptions {
             model: self.options.model.clone(),
             budget_usd: self
@@ -479,18 +529,11 @@ fn exit_of(event: &OrchestratorEvent) -> Option<(Option<i32>, Option<String>)> {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::util::atomic_write_json;
     use serde_json::json;
-
-    fn client_for(fleet_dir: &std::path::Path, cwd: &std::path::Path) -> Arc<OrchestratorClient> {
-        OrchestratorClient::new(OrchestratorClientOptions::new(
-            fleet_dir.to_path_buf(),
-            cwd.to_path_buf(),
-        ))
-    }
+    use std::fmt::Write as _;
 
     fn record(kind: &str, text: &str) -> EventRecord {
         EventRecord {
@@ -593,7 +636,7 @@ mod tests {
         let mut state = crate::orch::records::new_orchestrator_state("/repo");
         state.pending_requests = vec![crate::orch::protocol::PermissionRequest {
             request_id: "req_1".into(),
-            request: Default::default(),
+            request: crate::orch::protocol::CanUseToolRequest::default(),
             received_at: crate::util::now_iso(),
         }];
         crate::util::atomic_write_json(&FleetPaths::new(&fleet).orchestrator_state(), &state)
@@ -636,14 +679,13 @@ mod tests {
         let events_path = tmp.path().join("events.jsonl");
         let mut raw = String::new();
         for i in 0..(MAX_RESTORED_LINES + 10) {
-            raw.push_str(&format!("{{\"type\":\"stream_text\",\"text\":\"{i}\"}}\n"));
+            let _ = writeln!(raw, "{{\"type\":\"stream_text\",\"text\":\"{i}\"}}");
         }
         std::fs::write(&events_path, &raw).unwrap();
-        let client = client_for(tmp.path().join(".parl").as_path(), tmp.path());
-        client.trim_transcript(&events_path);
+        OrchestratorClient::trim_transcript(&events_path);
         let kept = std::fs::read_to_string(&events_path).unwrap();
-        let lines: Vec<&str> = kept.split('\n').filter(|l| !l.is_empty()).collect();
-        assert_eq!(lines.len(), MAX_RESTORED_LINES);
+        let count = kept.split('\n').filter(|l| !l.is_empty()).count();
+        assert_eq!(count, MAX_RESTORED_LINES);
         assert!(kept.contains(&format!("\"text\":\"{}\"", MAX_RESTORED_LINES + 9)));
     }
 }

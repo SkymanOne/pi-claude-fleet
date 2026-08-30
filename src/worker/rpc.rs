@@ -10,7 +10,7 @@
 //! so the monitor can mirror selected types and log every line verbatim.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// One parsed line of the pi RPC stream.
 #[derive(Debug, Clone)]
@@ -169,7 +169,7 @@ impl RpcResponse {
         serde_json::from_value::<CommandsData>(
             self.data
                 .clone()
-                .unwrap_or_else(|| Value::Object(Default::default())),
+                .unwrap_or_else(|| Value::Object(Map::default())),
         )
         .map(|d| d.commands)
         .unwrap_or_default()
@@ -181,7 +181,7 @@ impl RpcResponse {
         serde_json::from_value::<AvailableModelsData>(
             self.data
                 .clone()
-                .unwrap_or_else(|| Value::Object(Default::default())),
+                .unwrap_or_else(|| Value::Object(Map::default())),
         )
         .map(|d| d.models)
         .unwrap_or_default()

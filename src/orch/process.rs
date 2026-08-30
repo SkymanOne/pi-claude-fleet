@@ -12,7 +12,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use nix::sys::signal::Signal;
@@ -53,7 +53,7 @@ pub enum ControlOutcome {
 impl ControlOutcome {
     /// The success payload, or none for an error.
     #[must_use]
-    pub fn success(&self) -> Option<&Value> {
+    pub const fn success(&self) -> Option<&Value> {
         match self {
             Self::Success(value) => Some(value),
             Self::Error(_) => None,
@@ -188,9 +188,7 @@ pub struct OrchestratorProcess {
 /// Lock a mutex even if a previous holder panicked; the state is still
 /// consistent enough to keep going.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl OrchestratorProcess {
@@ -227,7 +225,7 @@ impl OrchestratorProcess {
     // -- introspection -----------------------------------------------------
 
     /// The options this process was built with.
-    pub fn options(&self) -> &OrchestratorOptions {
+    pub const fn options(&self) -> &OrchestratorOptions {
         &self.options
     }
 
@@ -342,9 +340,10 @@ impl OrchestratorProcess {
     /// Panics when called twice — starting twice is a programming error, as
     /// in the TypeScript (`throw new Error("orchestrator already started")`).
     pub fn start(self: &Arc<Self>) {
-        if self.started.swap(true, Ordering::AcqRel) {
-            panic!("orchestrator already started");
-        }
+        assert!(
+            !self.started.swap(true, Ordering::AcqRel),
+            "orchestrator already started"
+        );
         if let Some(path) = &self.options.log_path {
             *lock(&self.log) = std::fs::OpenOptions::new()
                 .create(true)
@@ -604,9 +603,12 @@ impl OrchestratorProcess {
     /// Allow a pending tool call, optionally adopting the rules claude
     /// suggested. False when the request is unknown or already answered.
     pub fn allow(&self, request_id: &str, updated_permissions: Option<&[Value]>) -> bool {
-        let input = match lock(&self.state).pending_requests.remove(request_id) {
-            Some(pending) => pending.request.input.clone(),
-            None => return false,
+        let input = {
+            let mut state = lock(&self.state);
+            match state.pending_requests.remove(request_id) {
+                Some(pending) => pending.request.input,
+                None => return false,
+            }
         };
         self.write(&allow_response(request_id, input, updated_permissions))
     }
@@ -619,9 +621,12 @@ impl OrchestratorProcess {
 
     /// Answer an AskUserQuestion request (answers keyed by question text).
     pub fn answer_question(&self, request_id: &str, answers: Value) -> bool {
-        let input = match lock(&self.state).pending_requests.remove(request_id) {
-            Some(pending) => pending.request.input.clone(),
-            None => return false,
+        let input = {
+            let mut state = lock(&self.state);
+            match state.pending_requests.remove(request_id) {
+                Some(pending) => pending.request.input,
+                None => return false,
+            }
         };
         self.write(&ask_user_question_response(request_id, input, answers))
     }
@@ -675,7 +680,7 @@ impl OrchestratorProcess {
     /// the model.
     pub async fn apply_flag_settings(&self, settings: Value) -> Option<ControlOutcome> {
         let id = new_request_id();
-        self.control(&id, apply_flag_settings_request(&id, settings))
+        self.control(&id, apply_flag_settings_request(&id, &settings))
             .await
     }
 
@@ -757,8 +762,9 @@ impl OrchestratorProcess {
     fn signal_process(&self, sig: Signal) {
         let Some(pid) = self.pid() else { return };
         // ESRCH: it died between the check and the signal — fine. EPERM: not
-        // ours to signal — nothing to do either.
-        let _ = nix::sys::signal::kill(Pid::from_raw(pid as i32), sig);
+        // ours to signal — nothing to do either. Unix pids fit in i32
+        // (pid_max ≪ 2^31); the fallback only ever fails harmlessly.
+        let _ = nix::sys::signal::kill(Pid::from_raw(i32::try_from(pid).unwrap_or(i32::MAX)), sig);
     }
 
     // -- stream handling ---------------------------------------------------
@@ -809,8 +815,8 @@ impl OrchestratorProcess {
         }
         if is_control_response(&msg) {
             if let Some(response) = try_control_response(&msg) {
-                if let Some(tx) = lock(&self.control_waiters).remove(&response.response.request_id)
-                {
+                let waiter = lock(&self.control_waiters).remove(&response.response.request_id);
+                if let Some(tx) = waiter {
                     let outcome = if response.response.subtype == "success" {
                         ControlOutcome::Success(
                             response
