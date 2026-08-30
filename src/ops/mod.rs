@@ -121,28 +121,34 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_fleet_dir_anchors_at_the_repo_root_and_realpaths() {
-        let root = tmp_dir("parl-ops-resolve-");
-        git_sync(&root, &["init", "-q", "-b", "main"]);
-        let sub = root.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        let root_real = root.canonicalize().unwrap();
-        let sub_real = sub.canonicalize().unwrap();
-
         // Under full-suite parallel load the git spawn behind the resolution
         // fails transiently, and canonicalize() of the root git reports can
-        // come back NotFound a moment later (see the matching poll in
-        // src/git.rs). Fold the whole resolution into a bounded retry instead
-        // of asserting it in one shot; a persistent mismatch still fails the
-        // test via the bound, loudly, with what the last attempt saw.
-        let deadline = Instant::now() + RETRY_BOUND;
+        // come back NotFound a moment later — the environmental loss
+        // documented in src/git.rs, whose probe this retries the same way,
+        // repo setup included in the retried condition. The bound is tripled
+        // from the shared budget: when another suite churns the same OS temp
+        // directory, the NotFound windows outlast it, and a share-sized
+        // bound burned out without a surviving attempt (observed once in
+        // sixteen full-suite runs). A genuinely broken resolution still
+        // fails loudly via the bound, with what the last attempt saw.
+        let deadline = Instant::now() + 3 * RETRY_BOUND;
         let mut last_seen = String::from("no attempt completed");
-        let in_repo = loop {
+        let (sub_real, in_repo) = loop {
             if Instant::now() >= deadline {
-                panic!(
-                    "resolve_fleet_dir never anchored at the repo root of {}: {last_seen}",
-                    root.display()
-                );
+                panic!("resolve_fleet_dir never anchored at the repo root: {last_seen}");
             }
+            let root = tmp_dir("parl-ops-resolve-");
+            git_sync(&root, &["init", "-q", "-b", "main"]);
+            let sub = root.join("sub");
+            std::fs::create_dir_all(&sub).unwrap();
+            let (root_real, sub_real) = match (root.canonicalize(), sub.canonicalize()) {
+                (Ok(root_real), Ok(sub_real)) => (root_real, sub_real),
+                (root_real, sub_real) => {
+                    last_seen = format!("setup canonicalize: root={root_real:?} sub={sub_real:?}");
+                    tokio::time::sleep(RETRY_INTERVAL).await;
+                    continue;
+                }
+            };
             match resolve_fleet_dir(Some(&sub)).await {
                 Ok(resolved)
                     if resolved.is_git
@@ -150,10 +156,11 @@ mod tests {
                             .repo_root
                             .as_ref()
                             .and_then(|repo| repo.canonicalize().ok())
-                            .is_some_and(|real| real == root_real)
-                        && resolved.paths.root() == root_real.join(".parl") =>
+                            .is_some_and(|real| *real == root_real)
+                        && resolved.paths.root() == root_real.join(".parl")
+                        && resolved.target_dir == sub_real =>
                 {
-                    break resolved;
+                    break (sub_real, resolved);
                 }
                 Ok(resolved) => {
                     // keep what the failed attempt actually saw
