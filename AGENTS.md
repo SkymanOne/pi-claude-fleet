@@ -106,6 +106,8 @@ The worker monitor treats a dialog request like a `fleet_ask` pending question. 
 - A user message injected mid-turn is delivered inside the running turn as a system-reminder right after the next tool result. Whether the model acts on it is up to the model (haiku once folded it in, once ignored it as a possible prompt injection). This is why the orchestrator prompt states that `<fleet-event>` messages arriving mid-turn are legitimate and must be acted on.
 - Permission modes: `--help` advertises acceptEdits, auto, bypassPermissions, manual, dontAsk and plan. `default` is not in that list but the flag accepts it, as a hidden alias for `manual`. (`bogus` is rejected, so the choice is validated.) Over the control protocol, `set_permission_mode` succeeds for every one of default/auto/acceptEdits/dontAsk/plan/manual, so the modes the console offers work both at launch and mid-session. The claude Agent SDK type definitions still exist, at `~/Library/Application Support/Code/agent-host/sdk-cache/claude/0.3.220/darwin-arm64/node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts` (only the old path went away). Its `PermissionMode` type lags the flag reality.
 
+**4. `deepseek-v4-flash` is provider-dependent (measured 2026-08-30).** On `openrouter` pi receives well-formed structured tool calls, but the model never invokes a write tool — runs end with no edits, no commit, no report, so it is unusable for agentic work. On `opencode-go` it edits and commits normally; `opencode-go` needs an explicit account opt-in, without which every spawn dies instantly with `403 {"type":"RegionError", ...}`.
+
 ## The `.parl` layout
 
 ```text
@@ -156,9 +158,8 @@ Gone for good: the top-level `reports/` directory, `orchestrator.json`, the per-
 
 ## Known issues
 
-- **The orchestrator monitor does not exit when its fleet directory disappears.** During the rewrite, 16 orphaned `parl orchestrator-monitor` processes accumulated from a deleted worktree, polling on timers for an hour against temp dirs that no longer existed. In real use, deleting `.parl` leaves a monitor running forever. The fix is a liveness check on the fleet dir in the monitor's poll loop.
 - **`fleet_spawn`'s structured output field is `fleetDir`**, where the TypeScript emitted `piFleetDir`. Intentional, since it follows `SpawnData`'s serialisation, but noted in case anything reads it.
-- **Test flakes: one repair round merged, two sites still open.** The merged round (`cf08a69`) fixed the zombie reap in `launch_monitor`, the transient git-subprocess family (now one shared bounded-retry `git::test_support::git_sync` helper) and the `run.json` flush races in `tests/worker_monitor.rs`, then held for 11 consecutive clean full-suite runs. Two sites still fail under heavy parallel load, both the same environmental family of fresh paths and transient subprocess results: `src/ops/mod.rs:157`, where `canonicalize()` of the git-reported root returns NotFound about 3% of runs, and `src/worker/models.rs:155/:176`, where the model listing transiently returns nothing and `list_models` caches the empty result.
+- **Test flakes: one repair round merged, one site traced to the `PARL_DIR` leak, one still open.** The merged round (`cf08a69`) fixed the zombie reap in `launch_monitor`, the transient git-subprocess family (now one shared bounded-retry `git::test_support::git_sync` helper) and the `run.json` flush races in `tests/worker_monitor.rs`, then held for 11 consecutive clean full-suite runs. The `src/ops/mod.rs:149` flake — `canonicalize()` of the git-reported root returns NotFound about 3% of runs — now looks like the test-isolation leak, not load: tests resolved the ambient `PARL_DIR` and a bare `cargo test` inside a live fleet operated on the real `.parl` while other agents mutated it concurrently, which produces exactly that transient symptom. The leak was fixed in `cb9cf81` (resolution is injectable, tests pass `None` and never read the environment) and the suite has run green since; if the flake recurs post-fix it really is environmental. Still open: `src/worker/models.rs:17/:65`, where `list_models` transiently returns nothing and caches the empty result.
 
 ## Traps
 
@@ -189,6 +190,8 @@ cargo build --release
 
 The suite is hermetic: the pi and claude sides are driven by Node fakes in `tests/fixtures/` (`fake-pi-parl.mjs`, `fake-claude.mjs` and friends), so a full run spends no tokens and touches no network. It does need `node` on PATH. Integration tests drive the built `parl` binary through `assert_cmd`, including `parl monitor` as a real child process, so pid liveness, monitor exit and signals are exercised the way production runs.
 
+Tests never resolve an ambient `PARL_DIR`. `FleetPaths::discover` prefers `$PARL_DIR` over `<cwd>/.parl` — right for production, but a bare `cargo test` inside a live fleet (the monitor exports `PARL_DIR`) used to operate on the real fleet: fixture runs, worktrees whose git admin dirs pointed into the test's own tempdir, and real `abort` envelopes that killed live agents mid-task. Resolution is therefore injectable end to end — `FleetPaths::discover_with_env`, `resolve_fleet_dir_with_env`, `resolve_run_with_env`, the `*_core_with_env` twins in `ops/`, `FleetServer::with_parl_dir` — with the public forms delegating to the ambient value and tests passing `None`. Every test that spawns the `parl` binary pins `PARL_DIR` per child with `Command::env`, or `env_remove`s it where the `<cwd>/.parl` fallback is the point under test (`tests/console_refusal.rs`); `std::env::set_var`/`remove_var` are `unsafe` in edition 2024 and `unsafe_code` is forbidden crate-wide, so per-child env is the only tool. Regression: `spawn_writes_only_to_the_fleet_dir_it_was_given` in `tests/cli_e2e.rs` proves a spawned `parl` writes only into the fleet dir it was given.
+
 Knobs, all derived from `ENV_PREFIX`:
 
 | Variable | Effect |
@@ -199,3 +202,13 @@ Knobs, all derived from `ENV_PREFIX`:
 | `PARL_PROMPT` | the orchestrator prompt override (set-but-missing is an error) |
 | `PARL_ASK_TIMEOUT_MS`, `PARL_ASK_POLL_MS` | shorten a worker's `fleet_ask` wait and its poll interval |
 | `PARL_RUN` | the run a worker's extension reports into |
+
+Run the full suite the sanctioned way, into a throwaway fleet dir, and check it stayed empty:
+
+```bash
+mkdir -p /tmp/parl-canary && rm -rf /tmp/parl-canary/*
+PARL_DIR=/tmp/parl-canary cargo test --all-features
+ls -A /tmp/parl-canary     # MUST print nothing
+```
+
+fmt, clippy and build all passed before the isolation bug was fixed, so they cannot detect this class of failure — a non-empty canary is the only signal that catches it. The suite is currently 422 tests, all green.
