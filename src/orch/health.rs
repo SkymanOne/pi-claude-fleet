@@ -222,7 +222,11 @@ pub struct ReapResult {
 /// than leaving one behind. A row without a recorded start time skips the
 /// second guard — the session-unique matcher still stands alone.
 #[must_use]
-pub fn reap_orphan_orchestrator(pid: Option<i32>, matcher: &str, started_at: Option<i64>) -> ReapResult {
+pub fn reap_orphan_orchestrator(
+    pid: Option<i32>,
+    matcher: &str,
+    started_at: Option<i64>,
+) -> ReapResult {
     if !is_alive(pid) {
         return ReapResult {
             reaped: false,
@@ -391,9 +395,7 @@ mod tests {
         let started = process_started_at(pid).expect("the process start is readable");
         let result = reap_orphan_orchestrator(Some(pid), &matcher, Some(started));
         assert!(!result.reaped, "{result:?}");
-        let reason = result
-            .reason
-            .expect("it explains why it left it alone");
+        let reason = result.reason.expect("it explains why it left it alone");
         assert!(
             reason.contains("is not a") && reason.contains("--session"),
             "{reason}"
@@ -418,9 +420,7 @@ mod tests {
         let recorded = now - 60;
         let result = reap_orphan_orchestrator(Some(pid), "sleep", Some(recorded));
         assert!(!result.reaped, "{result:?}");
-        let reason = result
-            .reason
-            .expect("it says why it left it alone");
+        let reason = result.reason.expect("it says why it left it alone");
         assert!(reason.contains("recycled pid"), "{reason}");
         assert!(is_alive(Some(pid)), "the recycled occupant survives");
         let _ = child.wait();

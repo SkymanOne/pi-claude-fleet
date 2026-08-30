@@ -79,14 +79,24 @@ fn build() -> TwoSessions {
 /// Environment for one monitor's spawn: the scripted claude, a pinned
 /// `PARL_DIR` (test isolation: nothing ambient may leak in), and the fake
 /// claude's session identity, distinct per session.
-fn monitor_env(fleet_dir: &Path, fake_session_id: &str, argv_file: &Path) -> HashMap<String, String> {
+fn monitor_env(
+    fleet_dir: &Path,
+    fake_session_id: &str,
+    argv_file: &Path,
+) -> HashMap<String, String> {
     let mut env = HashMap::new();
     env.insert(
         "PARL_CLAUDE_BIN".to_string(),
         format!("node {}", fake_claude().display()),
     );
-    env.insert("PARL_DIR".to_string(), fleet_dir.to_string_lossy().into_owned());
-    env.insert("FAKE_CLAUDE_SESSION_ID".to_string(), fake_session_id.to_string());
+    env.insert(
+        "PARL_DIR".to_string(),
+        fleet_dir.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "FAKE_CLAUDE_SESSION_ID".to_string(),
+        fake_session_id.to_string(),
+    );
     env.insert(
         "FAKE_CLAUDE_ARGV_FILE".to_string(),
         argv_file.to_string_lossy().into_owned(),
@@ -169,8 +179,12 @@ async fn wait_for_child_exit(
                      stderr tail: {:?})",
                     removed_dir.exists(),
                     fleet_dir.exists(),
-                    std::fs::read_to_string(err_file)
-                        .map(|s| s.lines().rev().take(4).collect::<Vec<_>>().join(" | "))
+                    std::fs::read_to_string(err_file).map(|s| s
+                        .lines()
+                        .rev()
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .join(" | "))
                 );
                 tokio::time::sleep(POLL).await;
             }
@@ -248,12 +262,30 @@ async fn two_live_sessions_are_isolated_and_one_dir_removal_stops_only_its_own_m
     );
 
     // Both boot: pid on disk, then the fake claude reports its own session id.
-    wait_for("a-state", WAIT, || state_of(fleet_dir, &fix.a.key()).is_some()).await;
-    wait_for("b-state", WAIT, || state_of(fleet_dir, &fix.b.key()).is_some()).await;
-    append_command(fleet_dir, &fix.a.key(), &OrchestratorCommand::User { text: "hello".into() })
-        .unwrap();
-    append_command(fleet_dir, &fix.b.key(), &OrchestratorCommand::User { text: "hello".into() })
-        .unwrap();
+    wait_for("a-state", WAIT, || {
+        state_of(fleet_dir, &fix.a.key()).is_some()
+    })
+    .await;
+    wait_for("b-state", WAIT, || {
+        state_of(fleet_dir, &fix.b.key()).is_some()
+    })
+    .await;
+    append_command(
+        fleet_dir,
+        &fix.a.key(),
+        &OrchestratorCommand::User {
+            text: "hello".into(),
+        },
+    )
+    .unwrap();
+    append_command(
+        fleet_dir,
+        &fix.b.key(),
+        &OrchestratorCommand::User {
+            text: "hello".into(),
+        },
+    )
+    .unwrap();
     wait_for("a-session-id", WAIT, || {
         state_of(fleet_dir, &fix.a.key())
             .and_then(|s| s.session_id)
@@ -268,8 +300,14 @@ async fn two_live_sessions_are_isolated_and_one_dir_removal_stops_only_its_own_m
             == Some("sess-ms-b")
     })
     .await;
-    wait_for("a-results", WAIT, || count_results(fleet_dir, &fix.a.key()) >= 1).await;
-    wait_for("b-results", WAIT, || count_results(fleet_dir, &fix.b.key()) >= 1).await;
+    wait_for("a-results", WAIT, || {
+        count_results(fleet_dir, &fix.a.key()) >= 1
+    })
+    .await;
+    wait_for("b-results", WAIT, || {
+        count_results(fleet_dir, &fix.b.key()) >= 1
+    })
+    .await;
     let pid_a = monitor_pid(fleet_dir, &fix.a);
     let pid_b = monitor_pid(fleet_dir, &fix.b);
     assert!(is_alive(Some(pid_a)) && is_alive(Some(pid_b)));
@@ -277,8 +315,14 @@ async fn two_live_sessions_are_isolated_and_one_dir_removal_stops_only_its_own_m
     // Each monitor writes only its own session's state, and the heartbeat
     // loop keeps both rows fresh (Fix C).
     assert_ne!(
-        state_of(fleet_dir, &fix.a.key()).unwrap().session_id.as_deref(),
-        state_of(fleet_dir, &fix.b.key()).unwrap().session_id.as_deref()
+        state_of(fleet_dir, &fix.a.key())
+            .unwrap()
+            .session_id
+            .as_deref(),
+        state_of(fleet_dir, &fix.b.key())
+            .unwrap()
+            .session_id
+            .as_deref()
     );
     wait_for("heartbeats", WAIT, || {
         session_by_uuid(fleet_dir, &fix.a).last_heartbeat.is_some()
@@ -339,7 +383,10 @@ async fn two_live_sessions_are_isolated_and_one_dir_removal_stops_only_its_own_m
     // B never noticed: its monitor is still alive, its state still reads,
     // and it still answers commands — the session is fully functional.
     assert!(is_alive(Some(pid_b)), "session B's monitor keeps running");
-    wait_for("b-still-alive", Duration::from_secs(3), || is_alive(Some(pid_b)) && state_of(fleet_dir, &fix.b.key()).is_some()).await;
+    wait_for("b-still-alive", Duration::from_secs(3), || {
+        is_alive(Some(pid_b)) && state_of(fleet_dir, &fix.b.key()).is_some()
+    })
+    .await;
     let results_before = count_results(fleet_dir, &fix.b.key());
     append_command(
         fleet_dir,
@@ -349,7 +396,10 @@ async fn two_live_sessions_are_isolated_and_one_dir_removal_stops_only_its_own_m
         },
     )
     .unwrap();
-    wait_for("b-results-after", WAIT, || count_results(fleet_dir, &fix.b.key()) > results_before).await;
+    wait_for("b-results-after", WAIT, || {
+        count_results(fleet_dir, &fix.b.key()) > results_before
+    })
+    .await;
     let b_row = session_by_uuid(fleet_dir, &fix.b);
     assert!(
         b_row.last_heartbeat.is_some(),
@@ -357,7 +407,10 @@ async fn two_live_sessions_are_isolated_and_one_dir_removal_stops_only_its_own_m
     );
     // A's monitor cleared its pid from the row on the way out — the row no
     // longer claims a live monitor.
-    wait_for("a-row-cleared", WAIT, || session_by_uuid(fleet_dir, &fix.a).pid.is_none()).await;
+    wait_for("a-row-cleared", WAIT, || {
+        session_by_uuid(fleet_dir, &fix.a).pid.is_none()
+    })
+    .await;
 
     // Cleanup: delete B's directory and both monitors are gone for good.
     let b_key = fix.b.key();

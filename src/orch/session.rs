@@ -236,7 +236,10 @@ pub fn list_sessions(fleet_dir: &Path) -> Vec<OrchestratorSession> {
 /// # Errors
 ///
 /// Returns an error when the store cannot be saved.
-pub fn create_session(fleet_dir: &Path, alias: Option<&str>) -> anyhow::Result<OrchestratorSession> {
+pub fn create_session(
+    fleet_dir: &Path,
+    alias: Option<&str>,
+) -> anyhow::Result<OrchestratorSession> {
     let mut store = load(fleet_dir).unwrap_or_default();
     let cwd = fleet_dir
         .parent()
@@ -276,9 +279,10 @@ pub fn resolve_session_by_key(fleet_dir: &Path, key: &str) -> anyhow::Result<Orc
     let raw = key.trim();
     let sessions: Vec<OrchestratorSession> = store.sessions.into_values().collect();
     if let Ok(uuid) = Uuid::parse_str(raw)
-        && let Some(session) = sessions.iter().find(|s| s.uuid == uuid) {
-            return Ok(session.clone());
-        }
+        && let Some(session) = sessions.iter().find(|s| s.uuid == uuid)
+    {
+        return Ok(session.clone());
+    }
     let wanted = crate::util::sanitize_name(raw);
     let by_alias: Vec<&OrchestratorSession> = sessions
         .iter()
@@ -550,7 +554,14 @@ mod tests {
 
         let listed = list_sessions(&fleet);
         let aliases: Vec<Option<String>> = listed.iter().map(|s| s.alias.clone()).collect();
-        assert_eq!(aliases, vec![Some("newest".into()), Some("mid".into()), Some("older".into())]);
+        assert_eq!(
+            aliases,
+            vec![
+                Some("newest".into()),
+                Some("mid".into()),
+                Some("older".into())
+            ]
+        );
         assert_eq!(listed[0].uuid, newest_uuid);
         // A store that never existed lists nothing.
         assert!(list_sessions(&tmp_fleet("parl-session-list-none-")).is_empty());
@@ -600,11 +611,15 @@ mod tests {
 
         // The exact uuid resolves regardless of alias collisions.
         assert_eq!(
-            session_by_key(&fleet, &first_uuid.to_string()).unwrap().uuid,
+            session_by_key(&fleet, &first_uuid.to_string())
+                .unwrap()
+                .uuid,
             first_uuid
         );
         assert_eq!(
-            session_by_key(&fleet, &second_uuid.to_string()).unwrap().uuid,
+            session_by_key(&fleet, &second_uuid.to_string())
+                .unwrap()
+                .uuid,
             second_uuid
         );
         // A unique alias resolves, sanitized both sides.
@@ -650,21 +665,26 @@ mod tests {
     #[test]
     fn monitor_health_derives_running_wedged_and_stopped() {
         let now = crate::util::now_ms();
-        let stale = crate::util::iso_at(
-            time::OffsetDateTime::now_utc() - time::Duration::seconds(60),
-        );
+        let stale =
+            crate::util::iso_at(time::OffsetDateTime::now_utc() - time::Duration::seconds(60));
         let fresh = crate::util::now_iso();
 
         let mut running = OrchestratorSession::new("/repo");
         running.pid = Some(42);
         running.last_heartbeat = Some(fresh);
-        assert_eq!(monitor_health(&running, |_| true, now), MonitorHealth::Running);
+        assert_eq!(
+            monitor_health(&running, |_| true, now),
+            MonitorHealth::Running
+        );
 
         // The heartbeat stopped while the pid stayed alive: a wedged monitor.
         let mut wedged = OrchestratorSession::new("/repo");
         wedged.pid = Some(42);
         wedged.last_heartbeat = Some(stale);
-        assert_eq!(monitor_health(&wedged, |_| true, now), MonitorHealth::Wedged);
+        assert_eq!(
+            monitor_health(&wedged, |_| true, now),
+            MonitorHealth::Wedged
+        );
 
         // No pid at all, and a pid whose process is gone: stopped both.
         assert_eq!(
@@ -677,7 +697,10 @@ mod tests {
         );
         let mut dead = OrchestratorSession::new("/repo");
         dead.pid = Some(42);
-        assert_eq!(monitor_health(&dead, |_| false, now), MonitorHealth::Stopped);
+        assert_eq!(
+            monitor_health(&dead, |_| false, now),
+            MonitorHealth::Stopped
+        );
 
         // A live pid that has not ticked yet is not judged.
         let mut unticked = OrchestratorSession::new("/repo");

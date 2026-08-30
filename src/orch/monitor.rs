@@ -179,19 +179,13 @@ impl Monitor {
         // a broken spawn, never a silent fallback.
         let store = session::load(fleet_dir).unwrap_or_default();
         let stored = match session {
-            Some(uuid) => Some(
-                store
-                    .sessions
-                    .get(&uuid)
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "no session {uuid} in {} — the console must create a session \
+            Some(uuid) => Some(store.sessions.get(&uuid).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no session {uuid} in {} — the console must create a session \
                              before spawning its monitor",
-                            paths.fleet_json().display()
-                        )
-                    })?,
-            ),
+                    paths.fleet_json().display()
+                )
+            })?),
             None => store.last_used().cloned(),
         };
         // The console records the repo it opened; without a session record
@@ -218,8 +212,7 @@ impl Monitor {
         record.pid = Some(i32::try_from(std::process::id()).unwrap_or(1));
         // The pid's own start time, for the orphan reaper: a pid recycled
         // onto a later process must never be reaped as this monitor.
-        record.pid_started_at =
-            crate::orch::health::process_started_at(record.pid.unwrap_or(0));
+        record.pid_started_at = crate::orch::health::process_started_at(record.pid.unwrap_or(0));
 
         // The prompt is read by the claude child, so it lives beside it;
         // render the current override (or the embedded template) fresh.
@@ -1120,10 +1113,7 @@ mod tests {
         );
         drop(sh);
         assert!(
-            monitor
-                .key
-                .dir_name()
-                .starts_with("wanted-")
+            monitor.key.dir_name().starts_with("wanted-")
                 && monitor
                     .key
                     .dir_name()

@@ -20,8 +20,12 @@ use crate::paths::{BIN_NAME, STATE_DIR_NAME, env_var};
 /// The shipped template, embedded in the binary.
 pub const ORCHESTRATOR_PROMPT_TEMPLATE: &str = include_str!("../../prompts/orchestrator.md");
 
-/// Workers that may run at once, when the template is not overridden.
-pub const DEFAULT_MAX_WORKERS: usize = 3;
+/// Workers that may run at once when nothing more specific is configured.
+/// An alias of the enforcement side's constant (`[limits]
+/// max_workers_per_session` in `~/.parl/config.toml` backstops `spawn`'s
+/// refusal): the prompt's advice and the enforced cap share one source of
+/// truth, so they cannot drift apart.
+pub const DEFAULT_MAX_WORKERS: usize = crate::paths::DEFAULT_MAX_WORKERS_PER_SESSION;
 
 /// What fills the template's `{{PLACEHOLDER}}`s.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -161,22 +165,42 @@ pub fn prompt_source(repo_root: &Path) -> anyhow::Result<Option<PathBuf>> {
     Ok(resolved)
 }
 
-/// Render the prompt for the fleet rooted at `fleet_dir` working in `repo_root`.
+/// Render the prompt for the fleet rooted at `fleet_dir` working in
+/// `repo_root`, substituting the same per-session worker cap `spawn`
+/// enforces: `~/.parl/config.toml`'s `[limits] max_workers_per_session`,
+/// or the shared default when unset.
 ///
 /// # Errors
 ///
-/// Returns an error when the resolved override cannot be read.
+/// Returns an error when the resolved override cannot be read or the user
+/// config is malformed.
 pub fn render_prompt(fleet_dir: &Path, repo_root: &Path) -> anyhow::Result<String> {
+    render_prompt_with_user_dir(fleet_dir, repo_root, crate::paths::user_dir().as_deref())
+}
+
+/// [`render_prompt`] with the user config dir injected (tests), so a test
+/// never resolves the ambient `~/.parl`.
+///
+/// # Errors
+///
+/// Returns an error when the resolved override cannot be read or the user
+/// config is malformed.
+pub fn render_prompt_with_user_dir(
+    fleet_dir: &Path,
+    repo_root: &Path,
+    user_config_dir: Option<&Path>,
+) -> anyhow::Result<String> {
     let template = match prompt_source(repo_root)? {
         Some(path) => std::fs::read_to_string(&path)?,
         None => ORCHESTRATOR_PROMPT_TEMPLATE.to_string(),
     };
+    let max_workers = crate::paths::load_user_config(user_config_dir)?.max_workers_per_session();
     Ok(render_prompt_template(
         &template,
         &PromptVars {
             fleet_dir: fleet_dir.to_string_lossy().into_owned(),
             repo_root: repo_root.to_string_lossy().into_owned(),
-            max_workers: None,
+            max_workers: Some(max_workers),
             bin_name: None,
         },
     ))
@@ -300,6 +324,47 @@ mod tests {
             },
         );
         assert_eq!(out, "a {{Foo}} b {{NOPE}} c {{A_B}} {{UNCLOSED d /f e");
+    }
+
+    #[test]
+    fn the_substituted_cap_tracks_the_enforced_limits_config() {
+        let root = std::env::temp_dir().join(format!(
+            "parl-prompt-cap-{}-{}",
+            std::process::id(),
+            crate::util::new_id("t").replace('_', "")
+        ));
+        std::fs::create_dir_all(root.join(STATE_DIR_NAME)).unwrap();
+        std::fs::create_dir_all(root.join("user")).unwrap();
+        let fleet_dir = root.join(STATE_DIR_NAME);
+
+        // No user config anywhere: the shared default, identical to the
+        // enforcement constant.
+        let text = render_prompt_with_user_dir(&fleet_dir, &root, None).unwrap();
+        assert!(
+            text.contains(&format!("At most {DEFAULT_MAX_WORKERS} workers")),
+            "{text}"
+        );
+
+        // A configured cap flows into the prompt instead of the default, so
+        // the agent is told exactly what spawn will refuse.
+        let user_dir = root.join("user");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(
+            user_dir.join("config.toml"),
+            "[limits]\nmax_workers_per_session = 5\n",
+        )
+        .unwrap();
+        let text = render_prompt_with_user_dir(&fleet_dir, &root, Some(&user_dir)).unwrap();
+        assert!(text.contains("At most 5 workers"), "{text}");
+        assert!(
+            !text.contains(&format!("At most {DEFAULT_MAX_WORKERS} workers")),
+            "the configured cap replaces the default: {text}"
+        );
+        // The two constants are literally the same value, forever.
+        assert_eq!(
+            DEFAULT_MAX_WORKERS,
+            crate::paths::DEFAULT_MAX_WORKERS_PER_SESSION
+        );
     }
 
     #[test]
