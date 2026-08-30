@@ -10,6 +10,7 @@
 //! `worker_monitor.rs`.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command as StdCommand, Stdio};
 use std::sync::{Mutex, MutexGuard};
@@ -63,6 +64,10 @@ fn fail_pi() -> PathBuf {
 /// `--session-dir`, for the documented-layout assertions.
 fn session_pi() -> PathBuf {
     fixture("fake-pi-session.mjs")
+}
+
+fn fake_claude() -> PathBuf {
+    fixture("fake-claude.mjs")
 }
 
 /// `PARL_PI_BIN` is an executable spec split on spaces.
@@ -526,6 +531,204 @@ fn mcp_serves_the_fleet_tools_over_stdio() {
         std::thread::sleep(POLL);
     };
     assert_eq!(code, Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// 4. The `.parl` layout — gitignore hygiene and the orchestrator's half.
+// ---------------------------------------------------------------------------
+
+/// `spawn` adds `.parl/` to the repository `.gitignore` without disturbing
+/// existing entries, and never adds it twice.
+#[test]
+fn spawn_gitignores_the_state_dir_without_disturbing_existing_entries() {
+    let _serial = serial();
+    let (_tmp, root) = init_repo();
+    std::fs::write(root.join(".gitignore"), "node_modules/\n*.log\n").unwrap();
+    git(&root, &["add", ".gitignore"]);
+    git(&root, &["commit", "-qm", "gitignore"]);
+
+    let first = spawn_ok(&root, "ignored1", "b", &fake_pi(), &[], &["--no-worktree"]);
+    let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+    assert!(gitignore.contains("node_modules/"), "{gitignore}");
+    assert!(gitignore.contains("*.log"), "{gitignore}");
+    assert!(gitignore.contains("# parl\n.parl/"), "{gitignore}");
+    assert_eq!(gitignore.matches(".parl/").count(), 1, "{gitignore}");
+    reap_monitor(&root, &first);
+
+    let second = spawn_ok(&root, "ignored2", "b", &fake_pi(), &[], &["--no-worktree"]);
+    let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+    assert_eq!(
+        gitignore.matches(".parl/").count(),
+        1,
+        "still one entry: {gitignore}"
+    );
+    reap_monitor(&root, &second);
+}
+
+/// `cleanup` refuses a running worker without `--force`, and with it aborts
+/// the worker, removes the worktree, deletes the branch and archives.
+#[test]
+fn cleanup_refuses_a_running_worker_and_forces_with_the_flag() {
+    let _serial = serial();
+    let (_tmp, root) = init_repo();
+    let run_id = spawn_ok(
+        &root,
+        "sleeper",
+        "a long task",
+        &fake_pi(),
+        &[("FAKE_PI_DELAY_MS", "30000")],
+        &[],
+    );
+    let state = poll_status(&root, "sleeper", SETTLE, |state| {
+        state["status"] == "running"
+    });
+    let worktree = PathBuf::from(state["worktree"].as_str().unwrap());
+    let branch = state["branch"].as_str().unwrap().to_string();
+
+    let (code, _, stderr) = run(&root, &["cleanup", "sleeper"]);
+    assert_eq!(code, 1, "a running worker is not cleaned up: {stderr}");
+    assert!(
+        stderr.contains("use --force to abort and clean"),
+        "{stderr}"
+    );
+    assert!(worktree.exists(), "the refusal left the worktree alone");
+    assert_ne!(status_json(&root, "sleeper")["status"], "archived");
+
+    let (code, stdout, stderr) = run(&root, &["cleanup", "sleeper", "--force"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains(&format!("archived {run_id}")), "{stdout}");
+    assert!(!worktree.exists(), "the worktree is gone");
+    let listed = StdCommand::new("git")
+        .args(["branch", "--list", &branch])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
+        "the aborted, unmerged branch is deleted by --force"
+    );
+    assert_eq!(status_json(&root, "sleeper")["status"], "archived");
+    reap_monitor(&root, &run_id);
+}
+
+/// The orchestrator side completes the documented layout: booted exactly as
+/// the console boots it (`parl orchestrator-monitor`), one user message
+/// makes the fake claude report init, and the monitor then keeps
+/// `fleet.json`, the rendered prompt (the embedded template, placeholders
+/// substituted), the transcript, the raw protocol log and the state file —
+/// and never the removed `orchestrator.json`. A `stop` command ends the
+/// monitor cleanly.
+#[test]
+fn the_orchestrator_side_writes_the_documented_fleet_layout() {
+    let _serial = serial();
+    let (tmp, root) = plain_dir();
+    let fleet_dir = root.join(parl::paths::STATE_DIR_NAME);
+    let mut monitor = StdCommand::new(assert_cmd::cargo_bin!("parl"))
+        .args(["orchestrator-monitor", "--fleet-dir"])
+        .arg(&fleet_dir)
+        .env("PARL_CLAUDE_BIN", pi_spec(&fake_claude()))
+        .env("FAKE_CLAUDE_SESSION_ID", "sess-e2e-12345678")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .current_dir(&root)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+
+    // Wait for boot (the orchestrator dir appears), then send one user
+    // message — the fake claude emits init after it, and init is when the
+    // monitor persists the session record.
+    let inbox = fleet_dir.join("orchestrator").join("inbox.jsonl");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !fleet_dir.join("orchestrator").is_dir() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the monitor never booted"
+        );
+        std::thread::sleep(POLL);
+    }
+    let user = parl::orch::records::OrchestratorCommand::User {
+        text: "hello fleet".into(),
+    }
+    .to_envelope(parl::fleet::envelope::Party::Console);
+    parl::fleet::envelope::append_envelope(&inbox, &user).unwrap();
+
+    let fleet_json = fleet_dir.join("fleet.json");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !fleet_json.is_file() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fleet.json never appeared; claude.log: {}",
+            std::fs::read_to_string(fleet_dir.join("orchestrator/claude.log")).unwrap_or_default()
+        );
+        std::thread::sleep(POLL);
+    }
+
+    let session: Value =
+        serde_json::from_str(&std::fs::read_to_string(&fleet_json).unwrap()).unwrap();
+    assert_eq!(session["version"], json!(1), "{session}");
+    assert_eq!(session["sessionId"], "sess-e2e-12345678");
+    assert_eq!(session["cwd"], root.to_string_lossy().as_ref());
+    let state = parl::orch::monitor::load_orchestrator_state(&fleet_dir).unwrap();
+    assert_eq!(state.session_id.as_deref(), Some("sess-e2e-12345678"));
+
+    for documented in [
+        fleet_dir.join("orchestrator").join("state.json"),
+        fleet_dir.join("orchestrator").join("events.jsonl"),
+        fleet_dir.join("orchestrator").join("inbox.jsonl"),
+        fleet_dir.join("orchestrator").join("claude.log"),
+        fleet_dir.join("orchestrator").join("prompt.md"),
+    ] {
+        assert!(documented.is_file(), "missing {}", documented.display());
+    }
+    assert!(
+        !path_exists(&fleet_dir.join("orchestrator.json")),
+        "the removed orchestrator.json is gone for good"
+    );
+
+    // The prompt was rendered from the copy embedded in the binary: the
+    // placeholders are substituted with this fleet's paths, nothing unknown
+    // remains, and nothing was copied outside the state directory.
+    let prompt = std::fs::read_to_string(fleet_dir.join("orchestrator/prompt.md")).unwrap();
+    assert!(prompt.starts_with("# Fleet orchestrator"), "{prompt}");
+    assert!(!prompt.contains("{{"), "{prompt}");
+    assert!(
+        prompt.contains(fleet_dir.to_string_lossy().as_ref()),
+        "the fleet dir placeholder was substituted: {prompt}"
+    );
+    assert!(
+        !root.join("orchestrator.md").exists()
+            && !root.join("prompts").exists()
+            && !root.join("pi").exists(),
+        "nothing was copied into the project"
+    );
+
+    // A stop command ends the monitor (and its claude child) cleanly.
+    let stop = parl::orch::records::OrchestratorCommand::Stop
+        .to_envelope(parl::fleet::envelope::Party::Console);
+    parl::fleet::envelope::append_envelope(&inbox, &stop).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let code = loop {
+        if let Some(status) = monitor.try_wait().unwrap() {
+            break status.code();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the monitor did not exit after the stop command"
+        );
+        std::thread::sleep(POLL);
+    };
+    assert_eq!(code, Some(0), "the monitor exits cleanly on stop");
+    let _ = monitor.wait(); // reap: no zombie
+
+    // The state records the ended session for the next console open.
+    let ended = parl::orch::monitor::load_orchestrator_state(&fleet_dir).unwrap();
+    assert!(
+        ended.exited.is_some(),
+        "the state records the ended child: {ended:?}"
+    );
+    let _ = tmp; // the tree outlives the monitor
 }
 
 // ---------------------------------------------------------------------------
