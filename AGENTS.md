@@ -21,9 +21,9 @@ Single crate `parl`, lib + bin. The library is the contract; the binary only par
 | `src/fleet/envelope.rs` | the mailbox envelope (`{"id","ts","from","to","type","payload"}`) shared by every `inbox.jsonl` and `outbox.jsonl` line; party parsing; typed builders/decoders for the six inbox types and three outbox types. Contract pinned byte-for-byte — see the module doc. |
 | `src/fleet/event.rs` | `FleetEvent` and `<fleet-event>` rendering; `sanitize_field`/`attr` are the security boundary that stops worker text forging or closing a block. |
 | `src/fleet/report.rs` | reading `runs/<id>/report.md` with the steering appendix, falling back to last assistant text. |
-| `src/worker/` | *(stub — worker step)* the detached worker monitor (`monitor.rs`), pi RPC message types (`rpc.rs`), `pi --list-models` and model checking (`models.rs`). |
-| `src/orch/` | *(stub — orch step)* the claude side: stream-json wire types (`protocol.rs`), argv builder (`args.rs`), child process (`process.rs`), detached monitor (`monitor.rs`), transcript records (`records.rs`), console-side client (`client.rs`), embedded prompt (`prompt.rs`), the `.mcp.json` (`mcp_config.rs`), health (`health.rs`), and the run-state watcher that turns state into fleet events (`watcher.rs`). |
-| `src/ops/` | *(stub — ops step)* the shared operation layer both the CLI and the MCP tools call: `spawn.rs`, `query.rs` (status/output/logs/report/wait/attach), `steer.rs` (send/followup/answer/stop), `integrate.rs` (diff/merge/cleanup). Signatures taking CLI-parsed values are frozen with `main.rs`. |
+| `src/worker/` | the detached worker monitor (`monitor.rs`), pi RPC message types (`rpc.rs`), `pi --list-models` and model checking (`models.rs`). Implemented in the worker step. |
+| `src/orch/` | the claude side: stream-json wire types (`protocol.rs`), argv builder (`args.rs`), child process (`process.rs`), detached monitor (`monitor.rs`), transcript records (`records.rs`), console-side client (`client.rs`), embedded prompt (`prompt.rs`), the `.mcp.json` (`mcp_config.rs`), health (`health.rs`), and the run-state watcher that turns state into fleet events (`watcher.rs`). Most files landed in the orch step; `client.rs`, `health.rs`, `monitor.rs` and `watcher.rs` are still stubs. |
+| `src/ops/` | the shared operation layer both the CLI and the MCP tools call: `spawn.rs`, `query.rs` (status/output/logs/report/wait/attach), `steer.rs` (send/followup/answer/stop), `integrate.rs` (diff/merge/cleanup). Signatures taking CLI-parsed values are frozen with `main.rs`; the `_core` variants take a `Party` source so the console and MCP can attribute actions honestly. Implemented in the ops step. |
 | `src/mcp/` | *(stub — mcp step)* the stdio MCP server (`server.rs`), one tool per op, built on `rmcp`. Server name stays `fleet` so tools stay `mcp__fleet__*`. |
 | `src/tui/` | *(stub — tui-model and tui-render steps)* app state and update loop (`app.rs`), view model (`model.rs`), modal keys (`keys.rs`), palette (`palette.rs`), completions (`completions.rs`), transcript (`transcript.rs`), markdown rendering (`markdown.rs`), theme (`theme.rs`), crossterm runtime (`runtime.rs`), and `view/` draw functions (dashboard, session, composer, overlay, statusline). |
 
@@ -41,6 +41,11 @@ Dated; newest last. Record anything that did not work out here too.
 - 2026-08-30 — `tui-textarea 0.7.0` pins `ratatui ^0.29` (no release supports 0.30 yet), so `ratatui` is pinned to `0.29.0` with `crossterm 0.28.1` and `unicode-width 0.2.0` exactly. Verified with a throwaway example (render into `TestBackend`), then deleted.
 - 2026-08-30 — `rmcp 3.1.4` verified to build and to serve a `ServerHandler` with `list_tools`/`call_tool` over `transport::stdio()` (throwaway example compiled and run, then deleted). Its `#[non_exhaustive]` model types are constructed via `Default` + field assignment.
 - 2026-08-30 — Mailboxes carry the envelope shape directly (`inbox.jsonl` lines are envelopes addressed `to: worker:<runId>`); the old flat `control.jsonl` shape is gone. Unknown `type` values and unknown payload fields parse but decode to `None` and readers skip the line, so a newer writer cannot crash an older reader.
+- 2026-08-30 — Steering provenance is the envelope's `from` party. The CLI wrappers attribute to `orchestrator` (the agent drives these tools); the console and future MCP callers thread `Party::Console` through the `_core` variants, which the watcher reads to surface human interventions as events the orchestrator reconciles with instead of undoing.
+- 2026-08-30 — `answer` targets the explicit `--question` id when given (the monitor routes by id, even when it is not the pending one), else the run's pending `fleet_ask` question, else a pending extension dialog (`pendingDialog`) — either kind of block is answerable.
+- 2026-08-30 — `merge` always aborts on conflict (exit 5) and names the base commit in the error, telling the caller to have the worker rebase in its own worktree — the orchestrator never edits files itself. The TS CLI left conflicts in place; the Rust CLI does not.
+- 2026-08-30 — The `ok()` helper zeroes `err`, so cores that carry stderr lines alongside a successful exit (diff/merge dirty warnings, attach's static-tail note, cleanup's kept-branch warning) must build the `CommandResult` by hand. Two warnings were silently dropped before a test caught it.
+- 2026-08-30 — The obsolete `stubs_report_not_implemented` test in `main.rs` was removed as wave-B ops work landed; dispatch coverage returns later as an integration test driving the built `parl` binary.
 
 ## Verified protocol facts
 
@@ -98,9 +103,9 @@ cargo build --release
 | Step | Status |
 | --- | --- |
 | scaffold (crate, module tree, CLI surface, util/paths/git/fleet core) | done |
-| worker (monitor, rpc, models) | pending |
+| worker (monitor, rpc, models) | done |
 | orch (claude monitor, protocol, prompt, watcher) | pending |
-| ops (shared operation layer behind CLI + MCP) | pending |
+| ops (shared operation layer behind CLI + MCP) | done |
 | mcp (stdio server) | pending |
 | tui-model (app state, view model, keys) | pending |
 | tui-render (views, markdown, theme, runtime) | pending |
