@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use uuid::Uuid;
 
 /// Exit codes, preserved exactly: 0 ok, 1 refusal or error, 2 no report,
 /// 3 wait timed out, 4 the run ended stopped/error/dead, 5 merge conflict.
@@ -308,5 +309,8 @@ pub enum Command {
         /// The fleet state directory.
         #[arg(long, value_name = "DIR")]
         fleet_dir: PathBuf,
+        /// The session uuid this monitor serves; the most recently used session when absent.
+        #[arg(long, value_name = "UUID")]
+        session: Option<Uuid>,
     },
 }

@@ -562,6 +562,12 @@ impl OrchestratorClient {
         command
             .args(["orchestrator-monitor", "--fleet-dir"])
             .arg(&self.options.fleet_dir)
+            // The monitor is pinned to this console's session: with N
+            // sessions sharing a fleet, "the most recently used one" would
+            // be a race. The marker also gives the orphan reaper its
+            // session-unique matcher.
+            .args(["--session"])
+            .arg(self.key.uuid.to_string())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(log))
             .stderr(std::process::Stdio::from(stderr));
