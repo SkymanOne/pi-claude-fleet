@@ -4,21 +4,7 @@ A fleet of [pi](https://github.com/earendil-works/pi-mono) coding agents in your
 
 You describe the work. The orchestrator plans it and spawns pi workers, each in its own git worktree. You see both sides at once: the conversation on one, the whole fleet on the other.
 
-```text
-┌──────────────────────────────────────────────────────────────────────────┐
-│ parl · orchestrator + 2 workers · ● running 1 · ? needs an answer 1      │
-│                                                                          │
-│ ▸ ○ orchestrator                                                   3m    │
-│     ✻ thinking… 12s                                                      │
-│   ● add-auth      parl/add-auth-9123456  +12 −3                    2m    │
-│     ⚙ bash                                                               │
-│ ? add-tests       parl/add-tests-9123457                           1m    │
-│     needs an answer                                                      │
-│                                                                          │
-│ j/k move · enter open · a answer · s stop · i compose · : palette · …    │
-├ add-tests · needs an answer · sonnet-4.5 · high · parl/add-tests-9123457 ┤
-└──────────────────────────────────────────────────────────────────────────┘
-```
+![](imgs/main.png)
 
 * **Watch and interrupt anything.** Drill into a worker, steer it, or answer its question yourself. The orchestrator is told what you did and works with it instead of undoing it.
 * **The console is disposable.** Every agent runs under a detached monitor that keeps its state on disk, so you can close the console mid-run and reopen it where you left off.
