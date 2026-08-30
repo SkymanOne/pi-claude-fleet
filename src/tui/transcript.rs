@@ -102,14 +102,16 @@ impl Transcript {
         &self.blocks
     }
 
-    /// Text the model is still streaming, not yet a committed block.
+    /// Text the model is still streaming, not yet a committed block. A fresh
+    /// join per call: the session view asks once per frame, the joined text
+    /// is just the in-flight deltas, and ownership beats a leak per frame.
     #[must_use]
-    pub fn partial(&self) -> Option<&str> {
+    pub fn partial(&self) -> Option<String> {
         if !self.open.is_empty() {
             let joined = self.open.values().cloned().collect::<Vec<_>>().join("");
-            return Some(Box::leak(joined.into_boxed_str()));
+            return Some(joined);
         }
-        (!self.partial.is_empty()).then_some(self.partial.as_str())
+        (!self.partial.is_empty()).then(|| self.partial.clone())
     }
 
     /// What the orchestrator is doing right now, or none between turns.
@@ -994,6 +996,35 @@ mod tests {
     }
 
     #[test]
+    fn partial_is_owned_and_stable_across_calls_no_matter_how_often_the_view_asks() {
+        let mut t = Transcript::new();
+        let update =
+            |body: Value| serde_json::json!({"type": "message_update", "ev": body}).to_string();
+        t.apply_worker_lines(&[
+            update(serde_json::json!({"type": "text_start", "contentIndex": 0})),
+            update(serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "st"})),
+            update(serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "rea"})),
+            update(serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "ming"})),
+        ]);
+        // the session view calls this every frame while a worker streams;
+        // each call must hand back its own string, all saying the same thing
+        let first = t.partial().unwrap();
+        let second = t.partial().unwrap();
+        assert_eq!(first, "streaming");
+        assert_eq!(second, "streaming");
+        assert_eq!(first, second);
+        // the orchestrator's coalesced partial reads the same way
+        let mut o = Transcript::new();
+        o.apply_orchestrator_record(&record(&OrchestratorEvent::StreamText {
+            text: "hal".into(),
+        }));
+        o.apply_orchestrator_record(&record(&OrchestratorEvent::StreamText {
+            text: "lo".into(),
+        }));
+        assert_eq!(o.partial().as_deref(), Some("hallo"));
+    }
+
+    #[test]
     fn streamed_text_accumulates_then_lands_as_text_blocks() {
         let mut t = Transcript::new();
         t.apply_orchestrator_record(&record(&OrchestratorEvent::StreamText {
@@ -1002,7 +1033,7 @@ mod tests {
         t.apply_orchestrator_record(&record(&OrchestratorEvent::StreamText {
             text: "lo".into(),
         }));
-        assert_eq!(t.partial(), Some("hello"));
+        assert_eq!(t.partial().as_deref(), Some("hello"));
         assert!(t.activity().is_some(), "streaming marks the activity");
         assert!(t.turn_active());
         // the committed assistant message clears the partial
@@ -1205,7 +1236,7 @@ mod tests {
             update(serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "he"})),
             update(serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "llo"})),
         ]);
-        assert_eq!(t.partial(), Some("hello"));
+        assert_eq!(t.partial().as_deref(), Some("hello"));
         t.apply_worker_lines(&[update(serde_json::json!({
             "type": "text_end", "contentIndex": 0, "content": "hello\nworld",
         }))]);
