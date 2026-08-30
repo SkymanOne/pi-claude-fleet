@@ -15,7 +15,14 @@ use std::process::{ChildStdin, Command as StdCommand, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use serde_json::{Value, json};
+
+/// Generous ceilings: three workers build and test on this machine at once,
+/// so every wait polls instead of sleeping and every deadline assumes load.
+const SETTLE: Duration = Duration::from_secs(40);
+const MONITOR_EXIT: Duration = Duration::from_secs(20);
 
 /// Subprocess-heavy tests run one at a time (same reason as `mcp_stdio.rs`).
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -47,6 +54,11 @@ fn fake_pi() -> PathBuf {
     fixture("fake-pi-parl.mjs")
 }
 
+/// pi replacement that dies immediately (the monitor's error path).
+fn fail_pi() -> PathBuf {
+    fixture("fail-pi.mjs")
+}
+
 /// `PARL_PI_BIN` is an executable spec split on spaces.
 fn pi_spec(path: &Path) -> String {
     format!("node {}", path.display())
@@ -67,6 +79,185 @@ fn run(root: &Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let output = StdCommand::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A git repo with one committed seed file and no `.gitignore` yet — spawn
+/// adds the `.parl/` entry itself, which the gitignore and conflict tests
+/// assert against.
+fn init_repo() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    git(&root, &["init", "-q", "-b", "main"]);
+    std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "seed"]);
+    (tmp, root)
+}
+
+/// Spawn a worker through the real binary with the fake pi; returns the run
+/// id parsed from the output's first line (`Spawned <id>`).
+fn spawn_ok(
+    root: &Path,
+    name: &str,
+    brief: &str,
+    pi: &Path,
+    extra_env: &[(&str, &str)],
+    flags: &[&str],
+) -> String {
+    let output = parl()
+        .args(["spawn", name])
+        .args(flags)
+        .args(["--", brief])
+        .current_dir(root)
+        .env("PARL_PI_BIN", pi_spec(pi))
+        .envs(extra_env.iter().copied())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "spawn failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    stdout
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Spawned ")
+        .unwrap_or_else(|| panic!("unexpected spawn output: {stdout}"))
+        .to_string()
+}
+
+/// Parsed `parl status <name> --json` (the single-run state object).
+fn status_json(root: &Path, name: &str) -> Value {
+    let output = parl()
+        .args(["status", name, "--json"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "status {name} failed");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("status {name} was not one JSON object: {err}: {stdout}"))
+}
+
+/// Poll `parl status <name> --json` until `check` holds or the timeout lapses.
+fn poll_status(
+    root: &Path,
+    name: &str,
+    timeout: Duration,
+    check: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let state = status_json(root, name);
+        if check(&state) {
+            return state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting on {name}; last state: {state}"
+        );
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Wait for any terminal state (what `parl wait` exits on).
+fn settled(root: &Path, name: &str) -> Value {
+    poll_status(root, name, SETTLE, |state| {
+        matches!(
+            state["status"].as_str(),
+            Some("settled" | "stopped" | "error" | "dead" | "archived")
+        )
+    })
+}
+
+/// `parl wait`'s exit code, for the exit-code matrix.
+fn wait_code(root: &Path, name: &str, timeout_secs: u64) -> i32 {
+    parl()
+        .args(["wait", name, "--timeout", &timeout_secs.to_string()])
+        .current_dir(root)
+        .output()
+        .unwrap()
+        .status
+        .code()
+        .unwrap_or(-1)
+}
+
+fn monitor_pid(run_json: &Path) -> Option<i32> {
+    let raw = std::fs::read_to_string(run_json).ok()?;
+    let state: Value = serde_json::from_str(&raw).ok()?;
+    state["pid"].as_i64().map(|pid| pid as i32)
+}
+
+/// Block until the run's detached monitor is gone, so a test never leaves a
+/// stray process behind; a SIGKILL is the last resort. The monitor is
+/// orphaned (its parent, `parl spawn`, has exited), so an exited pid is
+/// reaped by launchd and `kill(pid, 0)` reads it as gone — checked with the
+/// product's own liveness rule.
+fn reap_monitor(root: &Path, run_id: &str) {
+    let run_json = root
+        .canonicalize()
+        .unwrap()
+        .join(parl::paths::STATE_DIR_NAME)
+        .join("runs")
+        .join(run_id)
+        .join("run.json");
+    let deadline = std::time::Instant::now() + MONITOR_EXIT;
+    loop {
+        let Some(pid) = monitor_pid(&run_json) else {
+            return;
+        };
+        if !parl::fleet::run::is_alive(Some(pid)) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+            return;
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Safety net for failed assertions: a bounded reap when the test itself
+/// did not get there. Declared before the temp dir so it drops (kills)
+/// while the tree still exists.
+struct ReapOnDrop {
+    run_json: PathBuf,
+}
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while let Some(pid) = monitor_pid(&self.run_json) {
+            if !parl::fleet::run::is_alive(Some(pid)) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+                return;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -329,4 +520,190 @@ fn mcp_serves_the_fleet_tools_over_stdio() {
         std::thread::sleep(POLL);
     };
     assert_eq!(code, Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// 2. The exit-code matrix — the contract scripts depend on.
+// ---------------------------------------------------------------------------
+
+/// One slow, running worker drives every refusal exit code: merging an
+/// unsettled run (1), answering with nothing pending (1), a wait timeout (3),
+/// then the run ends stopped (4 via `wait`), and steering a finished run is
+/// refused (1).
+#[test]
+fn refusal_exit_codes_on_a_running_then_stopped_run() {
+    let _serial = serial();
+    let (tmp, root) = plain_dir();
+    let run_id = spawn_ok(
+        &root,
+        "slowpoke",
+        "long task",
+        &fake_pi(),
+        &[("FAKE_PI_DELAY_MS", "20000")],
+        &["--no-worktree"],
+    );
+    let _reap_guard = ReapOnDrop {
+        run_json: tmp
+            .path()
+            .join(parl::paths::STATE_DIR_NAME)
+            .join("runs")
+            .join(&run_id)
+            .join("run.json"),
+    };
+
+    // A running run cannot be merged (1) and has nothing to answer (1).
+    let (code, _, stderr) = run(&root, &["merge", "slowpoke"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("is running"), "{stderr}");
+    assert!(
+        stderr.contains("only settled runs can be merged"),
+        "{stderr}"
+    );
+    let (code, _, stderr) = run(&root, &["answer", "slowpoke", "--", "argon2"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("no pending question"), "{stderr}");
+
+    // A wait that outlives its timeout is exit 3, not an error.
+    assert_eq!(wait_code(&root, "slowpoke", 1), 3, "timeout is exit 3");
+    let (code, _, stderr) = run(&root, &["wait", "slowpoke", "--timeout", "1"]);
+    assert_eq!(code, 3);
+    assert!(stderr.contains("timed out after 1s"), "{stderr}");
+
+    // Stop settles the run as stopped; `wait` then reports the bad end (4).
+    let (code, _, stderr) = run(&root, &["stop", "slowpoke"]);
+    assert_eq!(code, 0, "{stderr}");
+    let state = settled(&root, "slowpoke");
+    assert_eq!(state["status"], "stopped", "{state}");
+    assert_eq!(
+        wait_code(&root, "slowpoke", 30),
+        4,
+        "a stopped run is exit 4"
+    );
+
+    // A finished run refuses steering (1) with the resume hint.
+    let (code, _, stderr) = run(&root, &["send", "slowpoke", "--", "too late"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("steering refused"), "{stderr}");
+    assert!(
+        stderr.contains("parl spawn slowpoke-2 --session"),
+        "carries the resume hint: {stderr}"
+    );
+
+    reap_monitor(&root, &run_id);
+}
+
+/// A worker whose pi dies without settling reads `error`, its reason names
+/// the cause, `wait` is exit 4, and with no report and no captured text
+/// `report` is exit 2.
+#[test]
+fn an_error_run_names_its_cause_and_report_is_exit_two() {
+    let _serial = serial();
+    let (tmp, root) = plain_dir();
+    let run_id = spawn_ok(&root, "doomed", "b", &fail_pi(), &[], &["--no-worktree"]);
+    let _reap_guard = ReapOnDrop {
+        run_json: tmp
+            .path()
+            .join(parl::paths::STATE_DIR_NAME)
+            .join("runs")
+            .join(&run_id)
+            .join("run.json"),
+    };
+
+    assert_eq!(wait_code(&root, "doomed", 30), 4, "an error run is exit 4");
+    let state = settled(&root, "doomed");
+    assert_eq!(state["status"], "error", "{state}");
+    let error = state["error"].as_str().unwrap_or_default();
+    assert!(error.contains("exited with code 1"), "{error}");
+    assert!(error.contains("model provider unreachable"), "{error}");
+
+    let (code, _, stderr) = run(&root, &["report", "doomed"]);
+    assert_eq!(code, 2, "no report and no captured text: {stderr}");
+    assert!(
+        stderr.contains("no report file and no captured output for doomed"),
+        "{stderr}"
+    );
+
+    reap_monitor(&root, &run_id);
+}
+
+/// A conflicting branch merges with exit 5: the merge is aborted, the
+/// checkout is left clean, and the message tells the caller to have the
+/// worker rebase — the orchestrator never edits files itself.
+#[test]
+fn a_conflicting_branch_merges_with_exit_five_and_a_clean_checkout() {
+    let _serial = serial();
+    let (_tmp, root) = init_repo();
+    let run_id = spawn_ok(
+        &root,
+        "conflicter",
+        "write hello.txt",
+        &fake_pi(),
+        &[("FAKE_PI_WRITE_HELLO", "1")],
+        &[],
+    );
+    let _reap_guard = ReapOnDrop {
+        run_json: root
+            .canonicalize()
+            .unwrap()
+            .join(parl::paths::STATE_DIR_NAME)
+            .join("runs")
+            .join(&run_id)
+            .join("run.json"),
+    };
+
+    let state = settled(&root, "conflicter");
+    assert_eq!(state["status"], "settled", "{state}");
+    let branch = state["branch"].as_str().unwrap().to_string();
+    let worktree = PathBuf::from(state["worktree"].as_str().unwrap());
+    assert!(branch.starts_with("parl/conflicter-"), "{branch}");
+
+    // The fake wrote hello.txt but did not commit; the worker commits.
+    git(&worktree, &["add", "."]);
+    git(&worktree, &["commit", "-qm", "worker hello"]);
+    let base = state["baseCommit"].as_str().unwrap().to_string();
+
+    // A conflicting change lands on the main checkout.
+    std::fs::write(root.join("hello.txt"), "different\n").unwrap();
+    git(&root, &["add", "hello.txt"]);
+    git(&root, &["commit", "-qm", "conflict"]);
+
+    let (code, stdout, stderr) = run(&root, &["merge", "conflicter"]);
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.is_empty(),
+        "a conflict prints to stderr only: {stdout:?}"
+    );
+    assert!(stderr.contains("conflicts in:\nhello.txt"), "{stderr}");
+    assert!(
+        stderr.contains("The merge was aborted; the checkout is clean"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("rebase its branch {branch}")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&base[..7]),
+        "names the commit the branch was cut from: {stderr}"
+    );
+
+    // The abort left the checkout clean and the worker's file untouched.
+    let status = StdCommand::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let porcelain_text = String::from_utf8_lossy(&status.stdout).into_owned();
+    let porcelain: Vec<&str> = porcelain_text
+        .lines()
+        .filter(|line| !line.is_empty() && *line != "?? .gitignore")
+        .collect();
+    assert_eq!(porcelain, Vec::<&str>::new(), "{porcelain:?}");
+    assert!(!root.join(".git").join("MERGE_HEAD").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("hello.txt")).unwrap(),
+        "different\n"
+    );
+
+    reap_monitor(&root, &run_id);
 }
