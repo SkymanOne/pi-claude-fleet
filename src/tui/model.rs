@@ -30,7 +30,7 @@ impl SessionTarget {
 
     /// True when the target is a worker run.
     #[must_use]
-    pub fn is_worker(&self) -> bool {
+    pub const fn is_worker(&self) -> bool {
         matches!(self, Self::Worker { .. })
     }
 }
@@ -78,7 +78,7 @@ pub struct RunRow<'a> {
 /// What the orchestrator is doing when it emits a thinking block: a factory
 /// for a fresh [`Activity`], stamped with `since_ms`.
 #[must_use]
-pub fn activity(kind: ActivityKind, label: Option<String>, since_ms: i64) -> Activity {
+pub const fn activity(kind: ActivityKind, label: Option<String>, since_ms: i64) -> Activity {
     Activity {
         kind,
         label,
@@ -89,7 +89,7 @@ pub fn activity(kind: ActivityKind, label: Option<String>, since_ms: i64) -> Act
 /// The state glyphs. `○` idle, `●` working, `?` needs you, `✓` done,
 /// `■` stopped, `!` failed or dead, `…` starting, `·` archived.
 #[must_use]
-pub fn worker_glyph(view: DerivedView) -> &'static str {
+pub const fn worker_glyph(view: DerivedView) -> &'static str {
     match view {
         DerivedView::Starting => "…",
         DerivedView::Running => "●",
@@ -110,21 +110,17 @@ pub fn worker_detail(state: &RunState, view: DerivedView) -> String {
         DerivedView::Running => match state.activity {
             Some(crate::fleet::run::WorkerActivity::Thinking) => "✻ thinking…".to_string(),
             Some(crate::fleet::run::WorkerActivity::Text) => "✎ replying…".to_string(),
-            Some(crate::fleet::run::WorkerActivity::Tool) => match &state.last_tool {
-                Some(tool) => format!("⚙ {tool}"),
-                None => "working…".to_string(),
-            },
-            None => match &state.last_tool {
-                Some(tool) => format!("⚙ {tool}"),
-                None => "working…".to_string(),
-            },
+            Some(crate::fleet::run::WorkerActivity::Tool) | None => state
+                .last_tool
+                .as_deref()
+                .map_or_else(|| "working…".to_string(), |tool| format!("⚙ {tool}")),
         },
         DerivedView::Starting => "starting…".to_string(),
         DerivedView::Settled => "done".to_string(),
-        DerivedView::Error => match &state.error {
-            Some(error) => first_line(error).to_string(),
-            None => "failed".to_string(),
-        },
+        DerivedView::Error => state.error.as_deref().map_or_else(
+            || "failed".to_string(),
+            |error| first_line(error).to_string(),
+        ),
         DerivedView::Dead => "monitor gone".to_string(),
         DerivedView::Stopped => "stopped".to_string(),
         DerivedView::Archived => "archived".to_string(),

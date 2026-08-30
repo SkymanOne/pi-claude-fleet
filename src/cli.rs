@@ -261,11 +261,11 @@ pub enum Command {
         cwd: Option<PathBuf>,
     },
 
-    /// remove a run's worktree + branch and archive it (<name> or all; --force aborts running workers)
+    /// remove a run's worktree + branch and archive it (<name> or all; --force also discards unmerged branches and uncommitted changes, and never aborts a run that `all` did not explicitly name)
     Cleanup {
         /// A run's name or id, or `all`.
         target: String,
-        /// Abort running workers and delete unmerged branches.
+        /// Discard unmerged branches and uncommitted changes; never aborts a run that `all` did not explicitly name.
         #[arg(long)]
         force: bool,
         /// Target directory (default: current).

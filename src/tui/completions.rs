@@ -158,8 +158,7 @@ pub fn active_token(input: &str) -> (&str, usize) {
         .char_indices()
         .rev()
         .find(|(_, ch)| ch.is_whitespace())
-        .map(|(idx, ch)| idx + ch.len_utf8())
-        .unwrap_or(0);
+        .map_or(0, |(idx, ch)| idx + ch.len_utf8());
     let token = &input[start..];
     (token, start)
 }
@@ -315,7 +314,7 @@ pub fn completions_for(input: &str, ctx: &CompletionContext) -> Option<Completio
             })
             .collect();
         items.extend(
-            rank(&ctx.files, query, |f| f.clone())
+            rank(&ctx.files, query, Clone::clone)
                 .into_iter()
                 .map(|file| Suggestion {
                     value: format!("@{file}"),
@@ -357,13 +356,15 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
         .or_else(|| map.get("url"))
         .or_else(|| map.get("name"))
         .or_else(|| map.get("target"));
-    let raw = match primary {
-        Some(value) => value.as_str().map_or_else(
-            || serde_json::to_string(value).unwrap_or_default(),
-            str::to_string,
-        ),
-        None => serde_json::to_string(args).unwrap_or_default(),
-    };
+    let raw = primary.map_or_else(
+        || serde_json::to_string(args).unwrap_or_default(),
+        |value| {
+            value.as_str().map_or_else(
+                || serde_json::to_string(value).unwrap_or_default(),
+                str::to_string,
+            )
+        },
+    );
     let line = first_line(&raw).trim().to_string();
     if line.chars().count() > CLIP {
         let cut: String = line.chars().take(CLIP - 1).collect();
@@ -431,7 +432,7 @@ fn walk(
         return;
     };
     let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let name = entry.file_name();
         let name = name.to_string_lossy();

@@ -71,6 +71,20 @@ pub enum Overlay {
     Palette(PaletteState),
     /// Searching the open session's transcript.
     Search(SearchState),
+    /// The selected session's full brief, scrollable.
+    Brief(BriefState),
+}
+
+/// The full-brief viewer's own state (`b` in normal mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BriefState {
+    /// The brief text: the run's `taskBrief`, or the rendered orchestrator
+    /// prompt for the orchestrator session.
+    pub text: String,
+    /// First wrapped line the popup shows; the draw clamps it to the viewport.
+    pub offset: usize,
+    /// The source was missing: show the placeholder dimmed instead of text.
+    pub placeholder: bool,
 }
 
 /// A blocking yes/no for anything that would destroy work.
@@ -284,7 +298,7 @@ pub enum SessionTarget {
 
 impl SessionTarget {
     #[must_use]
-    pub fn is_worker(&self) -> bool {
+    pub const fn is_worker(&self) -> bool {
         matches!(self, Self::Worker(_))
     }
 }
@@ -360,6 +374,9 @@ pub struct Console {
     pub viewport_rows: usize,
     /// Transient optimistic effort, until the monitor's state confirms it.
     pending_effort: Option<String>,
+    /// Per-run optimistic thinking levels, until the worker monitor persists
+    /// them into the run's state and the next poll confirms it.
+    pending_thinking: HashMap<String, String>,
 }
 
 impl Console {
@@ -394,6 +411,7 @@ impl Console {
             flash: None,
             viewport_rows: 20,
             pending_effort: None,
+            pending_thinking: HashMap::new(),
         }
     }
 
@@ -403,7 +421,28 @@ impl Console {
     /// Replace the run list (the watcher's poll).
     pub fn set_runs(&mut self, runs: Vec<RunEntry>) {
         self.runs = runs;
+        self.reconcile_pending_thinking();
         self.refresh_rows();
+    }
+
+    /// Fold still-unconfirmed thinking cycles into the fresh states (the
+    /// statusline reads `state.thinking_level`), and forget one the moment
+    /// the polled state catches up to it — the monitor now owns that level.
+    fn reconcile_pending_thinking(&mut self) {
+        let mut confirmed = Vec::new();
+        for run in &mut self.runs {
+            let Some(pending) = self.pending_thinking.get(&run.run_id) else {
+                continue;
+            };
+            if run.state.thinking_level.as_deref() == Some(pending.as_str()) {
+                confirmed.push(run.run_id.clone());
+            } else {
+                run.state.thinking_level = Some(pending.clone());
+            }
+        }
+        for run_id in confirmed {
+            self.pending_thinking.remove(&run_id);
+        }
     }
 
     /// Replace the orchestrator state (state.json poll).
@@ -502,12 +541,12 @@ impl Console {
     // View model for the renderer
 
     #[must_use]
-    pub fn mode(&self) -> Mode {
+    pub const fn mode(&self) -> Mode {
         self.mode
     }
 
     #[must_use]
-    pub fn view(&self) -> View {
+    pub const fn view(&self) -> View {
         self.view
     }
 
@@ -517,33 +556,33 @@ impl Console {
     }
 
     #[must_use]
-    pub fn selected(&self) -> usize {
+    pub const fn selected(&self) -> usize {
         self.selected
     }
 
     #[must_use]
-    pub fn composer(&self) -> &Composer {
+    pub const fn composer(&self) -> &Composer {
         &self.composer
     }
 
     #[must_use]
-    pub fn overlay(&self) -> Option<&Overlay> {
+    pub const fn overlay(&self) -> Option<&Overlay> {
         self.overlay.as_ref()
     }
 
     #[must_use]
-    pub fn flash(&self) -> Option<&Flash> {
+    pub const fn flash(&self) -> Option<&Flash> {
         self.flash.as_ref()
     }
 
     #[must_use]
-    pub fn prefs(&self) -> &Prefs {
+    pub const fn prefs(&self) -> &Prefs {
         &self.prefs
     }
 
     /// The orchestrator's transcript.
     #[must_use]
-    pub fn orchestrator_transcript(&self) -> &Transcript {
+    pub const fn orchestrator_transcript(&self) -> &Transcript {
         &self.orch_transcript
     }
 
@@ -563,13 +602,13 @@ impl Console {
 
     /// The session scroll offset: `None` follows the tail.
     #[must_use]
-    pub fn scroll(&self) -> Option<usize> {
+    pub const fn scroll(&self) -> Option<usize> {
         self.scroll
     }
 
     /// The search state of the open session, for highlight and `n`/`N`.
     #[must_use]
-    pub fn search(&self) -> Option<&SearchState> {
+    pub const fn search(&self) -> Option<&SearchState> {
         self.search.as_ref()
     }
 
@@ -598,10 +637,11 @@ impl Console {
     /// The selected session's target.
     #[must_use]
     pub fn selected_target(&self) -> SessionTarget {
-        match self.rows.get(self.selected) {
-            Some(row) => SessionTarget::from(&row.target),
-            None => SessionTarget::Orchestrator,
-        }
+        self.rows
+            .get(self.selected)
+            .map_or(SessionTarget::Orchestrator, |row| {
+                SessionTarget::from(&row.target)
+            })
     }
 
     /// The selected row, if any.
@@ -730,25 +770,29 @@ impl Console {
 
     /// Turn a key press into view-model changes plus effects to carry out.
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        if let Some(overlay) = self.overlay.clone() {
+        if self.overlay.is_some() {
             // An overlay owns the keys: it reads them like the composer does,
             // so printable characters are always text and the mode is moot.
             let action = map_key(Mode::Insert, key);
-            return self.handle_overlay(overlay, action, key);
+            return self.handle_action(action);
         }
         let action = map_key(self.mode, key);
+        self.handle_action(action)
+    }
+
+    /// Apply an already-mapped action. The runtime routes mouse wheel events
+    /// through here too; an open overlay owns the action either way.
+    pub fn handle_action(&mut self, action: KeyAction) -> Vec<Effect> {
+        if let Some(overlay) = self.overlay.clone() {
+            return self.handle_overlay(overlay, action);
+        }
         match self.mode {
             Mode::Normal => self.handle_normal(action),
             Mode::Insert => self.handle_insert(action),
         }
     }
 
-    fn handle_overlay(
-        &mut self,
-        overlay: Overlay,
-        action: KeyAction,
-        _key: KeyEvent,
-    ) -> Vec<Effect> {
+    fn handle_overlay(&mut self, overlay: Overlay, action: KeyAction) -> Vec<Effect> {
         match overlay {
             Overlay::Help => {
                 if matches!(
@@ -768,6 +812,7 @@ impl Console {
             Overlay::Permission(state) => self.handle_permission(state, action),
             Overlay::Palette(state) => self.handle_palette(state, action),
             Overlay::Search(state) => self.handle_search(state, action),
+            Overlay::Brief(state) => self.handle_brief(state, action),
         }
     }
 
@@ -800,7 +845,7 @@ impl Console {
 
     /// Stop everything: every live worker aborted, the orchestrator stopped,
     /// the console closed.
-    fn shutdown_effects(&mut self) -> Vec<Effect> {
+    fn shutdown_effects(&self) -> Vec<Effect> {
         let mut effects = Vec::new();
         for run in &self.runs {
             if !Self::is_live(&run.state) {
@@ -856,7 +901,7 @@ impl Console {
 
         if is_question && !questions.is_empty() {
             let current = &questions[state.question.min(questions.len() - 1)];
-            let option_count = current.options.as_ref().map_or(0, |o| o.len());
+            let option_count = current.options.as_ref().map_or(0, Vec::len);
             match action {
                 KeyAction::CompletionNext | KeyAction::Move(1) => {
                     state.selected = (state.selected + 1) % (option_count + 1);
@@ -933,7 +978,7 @@ impl Console {
                 .collect(),
         );
         let effect = Effect::ResolvePermission {
-            request_id: request.request_id.clone(),
+            request_id: request.request_id,
             decision: PermissionDecisionRecord::Answer { answers },
         };
         self.advance_permission(state);
@@ -947,7 +992,7 @@ impl Console {
         reason: String,
     ) -> Vec<Effect> {
         let effect = Effect::ResolvePermission {
-            request_id: request.request_id.clone(),
+            request_id: request.request_id,
             decision: PermissionDecisionRecord::Deny {
                 message: if reason.is_empty() {
                     "denied by the user".to_string()
@@ -967,7 +1012,7 @@ impl Console {
         updated_permissions: Option<Vec<Value>>,
     ) -> Vec<Effect> {
         let effect = Effect::ResolvePermission {
-            request_id: request.request_id.clone(),
+            request_id: request.request_id,
             decision: PermissionDecisionRecord::Allow {
                 updated_permissions,
             },
@@ -1093,6 +1138,66 @@ impl Console {
         Vec::new()
     }
 
+    /// `b`: pop the selected session's full brief; the composer keeps its
+    /// message. A worker's is its `taskBrief`; the orchestrator's is the
+    /// rendered `orchestrator/prompt.md`, or a dimmed placeholder when the
+    /// monitor has not written it yet.
+    fn open_brief(&mut self) -> Vec<Effect> {
+        let (text, placeholder) = match self.selected_target() {
+            SessionTarget::Worker(run_id) => match self.run_state(&run_id) {
+                Some(state) if !state.task_brief.trim().is_empty() => {
+                    (state.task_brief.clone(), false)
+                }
+                _ => {
+                    let text = format!("(no brief recorded for {})", self.name_of(&run_id));
+                    (text, true)
+                }
+            },
+            SessionTarget::Orchestrator => {
+                match std::fs::read_to_string(self.fleet.orchestrator_dir().join("prompt.md")) {
+                    Ok(text) if !text.trim().is_empty() => (text, false),
+                    _ => (
+                        "(no orchestrator prompt yet — the monitor writes prompt.md at boot)"
+                            .to_string(),
+                        true,
+                    ),
+                }
+            }
+        };
+        self.overlay = Some(Overlay::Brief(BriefState {
+            text,
+            offset: 0,
+            placeholder,
+        }));
+        Vec::new()
+    }
+
+    /// The brief popup owns its keys: esc (and the other close keys) drop
+    /// it, the wheel and the scroll keys move the window, everything else is
+    /// absorbed — typing never lands in the composer while it is up.
+    fn handle_brief(&mut self, mut state: BriefState, action: KeyAction) -> Vec<Effect> {
+        let step = (self.viewport_rows / 2).max(1);
+        match action {
+            KeyAction::ScrollHalfUp | KeyAction::ScrollPageUp => {
+                state.offset = state.offset.saturating_sub(step);
+            }
+            KeyAction::ScrollHalfDown | KeyAction::ScrollPageDown => {
+                state.offset = state.offset.saturating_add(step);
+            }
+            KeyAction::Help
+            | KeyAction::Back
+            | KeyAction::Open
+            | KeyAction::Send
+            | KeyAction::LeaveInsert => {
+                self.overlay = None;
+                return Vec::new();
+            }
+            _ => {}
+        }
+        self.overlay = Some(Overlay::Brief(state));
+        Vec::new()
+    }
+
     /// Case-insensitive matches over the open session's transcript blocks.
     fn search_matches(&self, query: &str) -> Vec<usize> {
         if query.is_empty() {
@@ -1118,9 +1223,9 @@ impl Console {
         let matches = self.search_matches(&query);
         let current = matches.first().copied();
         self.search = Some(SearchState {
+            query,
             matches,
             current,
-            query,
         });
     }
 
@@ -1181,6 +1286,7 @@ impl Console {
                 self.overlay = Some(Overlay::Help);
                 Vec::new()
             }
+            KeyAction::Brief => self.open_brief(),
             KeyAction::Quit => vec![Effect::Quit],
             KeyAction::EnterInsert => {
                 self.enter_insert();
@@ -1278,7 +1384,7 @@ impl Console {
         if blocks == 0 {
             return;
         }
-        let current = self.scroll.map_or(blocks.saturating_sub(1), |s| s);
+        let current = self.scroll.unwrap_or_else(|| blocks.saturating_sub(1));
         let next = (current as i64 + delta).clamp(0, blocks.saturating_sub(1) as i64) as usize;
         self.scroll = Some(next);
     }
@@ -1422,6 +1528,19 @@ impl Console {
                 self.mode = Mode::Normal;
                 self.composer.answering = None;
                 self.composer.dismissed = true;
+                Vec::new()
+            }
+            // the wheel (and the odd ctrl-d/ctrl-u) scroll the transcript
+            // while the composer has focus; typing is never interrupted
+            KeyAction::ScrollHalfUp | KeyAction::ScrollHalfDown => {
+                if self.view == View::Session {
+                    let delta = if action == KeyAction::ScrollHalfUp {
+                        -1
+                    } else {
+                        1
+                    };
+                    self.scroll_page(delta * (self.viewport_rows as i64 / 2));
+                }
                 Vec::new()
             }
             KeyAction::PaletteInInsert => {
@@ -1676,7 +1795,7 @@ impl Console {
                     let questions = questions_of(&request.request.input);
                     if questions
                         .first()
-                        .is_some_and(|first| first.options.as_ref().is_none_or(|o| o.is_empty()))
+                        .is_some_and(|first| first.options.as_ref().is_none_or(Vec::is_empty))
                     {
                         custom = true;
                     }
@@ -1825,7 +1944,16 @@ impl Console {
                     );
                     return Vec::new();
                 }
-                let next = next_level(&THINKING_LEVELS, state.thinking_level.as_deref());
+                let current = self
+                    .pending_thinking
+                    .get(&run_id)
+                    .map(String::as_str)
+                    .or(state.thinking_level.as_deref());
+                let next = next_level(&THINKING_LEVELS, current);
+                // optimistic, like the orchestrator's pending_effort: the
+                // statusline reads it via the state overlay in set_runs, and
+                // the next press advances from it instead of the stale state
+                self.pending_thinking.insert(run_id.clone(), next.clone());
                 self.toast(format!("· {} thinking {next}", state.name), false);
                 vec![Effect::WorkerThinking {
                     run_id,
@@ -1856,7 +1984,7 @@ impl Console {
 
     /// The `/model` effect for the selected session: an orchestrator command
     /// or a worker `model` envelope; claude validates its own names.
-    fn model_effect(&mut self, model_id: &str, provider: Option<String>) -> Vec<Effect> {
+    fn model_effect(&self, model_id: &str, provider: Option<String>) -> Vec<Effect> {
         match self.selected_target() {
             SessionTarget::Orchestrator => {
                 vec![Effect::SetOrchestratorModel(model_id.to_string())]
@@ -2057,10 +2185,9 @@ impl Console {
                         return Vec::new();
                     }
                     self.notice(format!("→ {} thinking level → {level}", state.name), false);
-                    vec![Effect::WorkerThinking {
-                        run_id: run_id.to_string(),
-                        level,
-                    }]
+                    let run_id = run_id.to_string();
+                    self.pending_thinking.insert(run_id.clone(), level.clone());
+                    vec![Effect::WorkerThinking { run_id, level }]
                 }
                 "/model" => {
                     if argument.is_empty() {
@@ -2270,8 +2397,7 @@ impl Console {
             .fleet
             .root()
             .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.fleet.root().to_path_buf());
+            .map_or_else(|| self.fleet.root().to_path_buf(), Path::to_path_buf);
         let result: anyhow::Result<()> = async {
             match effect {
                 Effect::SendToOrchestrator(text) => {
@@ -2375,7 +2501,7 @@ impl Console {
 
 /// Is this derived view past working? (Steering, stopping: no longer applies.)
 #[must_use]
-pub fn is_terminal_view(view: DerivedView) -> bool {
+pub const fn is_terminal_view(view: DerivedView) -> bool {
     matches!(
         view,
         DerivedView::Settled
@@ -2390,10 +2516,7 @@ pub fn is_terminal_view(view: DerivedView) -> bool {
 #[must_use]
 pub fn next_level(levels: &[&str], current: Option<&str>) -> String {
     let at = current.and_then(|c| levels.iter().position(|l| *l == c));
-    let next = match at {
-        Some(at) => (at + 1) % levels.len(),
-        None => 0,
-    };
+    let next = at.map_or(0, |at| (at + 1) % levels.len());
     levels[next].to_string()
 }
 
@@ -2465,6 +2588,11 @@ fn char_to_byte(input: &str, char_index: usize) -> usize {
 /// installs the terminal and the panic hook, and hands the event loop to
 /// [`crate::tui::runtime::run_console`]. The terminal is restored on every
 /// exit path — panic included — before anything prints.
+/// Run the console: the terminal, the lock, and the event loop.
+///
+/// # Errors
+/// Terminal bring-up (raw mode, alternate screen) and draw failures; the
+/// console's own problems surface as notices, not errors.
 pub async fn run_app(options: TuiOptions) -> anyhow::Result<crate::cli::ExitCode> {
     let cwd = match options.cwd.clone() {
         Some(dir) => dir,
@@ -3174,22 +3302,76 @@ mod tests {
         assert_eq!(c.effort(), Some("low"), "optimistic until state confirms");
         // the worker cycles pi's from the level it reports
         c.handle_key(ch('j'));
+        let mut entry = running_run("db-20260829120000", "db");
+        entry.state.thinking_level = Some("high".into());
+        c.set_runs(vec![entry]);
         let effects = c.handle_key(ch('t'));
         assert_eq!(
             effects,
             vec![Effect::WorkerThinking {
                 run_id: "db-20260829120000".to_string(),
-                level: "off".to_string(),
+                level: "xhigh".to_string(),
             }]
         );
-        let mut entry = running_run("db-20260829120000", "db");
-        entry.state.thinking_level = Some("high".into());
-        c.set_runs(vec![entry]);
+        // and the next press advances from the optimistically written level,
+        // even though the monitor has not written it back into run.json yet
         let effects = c.handle_key(ch('t'));
         assert!(matches!(
             &effects[0],
+            Effect::WorkerThinking { level, .. } if level == "max"
+        ));
+    }
+
+    #[test]
+    fn t_cycles_a_worker_thinking_level_without_the_monitor_writeback() {
+        let mut c = setup_with_worker();
+        c.handle_key(ch('j'));
+        let mut entry = running_run("db-20260829120000", "db");
+        entry.state.thinking_level = Some("high".into());
+        c.set_runs(vec![entry]);
+
+        // the monitor never writes the applied level back into run.json: the
+        // polled state still says "high", yet the press advances anyway
+        let first = c.handle_key(ch('t'));
+        assert!(matches!(
+            &first[0],
             Effect::WorkerThinking { level, .. } if level == "xhigh"
         ));
+        let second = c.handle_key(ch('t'));
+        assert!(
+            matches!(
+                &second[0],
+                Effect::WorkerThinking { level, .. } if level == "max"
+            ),
+            "the second press must advance from the optimistic level: {second:?}"
+        );
+
+        // a re-poll with the stale state folds the optimistic level into the
+        // view, so the statusline shows it; a poll that catches up forgets it
+        let mut stale = running_run("db-20260829120000", "db");
+        stale.state.thinking_level = Some("high".into());
+        c.set_runs(vec![stale]);
+        assert_eq!(
+            c.runs[0].state.thinking_level.as_deref(),
+            Some("max"),
+            "the statusline reads the optimistic level until the state catches up"
+        );
+        let mut caught_up = running_run("db-20260829120000", "db");
+        caught_up.state.thinking_level = Some("max".into());
+        c.set_runs(vec![caught_up]);
+        assert_eq!(
+            c.pending_thinking.len(),
+            0,
+            "the monitor owns the level now"
+        );
+        let next = c.handle_key(ch('t'));
+        assert!(
+            matches!(
+                &next[0],
+                Effect::WorkerThinking { level, .. } if level == "off"
+            ),
+            "max wraps to off: {next:?}"
+        );
     }
 
     #[test]
@@ -3201,6 +3383,78 @@ mod tests {
         c.handle_key(ch('j'));
         c.handle_key(ch('p'));
         assert!(c.flash().unwrap().text.contains("orchestrator-only"));
+    }
+
+    #[test]
+    fn b_opens_the_full_brief_popup_and_scrolls_it() {
+        let mut c = setup_with_worker();
+        // the orchestrator's brief is the rendered prompt; none on a fresh
+        // fleet, so the popup says so dimmed instead of erroring
+        c.handle_key(ch('b'));
+        let Overlay::Brief(state) = c.overlay().unwrap() else {
+            panic!("expected the brief overlay");
+        };
+        assert!(state.placeholder, "no prompt.md yet on a fresh fleet");
+        c.handle_key(esc());
+        assert!(c.overlay().is_none(), "esc closes the brief");
+
+        // a worker's brief is its taskBrief
+        let mut entry = running_run("db-20260829120000", "db");
+        entry.state.task_brief = "Build the auth module.\n\nDo not touch tests.".into();
+        c.set_runs(vec![entry]);
+        c.handle_key(ch('j'));
+        c.handle_key(ch('b'));
+        let Overlay::Brief(state) = c.overlay().unwrap() else {
+            panic!();
+        };
+        assert_eq!(
+            state.text, "Build the auth module.\n\nDo not touch tests.",
+            "the full brief, not the one-line transcript summary"
+        );
+        assert!(!state.placeholder);
+
+        // the wheel routes here as the scroll actions, half a viewport each
+        let offset = |c: &Console| {
+            let Overlay::Brief(state) = c.overlay().unwrap() else {
+                panic!();
+            };
+            state.offset
+        };
+        c.handle_action(KeyAction::ScrollHalfDown);
+        c.handle_action(KeyAction::ScrollHalfDown);
+        assert_eq!(offset(&c), 20, "two notches of the 20-row viewport");
+        c.handle_action(KeyAction::ScrollHalfUp);
+        assert_eq!(offset(&c), 10);
+        c.handle_action(KeyAction::Back);
+        assert!(c.overlay().is_none());
+
+        // with a rendered prompt on disk, the orchestrator shows it
+        std::fs::create_dir_all(c.fleet.orchestrator_dir()).unwrap();
+        std::fs::write(
+            c.fleet.orchestrator_dir().join("prompt.md"),
+            "You are the orchestrator.",
+        )
+        .unwrap();
+        c.handle_key(ch('k'));
+        c.handle_key(ch('b'));
+        let Overlay::Brief(state) = c.overlay().unwrap() else {
+            panic!();
+        };
+        assert_eq!(state.text, "You are the orchestrator.");
+        assert!(!state.placeholder);
+        c.handle_action(KeyAction::Back);
+
+        // a worker whose record is gone (or brief empty) reads as a placeholder
+        let mut empty = running_run("db-20260829120000", "db");
+        empty.state.task_brief = String::new();
+        c.set_runs(vec![empty]);
+        c.handle_key(ch('j'));
+        let effects = c.handle_key(ch('b'));
+        assert!(effects.is_empty());
+        let Overlay::Brief(state) = c.overlay().unwrap() else {
+            panic!();
+        };
+        assert!(state.placeholder, "an empty brief is not a brief");
     }
 
     #[test]

@@ -6,7 +6,8 @@
 //! The map is pure: it turns one [`KeyEvent`] into one [`KeyAction`] and the
 //! app decides what the action does in the current view.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use std::fmt::Write as _;
 
 /// Which key mode the console is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -44,6 +45,8 @@ pub enum KeyAction {
     OpenPalette,
     /// `?`: the help overlay.
     Help,
+    /// `b`: the selected session's full brief (scrollable popup).
+    Brief,
     /// `q`: close the console; workers keep running.
     Quit,
     /// `Q`: stop the orchestrator and every worker (asks first).
@@ -136,6 +139,9 @@ fn map_normal(key: KeyEvent) -> KeyAction {
         KeyCode::Char('/') => A::Search,
         KeyCode::Char(':') => A::OpenPalette,
         KeyCode::Char('?') => A::Help,
+        // ctrl+b must be tested before the bare b that opens the brief
+        KeyCode::Char('b') if ctrl(&key) => A::ScrollPageUp,
+        KeyCode::Char('b') => A::Brief,
         KeyCode::Char('q') => A::Quit,
         KeyCode::Char('Q') => A::Shutdown,
         KeyCode::Char('i') => A::EnterInsert,
@@ -150,7 +156,6 @@ fn map_normal(key: KeyEvent) -> KeyAction {
         KeyCode::Char('d') if ctrl(&key) => A::ScrollHalfDown,
         KeyCode::Char('u') if ctrl(&key) => A::ScrollHalfUp,
         KeyCode::Char('f') if ctrl(&key) => A::ScrollPageDown,
-        KeyCode::Char('b') if ctrl(&key) => A::ScrollPageUp,
         KeyCode::PageDown => A::ScrollPageDown,
         KeyCode::PageUp => A::ScrollPageUp,
         // Any other printable starts a message: normal mode keeps the char.
@@ -178,6 +183,18 @@ fn map_insert(key: KeyEvent) -> KeyAction {
         KeyCode::Esc => A::LeaveInsert,
         KeyCode::Char('k') if ctrl(&key) => A::PaletteInInsert,
         _ => A::Ignored,
+    }
+}
+
+/// Map a mouse event onto the action it means. The wheel scrolls wherever
+/// the transcript does: half a viewport per notch, in both modes; every
+/// other button stays unbound for now.
+#[must_use]
+pub fn map_mouse(mouse: MouseEvent) -> KeyAction {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => KeyAction::ScrollHalfUp,
+        MouseEventKind::ScrollDown => KeyAction::ScrollHalfDown,
+        _ => KeyAction::Ignored,
     }
 }
 
@@ -234,6 +251,10 @@ pub const NORMAL_KEYS: &[KeyHelp] = &[
     KeyHelp {
         keys: "?",
         what: "this help",
+    },
+    KeyHelp {
+        keys: "b",
+        what: "the selected session's full brief",
     },
     KeyHelp {
         keys: "a",
@@ -352,7 +373,7 @@ fn render_section(section: &HelpSection) -> String {
     let mut out = String::from(section.title);
     out.push(':');
     for row in section.rows {
-        out.push_str(&format!("\n  {:18} {}", row.keys, row.what));
+        let _ = write!(out, "\n  {:18} {}", row.keys, row.what);
     }
     out
 }
@@ -399,6 +420,7 @@ pub fn help_lines(width: usize, max_rows: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use KeyAction as A;
+    use crossterm::event::MouseButton;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -461,6 +483,7 @@ mod tests {
         );
         assert_eq!(map_key(Mode::Normal, key(KeyCode::Char('n'))), A::NextMatch);
         assert_eq!(map_key(Mode::Normal, key(KeyCode::Char('N'))), A::PrevMatch);
+        assert_eq!(map_key(Mode::Normal, key(KeyCode::Char('b'))), A::Brief);
     }
 
     #[test]
@@ -555,6 +578,26 @@ mod tests {
             map_key(Mode::Insert, ctrl_key(KeyCode::Char('a'))),
             A::Ignored
         );
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_half_a_viewport_and_other_buttons_are_ignored() {
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(map_mouse(mouse(MouseEventKind::ScrollUp)), A::ScrollHalfUp);
+        assert_eq!(
+            map_mouse(mouse(MouseEventKind::ScrollDown)),
+            A::ScrollHalfDown
+        );
+        assert_eq!(
+            map_mouse(mouse(MouseEventKind::Down(MouseButton::Left))),
+            A::Ignored
+        );
+        assert_eq!(map_mouse(mouse(MouseEventKind::Moved)), A::Ignored);
     }
 
     #[test]

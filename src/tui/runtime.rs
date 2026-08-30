@@ -13,7 +13,10 @@ use std::process::id as process_id;
 use std::time::Duration;
 
 use anyhow::Context;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -40,7 +43,7 @@ fn repo_cwd(fleet: &FleetPaths) -> String {
     fleet
         .root()
         .parent()
-        .unwrap_or(fleet.root())
+        .unwrap_or_else(|| fleet.root())
         .to_string_lossy()
         .into_owned()
 }
@@ -64,24 +67,24 @@ pub fn is_interactive() -> bool {
     io::stdin().is_tty() && io::stdout().is_tty()
 }
 
-/// Install the terminal: raw mode, alternate screen, backend.
+/// Install the terminal: raw mode, alternate screen, mouse capture, backend.
 ///
 /// # Errors
 /// Raw mode or the screen switch failing — there is nothing to restore yet.
 pub fn enter() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
-/// Undo [`enter`]: leave the alternate screen, drop raw mode, flush. Best
-/// effort and idempotent — called from the panic hook and every exit path,
-/// and it must never mask the error that brought us here.
+/// Undo [`enter`]: release the mouse, leave the alternate screen, drop raw
+/// mode, flush. Best effort and idempotent — called from the panic hook and
+/// every exit path, and it must never mask the error that brought us here.
 pub fn restore() {
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
-    let _ = disable_raw_mode();
     use std::io::Write as _;
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let _ = disable_raw_mode();
     let _ = io::stdout().flush();
 }
 
@@ -427,7 +430,7 @@ fn record_launch_options(fleet: &FleetPaths, options: &TuiOptions) {
 fn is_interrupt(key: &KeyEvent) -> bool {
     key.kind != KeyEventKind::Release
         && key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +448,11 @@ pub async fn run_console(
     lock: &ConsoleLock,
     options: TuiOptions,
 ) -> anyhow::Result<ExitCode> {
-    let repo_root = fleet.root().parent().unwrap_or(fleet.root()).to_path_buf();
+    let repo_root = fleet
+        .root()
+        .parent()
+        .unwrap_or_else(|| fleet.root())
+        .to_path_buf();
     let mut console = Console::new(fleet.clone());
     console.load_prefs();
 
@@ -531,7 +538,16 @@ pub async fn run_console(
                         break;
                     }
                 }
-                // resize redraws on the next pass; mouse and focus are unused
+                Some(Ok(Event::Mouse(mouse))) => {
+                    // the wheel scrolls half a viewport, in both modes and
+                    // inside the brief popup; other buttons stay unbound
+                    let action = crate::tui::keys::map_mouse(mouse);
+                    if action != crate::tui::keys::KeyAction::Ignored {
+                        let effects = console.handle_action(action);
+                        console.execute_all(effects).await;
+                    }
+                }
+                // resize redraws on the next pass; focus is unused
                 Some(Ok(_)) => {}
                 Some(Err(_)) | None => break,
             },
@@ -580,14 +596,14 @@ mod tests {
         // a fresh foreign lock is refused
         std::fs::write(
             &path,
-            json!({ "pid": std::process::id() as u64 + 1, "ts": now_iso() }).to_string(),
+            json!({ "pid": u64::from(std::process::id()) + 1, "ts": now_iso() }).to_string(),
         )
         .unwrap();
-        assert_eq!(active_lock(&path), Some(std::process::id() as u64 + 1));
+        assert_eq!(active_lock(&path), Some(u64::from(std::process::id()) + 1));
 
         // a stale lock is a crashed console, not a live one
         let stale = json!({
-            "pid": std::process::id() as u64 + 1,
+            "pid": u64::from(std::process::id()) + 1,
             "ts": crate::util::now_iso(),
         });
         let stale = match &stale {
@@ -627,7 +643,7 @@ mod tests {
     fn dropping_leaves_a_taken_over_lock_alone() {
         let (_dir, fleet) = tmp_fleet();
         let path = fleet.console_lock();
-        let foreign = process_id() as u64 + 1;
+        let foreign = u64::from(process_id()) + 1;
         std::fs::write(
             &path,
             json!({ "pid": foreign, "ts": now_iso() }).to_string(),
@@ -705,7 +721,7 @@ mod tests {
         let mut options = tui_options(Some("fable"));
         options.budget = Some(" 2.5 ".into());
         options.permission_mode = Some("acceptEdits".into());
-        options.remote_control = Some("".into());
+        options.remote_control = Some(String::new());
         options.fresh = true;
         assert!(ensure_orchestrator(&fleet, &options).unwrap());
         let session = crate::orch::session::load(fleet.root()).unwrap();
@@ -780,13 +796,13 @@ mod tests {
         )
     }
 
-    fn settle(fleet: &FleetPaths, run_id: &str, question: serde_json::Value) {
+    fn settle(fleet: &FleetPaths, run_id: &str, question: &serde_json::Value) {
         let run_dir = fleet.root().join("runs").join(run_id);
         let mut state = crate::fleet::run::load_state(&run_dir).unwrap();
         state.status = crate::fleet::run::RunStatus::Settled;
         state.last_assistant_text = Some("Done: wrote the auth module".into());
         crate::fleet::run::save_state(&run_dir, &state).unwrap();
-        crate::util::append_json_line(&run_dir.join("events.jsonl"), &question).unwrap();
+        crate::util::append_json_line(&run_dir.join("events.jsonl"), question).unwrap();
     }
 
     fn inbox_lines(fleet: &FleetPaths) -> Vec<String> {
@@ -824,7 +840,9 @@ mod tests {
         settle(
             &fleet,
             &run_id,
-            json!({"type":"worker_question","questionId":"q_1","question":"bcrypt or argon2?"}),
+            &json!(
+                {"type":"worker_question","questionId":"q_1","question":"bcrypt or argon2?"}
+            ),
         );
         poll.forward_fleet_events(&mut console).await;
         let lines = inbox_lines(&fleet);
@@ -858,7 +876,7 @@ mod tests {
         settle(
             &fleet,
             &run_id,
-            json!({"type":"worker_question","questionId":"q_1","question":"which db?"}),
+            &json!({"type":"worker_question","questionId":"q_1","question":"which db?"}),
         );
         poll.forward_fleet_events(&mut console).await;
         assert_eq!(count_kind(&fleet, "question"), 1);
@@ -894,7 +912,7 @@ mod tests {
         settle(
             &fleet,
             &run_id,
-            json!({"type":"worker_question","questionId":"q_1","question":"rest or grpc?"}),
+            &json!({"type":"worker_question","questionId":"q_1","question":"rest or grpc?"}),
         );
         poll.forward_fleet_events(&mut console).await;
         // nothing new: the same consumed lines are not queued twice
