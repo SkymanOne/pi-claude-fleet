@@ -214,17 +214,7 @@ pub fn ensure_gitignore_entry(root: &Path, entry: &str) -> std::io::Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
-
-    fn tmp_repo(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "{name}-{}-{}",
-            std::process::id(),
-            crate::util::new_id("t").replace('_', "")
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::git::test_support::{git_sync, tmp_dir};
 
     #[test]
     fn layout_paths_are_derived_from_the_root() {
@@ -296,44 +286,14 @@ mod tests {
         assert_eq!(env_var("RUN"), "PARL_RUN");
     }
 
-    /// Is `dir` inside a usable git work tree? What `ensure`'s gitignore
-    /// lookup actually depends on.
-    fn git_repo_ready(dir: &Path) -> bool {
-        std::process::Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .current_dir(dir)
-            .output()
-            .is_ok_and(|out| out.status.success())
-    }
-
-    /// Set up a real git repo in a fresh tempdir, polling with a bound. Both
-    /// `git init` and the `rev-parse` that `ensure` relies on are spawns, and
-    /// under full-suite parallel load a spawn has been observed to fail
-    /// transiently ("No such file or directory"). `git init` is idempotent,
-    /// so retrying is safe; a persistent failure still fails the test, and
-    /// the bound keeps a real breakage from hanging the suite.
-    fn init_repo_bounded(dir: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let init = std::process::Command::new("git")
-                .args(["init", "-q", "-b", "main"])
-                .current_dir(dir)
-                .output();
-            if init.as_ref().is_ok_and(|out| out.status.success()) && git_repo_ready(dir) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "git init in {dir:?} never became a usable repo: {init:?}"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
     #[test]
     fn ensure_creates_layout_and_gitignores_once() {
-        let root = tmp_repo("parl-paths-");
-        init_repo_bounded(&root);
+        let root = tmp_dir("parl-paths-");
+        // Both spawns transiently fail under full-suite parallel load; the
+        // shared bounded retry covers them, and the rev-parse probe confirms
+        // the repo answers before `ensure` consults it.
+        git_sync(&root, &["init", "-q", "-b", "main"]);
+        git_sync(&root, &["rev-parse", "--show-toplevel"]);
         let paths = FleetPaths::new(root.join(STATE_DIR_NAME));
         assert!(paths.ensure().unwrap());
         assert!(paths.root().is_dir());

@@ -300,11 +300,62 @@ pub async fn merge_branch(
     MergeOutcome::Conflicted(files)
 }
 
+/// Test-only git helpers shared by the unit suites (`git`, `ops::spawn`,
+/// `paths`). Test-setup git spawns have been observed to fail transiently
+/// under full-suite parallel load ("No such file or directory" from the
+/// spawn itself), so every test-side git call goes through the same bounded
+/// retry. Production code stays single-shot on purpose.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
-    fn tmp_dir(name: &str) -> PathBuf {
+    /// How long a transient-prone git call may keep being retried.
+    pub(crate) const RETRY_BOUND: Duration = Duration::from_secs(10);
+    /// Pause between retries.
+    pub(crate) const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// Run `git args` in `dir` with a test identity (commits must work on a
+    /// machine with no git config), retrying within [`RETRY_BOUND`]: a git
+    /// spawn can transiently fail when the machine is loaded. Panics with
+    /// the last attempt's stderr — setup must succeed for the test to mean
+    /// anything, and the bound keeps a real breakage from hanging the suite.
+    /// Only ever used for setup commands whose retry is safe (`git init` is
+    /// idempotent; a failed command left nothing behind to half-apply).
+    pub(crate) fn git_sync(dir: &Path, args: &[&str]) {
+        let deadline = Instant::now() + RETRY_BOUND;
+        loop {
+            let attempt = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output();
+            match attempt {
+                Ok(out) if out.status.success() => return,
+                attempt => {
+                    let detail = match attempt.as_ref() {
+                        Ok(out) => format!(
+                            "{}: {}",
+                            out.status,
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ),
+                        Err(err) => err.to_string(),
+                    };
+                    assert!(
+                        Instant::now() < deadline,
+                        "git {args:?} in {dir:?} never succeeded: {detail}"
+                    );
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+            }
+        }
+    }
+
+    /// A unique throwaway directory under the OS temp dir.
+    pub(crate) fn tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "{name}-{}-{}",
             std::process::id(),
@@ -313,23 +364,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
+}
 
-    fn git_sync(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+#[cfg(test)]
+mod tests {
+    use super::test_support::{RETRY_BOUND, RETRY_INTERVAL, git_sync, tmp_dir};
+    use super::*;
+    use std::time::Instant;
 
     /// A repo with one committed seed file, like the TypeScript test helper.
     fn init_repo(name: &str) -> PathBuf {
@@ -358,30 +399,32 @@ mod tests {
     #[tokio::test]
     async fn repo_detection_and_root_resolution() {
         // A git spawn can transiently fail when the machine is loaded (this
-        // suite runs many git subprocesses in parallel); retry a few times
-        // before calling the assertion failed.
-        for attempt in 0..3 {
+        // suite runs many git subprocesses in parallel). Repo setup retries
+        // inside the shared helper; the production probes are single-shot by
+        // design, so poll them against the same bound before failing the
+        // test.
+        let deadline = Instant::now() + RETRY_BOUND;
+        loop {
             let root = init_repo("parl-git-");
-            let repo_detected = is_git_repo(&root).await;
-            let root_resolved = repo_root(&root).await;
-            if !repo_detected || root_resolved.is_none() {
-                if attempt == 2 {
-                    panic!("git repo not detected at {}", root.display());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
+            if is_git_repo(&root).await
+                && let Some(resolved) = repo_root(&root).await
+            {
+                assert_eq!(
+                    resolved.canonicalize().unwrap(),
+                    root.canonicalize().unwrap()
+                );
+                break;
             }
-            assert!(repo_detected);
-            assert_eq!(
-                root_resolved.unwrap().canonicalize().unwrap(),
-                root.canonicalize().unwrap()
+            assert!(
+                Instant::now() < deadline,
+                "git repo not detected at {}",
+                root.display()
             );
-            let plain = tmp_dir("parl-plain-");
-            assert!(!is_git_repo(&plain).await);
-            assert_eq!(repo_root(&plain).await, None);
-            return;
+            tokio::time::sleep(RETRY_INTERVAL).await;
         }
-        unreachable!("retry loop always returns or panics")
+        let plain = tmp_dir("parl-plain-");
+        assert!(!is_git_repo(&plain).await);
+        assert_eq!(repo_root(&plain).await, None);
     }
 
     #[tokio::test]
