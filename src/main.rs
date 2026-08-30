@@ -192,7 +192,6 @@ async fn finish(result: anyhow::Result<ExitCode>) -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn exit_codes_are_stable() {
@@ -296,56 +295,5 @@ mod tests {
         }
         // --run is required for the worker monitor.
         assert!(Cli::try_parse_from(["parl", "monitor", "--fleet-dir", "/x"]).is_err());
-    }
-
-    #[tokio::test]
-    async fn stubs_report_not_implemented() {
-        // Every stub refuses politely rather than panicking.
-        let err = ops::query::status(None, None, false, false)
-            .await
-            .expect_err("stub bails");
-        assert!(err.to_string().contains("not implemented yet: status"));
-
-        let err = ops::integrate::cleanup("all", None::<&std::path::Path>, false)
-            .await
-            .expect_err("stub bails");
-        assert!(err.to_string().contains("not implemented yet: cleanup"));
-
-        let err = worker::monitor::run_monitor(&PathBuf::from("/x"), "r")
-            .await
-            .expect_err("stub bails");
-        assert!(
-            err.to_string()
-                .contains("not implemented yet: worker monitor")
-        );
-
-        let err = orch::monitor::run_orchestrator_monitor(&PathBuf::from("/x"))
-            .await
-            .expect_err("stub bails");
-        assert!(
-            err.to_string()
-                .contains("not implemented yet: orchestrator monitor")
-        );
-
-        let err = mcp::server::serve_stdio(None)
-            .await
-            .expect_err("stub bails");
-        assert!(
-            err.to_string()
-                .contains("not implemented yet: mcp stdio server")
-        );
-
-        let err = tui::app::run_app(tui::app::TuiOptions {
-            cwd: None,
-            model: None,
-            permission_mode: None,
-            remote_control: None,
-            fresh: false,
-            budget: None,
-            progress_events: false,
-        })
-        .await
-        .expect_err("stub bails");
-        assert!(err.to_string().contains("not implemented yet: tui app"));
     }
 }
