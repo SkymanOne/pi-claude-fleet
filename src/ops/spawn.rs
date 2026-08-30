@@ -8,7 +8,6 @@ use std::process::Stdio;
 use serde::Serialize;
 
 use crate::cli::ExitCode;
-use crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION;
 use crate::fleet::run::{self, RunRef, RunState, RunStatus};
 use crate::git;
 use crate::paths::FleetPaths;
@@ -102,6 +101,46 @@ pub(crate) async fn spawn_core_with_dirs(
         anyhow::bail!("spawn: task brief required after \"--\"");
     }
     let config = crate::paths::load_user_config(user_config_dir)?;
+    // The per-session cap is enforced before a worktree, a branch or a
+    // monitor exist: `[limits] max_workers_per_session` (default 3) limits
+    // how many *live* workers one session may hold — settled, archived and
+    // dead runs free their slot. Zero means no spawning at all.
+    let fleet_dir = resolve_fleet_dir_with_env(request.cwd.as_deref(), parl_dir)
+        .await?
+        .paths
+        .root()
+        .to_path_buf();
+    let session = super::acting_session(&fleet_dir);
+    let cap = config.max_workers_per_session();
+    let live = super::live_runs_for_session(&fleet_dir, session);
+    if live.len() >= cap {
+        let holders = live
+            .iter()
+            .map(|s| {
+                format!(
+                    "  {} ({}) — {}",
+                    s.id,
+                    s.name,
+                    run::derive_view(s, run::is_alive, crate::util::now_ms())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hint = if live.is_empty() {
+            "the cap is set to 0 — raise [limits] max_workers_per_session in the \
+user config (~/.parl/config.toml) to spawn at all."
+        } else {
+            "finish or clean up one of these before spawning another."
+        };
+        return Ok(fail(
+            ExitCode::Error,
+            vec![format!(
+                "spawn: refused — this session already has {} live worker(s), the \
+per-session cap is {cap} ([limits] max_workers_per_session):\n{holders}\n{hint}",
+                live.len()
+            )],
+        ));
+    }
     // The resolved model is the one the monitor will actually run, so a bad
     // name from the config is refused here too — before a worktree exists.
     let model = config.worker_model(request.model.as_deref());
@@ -270,9 +309,11 @@ one live run; stop or clean it first, or use another name.",
     state.is_git = fleet.is_git;
     state.base_commit = base_commit;
     // The recorded identity is the one the directory and branch were cut
-    // from; ownership is the default session until sessions wire through.
+    // from; ownership is the acting session's — the fleet's last-used
+    // session, or the default session when the fleet has no session rows
+    // yet — so a session's cap and views count exactly the runs it owns.
     state.uuid = uuid;
-    state.orchestrator_id = Some(DEFAULT_ORCHESTRATOR_SESSION);
+    state.orchestrator_id = Some(super::acting_session(fleet.paths.root()));
     crate::fleet::run::save_state(&run_dir, &state)?;
     Ok(CreatedRun {
         run_id,
@@ -417,7 +458,8 @@ mod tests {
                 .is_match(&created.run_id)
         );
         // The id is the alias plus the short uuid, and the state records the
-        // same uuid plus the owning (default) session.
+        // same uuid plus the owning session (the default until fleet.json
+        // names one — a fresh fleet has no session rows yet).
         assert!(!created.state.uuid.is_nil());
         assert_eq!(
             created.run_id,
@@ -428,7 +470,7 @@ mod tests {
         );
         assert_eq!(
             created.state.orchestrator_id,
-            Some(DEFAULT_ORCHESTRATOR_SESSION)
+            Some(crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION)
         );
         assert!(created.paths.run_json(&created.run_id).is_file());
         let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
@@ -659,5 +701,219 @@ mod tests {
         assert_eq!(created.state.model.as_deref(), Some("glm-5.3"));
         // The provider carries no explicit value, so the config still fills it.
         assert_eq!(created.state.provider.as_deref(), Some("opencode-go"));
+    }
+
+    /// A live run on disk owned by `owner` (`None` = the unowned legacy
+    /// shape), the way an earlier spawn of that session left it.
+    fn put_live_run(paths: &FleetPaths, run_id: &str, name: &str, owner: Option<uuid::Uuid>) {
+        let run_dir = paths.run_dir(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut state = RunState::new(
+            paths.root().to_string_lossy().as_ref(),
+            run_id,
+            name,
+            "/tmp/x",
+            "b",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        state.status = RunStatus::Running;
+        state.pid = Some(std::process::id().cast_signed());
+        state.orchestrator_id = owner;
+        save_state(&run_dir, &state).unwrap();
+    }
+
+    /// The fleet dir of a repo, ensured like spawn ensures it.
+    fn fleet_of(root: &Path) -> PathBuf {
+        let dir = root.join(crate::paths::STATE_DIR_NAME);
+        std::fs::create_dir_all(dir.join("runs")).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn spawn_refuses_at_the_per_session_cap_naming_the_slots() {
+        let root = init_repo("parl-spawn-cap-");
+        let fleet = fleet_of(&root);
+        let default = Some(crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION);
+        // Three live runs of the (default) session fill the default cap of 3.
+        for i in 0..3 {
+            put_live_run(
+                &FleetPaths::new(&fleet),
+                &format!("cap{i}-6082814153{i}"),
+                &format!("cap{i}"),
+                default,
+            );
+        }
+        let before = std::fs::read_dir(fleet.join("runs"))
+            .unwrap()
+            .flatten()
+            .count();
+        let worktrees = fleet.join("worktrees");
+        let worktrees_before = std::fs::read_dir(&worktrees)
+            .map(Iterator::count)
+            .unwrap_or(0);
+
+        let result = spawn_core_with_dirs(request("fourth", "b", &root, true), None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.code, ExitCode::Error, "refused with exit 1");
+        let err = result.err.join("\n");
+        assert!(err.contains("refused"), "{err}");
+        assert!(err.contains("cap is 3"), "{err}");
+        assert!(err.contains("max_workers_per_session"), "{err}");
+        // Every holder is named, with its id and derived view.
+        for i in 0..3 {
+            assert!(err.contains(&format!("cap{i}-6082814153{i}")), "{err}");
+        }
+        // Nothing was created: no new run, no worktree.
+        let after = std::fs::read_dir(fleet.join("runs"))
+            .unwrap()
+            .flatten()
+            .count();
+        assert_eq!(after, before, "no run directory appeared");
+        let worktrees_after = std::fs::read_dir(&worktrees)
+            .map(Iterator::count)
+            .unwrap_or(0);
+        assert_eq!(worktrees_before, worktrees_after, "no worktree was cut");
+    }
+
+    #[tokio::test]
+    async fn the_cap_counts_live_runs_only_and_other_sessions_do_not_hold_slots() {
+        let root = init_repo("parl-spawn-cap2-");
+        let fleet = fleet_of(&root);
+        let paths = FleetPaths::new(&fleet);
+        let other = Some(uuid::Uuid::parse_str("9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c").unwrap());
+        // Three live runs owned by *another* session: none count toward this
+        // (default) session's cap — the whole point of a per-session limit.
+        for i in 0..3 {
+            put_live_run(
+                &paths,
+                &format!("theirs{i}-6082814153{i}"),
+                &format!("theirs{i}"),
+                other,
+            );
+        }
+        let result = spawn_core_with_dirs(request("mine", "b", &root, true), None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.code, ExitCode::Ok, "{:?}", result.err);
+
+        // Settled runs free their slot: two live, one settled — a third
+        // live would refuse, the settled one never holds a slot.
+        let mut settled = RunState::new(
+            paths.root().to_string_lossy().as_ref(),
+            "old-60828141530",
+            "old",
+            "/tmp/x",
+            "b",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        settled.status = RunStatus::Settled;
+        settled.orchestrator_id = Some(crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION);
+        let old_dir = paths.run_dir("old-60828141530");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        save_state(&old_dir, &settled).unwrap();
+        put_live_run(&paths, "a-60828141531", "a", None);
+        put_live_run(&paths, "b-60828141532", "b", None);
+        put_live_run(
+            &paths,
+            "c-60828141533",
+            "c",
+            Some(crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION),
+        );
+        let result = spawn_core_with_dirs(request("again", "b", &root, true), None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.code, ExitCode::Error);
+        let err = result.err.join("\n");
+        assert!(err.contains("cap is 3"), "{err}");
+        assert!(err.contains("a-60828141531"), "{err}");
+        assert!(err.contains("b-60828141532"), "{err}");
+        assert!(err.contains("c-60828141533"), "{err}");
+        assert!(!err.contains("old-"), "a settled run holds no slot: {err}");
+    }
+
+    #[tokio::test]
+    async fn the_user_config_sets_the_cap_and_zero_refuses_everything() {
+        let root = init_repo("parl-spawn-capcfg-");
+        let fleet = fleet_of(&root);
+        let paths = FleetPaths::new(&fleet);
+        let user_dir = tmp_dir("parl-user-cap-");
+        // A lowered cap: two live runs fill it.
+        std::fs::write(
+            user_dir.join("config.toml"),
+            "[limits]\nmax_workers_per_session = 2\n",
+        )
+        .unwrap();
+        put_live_run(&paths, "x-60828141530", "x", None);
+        put_live_run(&paths, "y-60828141531", "y", None);
+        let result = spawn_core_with_dirs(request("z", "b", &root, true), None, Some(&user_dir))
+            .await
+            .unwrap();
+        assert_eq!(result.code, ExitCode::Error);
+        assert!(
+            result.err.join("\n").contains("cap is 2"),
+            "{:?}",
+            result.err
+        );
+
+        // A cap of zero refuses even with nothing running: no spawning at
+        // all, with a hint naming the config key.
+        let empty = init_repo("parl-spawn-capzero-");
+        std::fs::write(
+            user_dir.join("config.toml"),
+            "[limits]\nmax_workers_per_session = 0\n",
+        )
+        .unwrap();
+        let result =
+            spawn_core_with_dirs(request("solo", "b", &empty, true), None, Some(&user_dir))
+                .await
+                .unwrap();
+        assert_eq!(result.code, ExitCode::Error);
+        let err = result.err.join("\n");
+        assert!(err.contains("cap is 0"), "{err}");
+        assert!(
+            err.contains("raise [limits] max_workers_per_session"),
+            "actionable hint: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spawn_records_the_acting_session_as_owner() {
+        let root = init_repo("parl-spawn-owner-");
+        let fleet = fleet_of(&root);
+        // The fleet's last-used session is the acting one; the new run is
+        // recorded as *its*, so its cap and views count exactly its runs.
+        let mut store = crate::orch::session::FleetSessions::new();
+        store.upsert(crate::orch::session::OrchestratorSession::new("/repo"));
+        let session = store.last_used().unwrap().uuid;
+        crate::orch::session::save(&fleet, &mut store).unwrap();
+        let created = create_run_with_retry(&request("owned", "b", &root, true), None)
+            .await
+            .unwrap();
+        assert_eq!(created.state.orchestrator_id, Some(session));
+        // And the session's own live runs now fill its cap: one more live
+        // run blocks this session's next spawn.
+        let state = run::load_state(&created.run_dir).unwrap();
+        assert_eq!(state.orchestrator_id, Some(session));
     }
 }

@@ -13,9 +13,14 @@ pub mod query;
 pub mod spawn;
 pub mod steer;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use uuid::Uuid;
+
 use crate::cli::ExitCode;
+use crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION;
+use crate::fleet::run::{self, RunSummary};
 use crate::git;
 use crate::paths::{FleetPaths, env_var};
 
@@ -125,6 +130,55 @@ pub async fn resolve_fleet_dir_with_env(
 /// resolves the environment and lands in an unrelated fleet.
 pub(crate) fn ambient_parl_dir() -> Option<String> {
     std::env::var(env_var("DIR")).ok()
+}
+
+/// The session an op acts as: the fleet's last-used session (the one a
+/// console or orchestrator monitor most recently touched `fleet.json`), or
+/// the default session when the fleet has no session rows yet — the
+/// pre-session identity, so a fresh fleet and its legacy runs behave as one
+/// session's. Resolved from the fleet dir the op already resolved, so the
+/// ownership bookkeeping never splits from where the op writes.
+pub(crate) fn acting_session(fleet_dir: &Path) -> Uuid {
+    crate::orch::session::resolve_session(fleet_dir)
+        .map(|session| session.uuid)
+        .unwrap_or(DEFAULT_ORCHESTRATOR_SESSION)
+}
+
+/// The runs the acting session sees as its own: the runs whose `run.json`
+/// records it as owner — plus, when the acting session is the default
+/// (pre-session) one, the unowned legacy runs whose state predates session
+/// ownership, which nothing else can claim. Newest id first.
+pub(crate) fn runs_for_acting_session(fleet_dir: &Path, session: Uuid) -> Vec<RunSummary> {
+    let mut runs = run::list_runs_for_owner(fleet_dir, session);
+    if session == DEFAULT_ORCHESTRATOR_SESSION {
+        let owned: HashSet<String> = runs.iter().map(|r| r.run_id.clone()).collect();
+        for summary in run::list_runs(fleet_dir) {
+            if owned.contains(&summary.run_id) {
+                continue;
+            }
+            let unowned = run::load_state(&summary.run_dir)
+                .ok()
+                .is_some_and(|state| state.orchestrator_id.is_none());
+            if unowned {
+                runs.push(summary);
+            }
+        }
+        runs.sort_by(|a, b| b.run_id.cmp(&a.run_id));
+    }
+    runs
+}
+
+/// The session's still-live runs — the derived view, not the stored status,
+/// so a dead monitor frees its slot and a settled run never holds one. This
+/// is the set that counts against the per-session worker cap.
+pub(crate) fn live_runs_for_session(fleet_dir: &Path, session: Uuid) -> Vec<run::RunState> {
+    runs_for_acting_session(fleet_dir, session)
+        .into_iter()
+        .filter_map(|r| run::load_state(&r.run_dir).ok())
+        .filter(|state| {
+            !run::derive_status(state, run::is_alive, crate::util::now_ms()).is_terminal()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -240,5 +294,160 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(blank.paths.root(), blank.target_dir.join(".parl"));
+    }
+
+    /// A fleet dir with one run on disk, owned by `owner` (`None` = the
+    /// unowned legacy shape).
+    fn put_run(
+        fleet: &Path,
+        run_id: &str,
+        name: &str,
+        status: crate::fleet::run::RunStatus,
+        pid: Option<i32>,
+        owner: Option<Uuid>,
+    ) {
+        let run_dir = fleet.join("runs").join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut state = crate::fleet::run::RunState::new(
+            fleet.to_string_lossy().as_ref(),
+            run_id,
+            name,
+            "/tmp/x",
+            "b",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        state.status = status;
+        state.pid = pid;
+        state.orchestrator_id = owner;
+        crate::fleet::run::save_state(&run_dir, &state).unwrap();
+    }
+
+    #[test]
+    fn runs_for_acting_session_folds_unowned_legacy_runs_into_the_default() {
+        let fleet = tmp_dir("parl-ops-owner-");
+        std::fs::create_dir_all(fleet.join("runs")).unwrap();
+        let default = DEFAULT_ORCHESTRATOR_SESSION;
+        let other = Uuid::parse_str("9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c").unwrap();
+        put_run(
+            &fleet,
+            "mine-60828141530",
+            "mine",
+            crate::fleet::run::RunStatus::Running,
+            Some(std::process::id().cast_signed()),
+            Some(default),
+        );
+        put_run(
+            &fleet,
+            "legacy-60828141531",
+            "legacy",
+            crate::fleet::run::RunStatus::Settled,
+            None,
+            None,
+        );
+        put_run(
+            &fleet,
+            "theirs-60828141532",
+            "theirs",
+            crate::fleet::run::RunStatus::Running,
+            Some(std::process::id().cast_signed()),
+            Some(other),
+        );
+        // The default session sees its own runs plus the unowned legacy one,
+        // newest id first.
+        let default_runs: Vec<String> = runs_for_acting_session(&fleet, default)
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        assert_eq!(default_runs, vec!["mine-60828141530", "legacy-60828141531"]);
+        // Another session sees exactly its own.
+        let other_runs: Vec<String> = runs_for_acting_session(&fleet, other)
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        assert_eq!(other_runs, vec!["theirs-60828141532"]);
+        // The unfiltered listing still sees everything.
+        assert_eq!(crate::fleet::run::list_runs(&fleet).len(), 3);
+        // A run in a foreign directory without run.json is not claimed.
+        std::fs::create_dir_all(fleet.join("runs/garbage-60828141533")).unwrap();
+        assert_eq!(runs_for_acting_session(&fleet, default).len(), 2);
+    }
+
+    #[test]
+    fn acting_session_is_the_last_used_row_or_the_default() {
+        let fleet = tmp_dir("parl-ops-session-");
+        // No fleet.json: the pre-session identity.
+        assert_eq!(acting_session(&fleet), DEFAULT_ORCHESTRATOR_SESSION);
+        let mut store = crate::orch::session::FleetSessions::new();
+        let mut older = crate::orch::session::OrchestratorSession::new("/repo");
+        older.last_used_at = "2026-08-01T00:00:00.000Z".into();
+        let mut newer = crate::orch::session::OrchestratorSession::new("/repo");
+        newer.last_used_at = "2026-09-01T00:00:00.000Z".into();
+        let newer_uuid = newer.uuid;
+        store.upsert(older);
+        store.upsert(newer);
+        crate::orch::session::save(&fleet, &mut store).unwrap();
+        assert_eq!(acting_session(&fleet), newer_uuid);
+    }
+
+    #[test]
+    fn live_runs_for_session_counts_only_the_derived_non_terminal() {
+        let fleet = tmp_dir("parl-ops-live-");
+        std::fs::create_dir_all(fleet.join("runs")).unwrap();
+        let default = DEFAULT_ORCHESTRATOR_SESSION;
+        // Running with a live pid, settled, archived, and a stale Starting
+        // (past grace, no pid — reads dead): one live slot.
+        put_run(
+            &fleet,
+            "r-60828141530",
+            "r",
+            crate::fleet::run::RunStatus::Running,
+            Some(std::process::id().cast_signed()),
+            Some(default),
+        );
+        put_run(
+            &fleet,
+            "s-60828141531",
+            "s",
+            crate::fleet::run::RunStatus::Settled,
+            None,
+            Some(default),
+        );
+        put_run(
+            &fleet,
+            "a-60828141532",
+            "a",
+            crate::fleet::run::RunStatus::Archived,
+            None,
+            Some(default),
+        );
+        put_run(
+            &fleet,
+            "d-60828141533",
+            "d",
+            crate::fleet::run::RunStatus::Starting,
+            None,
+            Some(default),
+        );
+        // The stale Starting run actually reads dead: its creation stamp is
+        // older than the starting grace, so no pid means the monitor died.
+        let stale_dir = fleet.join("runs/d-60828141533");
+        let mut stale = crate::fleet::run::load_state(&stale_dir).unwrap();
+        stale.created_at = "2020-01-01T00:00:00.000Z".into();
+        crate::fleet::run::save_state(&stale_dir, &stale).unwrap();
+        let live: Vec<String> = live_runs_for_session(&fleet, default)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(live, vec!["r-60828141530"], "one live slot among the five");
     }
 }

@@ -287,6 +287,8 @@ pub struct UserConfig {
     pub orchestrator: OrchestratorConfig,
     /// Defaults for workers.
     pub worker: WorkerConfig,
+    /// Fleet-wide limits.
+    pub limits: LimitsConfig,
 }
 
 /// The `[orchestrator]` section.
@@ -308,6 +310,33 @@ pub struct WorkerConfig {
     pub provider: Option<String>,
 }
 
+/// The default per-session worker cap when `[limits] max_workers_per_session`
+/// is absent from the user config: the same number the orchestrator prompt
+/// substitutes as `MAX_WORKERS`, so the prompt's advice and the enforced
+/// refusal agree.
+pub const DEFAULT_MAX_WORKERS_PER_SESSION: usize = 3;
+
+/// The `[limits]` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// How many live (non-terminal) workers one orchestrator session may
+    /// have at once; `None` means the default. An enforced cap: `spawn`
+    /// refuses once a session's live runs reach this number.
+    pub max_workers_per_session: Option<usize>,
+}
+
+impl LimitsConfig {
+    /// The per-session worker cap: the configured value, or
+    /// [`DEFAULT_MAX_WORKERS_PER_SESSION`] when absent. Zero deliberately
+    /// means "no spawning allowed", never "unlimited".
+    #[must_use]
+    pub fn max_workers_per_session(&self) -> usize {
+        self.max_workers_per_session
+            .unwrap_or(DEFAULT_MAX_WORKERS_PER_SESSION)
+    }
+}
+
 impl UserConfig {
     /// The worker model, most specific wins: the explicit argument, then
     /// the config's `[worker] model`, then `None` (let pi decide).
@@ -320,6 +349,12 @@ impl UserConfig {
     #[must_use]
     pub fn worker_provider<'a>(&'a self, explicit: Option<&'a str>) -> Option<&'a str> {
         explicit.or(self.worker.provider.as_deref())
+    }
+
+    /// The per-session worker cap, resolved from the `[limits]` section.
+    #[must_use]
+    pub fn max_workers_per_session(&self) -> usize {
+        self.limits.max_workers_per_session()
     }
 
     /// The orchestrator model, most specific wins: the explicit argument,
@@ -579,6 +614,63 @@ mod tests {
     }
 
     #[test]
+    fn user_config_reads_the_limits_section_and_defaults_the_cap() {
+        let tmp = tmp_dir("parl-cfg-limits-");
+        // No file, an empty file, and a file with other sections alone all
+        // read as the default cap.
+        assert_eq!(
+            load_user_config(Some(&tmp)).unwrap().limits,
+            LimitsConfig::default()
+        );
+        assert_eq!(
+            load_user_config(Some(&tmp))
+                .unwrap()
+                .max_workers_per_session(),
+            DEFAULT_MAX_WORKERS_PER_SESSION
+        );
+        write_config(&tmp, "");
+        assert_eq!(
+            load_user_config(Some(&tmp))
+                .unwrap()
+                .max_workers_per_session(),
+            DEFAULT_MAX_WORKERS_PER_SESSION
+        );
+        write_config(&tmp, "[worker]\nmodel = \"deepseek-v4-flash\"\n");
+        assert_eq!(
+            load_user_config(Some(&tmp))
+                .unwrap()
+                .max_workers_per_session(),
+            DEFAULT_MAX_WORKERS_PER_SESSION
+        );
+        // The configured cap wins; zero is a real value (no spawning allowed).
+        write_config(&tmp, "[limits]\nmax_workers_per_session = 5\n");
+        let config = load_user_config(Some(&tmp)).unwrap();
+        assert_eq!(config.limits.max_workers_per_session, Some(5));
+        assert_eq!(config.max_workers_per_session(), 5);
+        write_config(&tmp, "[limits]\nmax_workers_per_session = 0\n");
+        assert_eq!(
+            load_user_config(Some(&tmp))
+                .unwrap()
+                .max_workers_per_session(),
+            0,
+            "zero means no spawning, not unlimited"
+        );
+        // All three sections parse together.
+        write_config(
+            &tmp,
+            "[orchestrator]\nmodel = \"claude-opus-5\"\n\n[worker]\nmodel = \"deepseek-v4-flash\"\n\n[limits]\nmax_workers_per_session = 7\n",
+        );
+        let config = load_user_config(Some(&tmp)).unwrap();
+        assert_eq!(config.orchestrator.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(config.max_workers_per_session(), 7);
+        // A negative cap is not a usize: a malformed config stays a hard
+        // error naming the path, never a silent fallback.
+        write_config(&tmp, "[limits]\nmax_workers_per_session = -1\n");
+        let err = load_user_config(Some(&tmp)).unwrap_err().to_string();
+        assert!(err.contains("config.toml"), "names the file: {err}");
+    }
+
+    #[test]
     fn user_config_parses_both_sections() {
         let tmp = tmp_dir("parl-cfg-full-");
         write_config(
@@ -612,6 +704,9 @@ mod tests {
                 model: Some("deepseek-v4-flash".into()),
                 provider: Some("opencode-go".into()),
             },
+            limits: LimitsConfig {
+                max_workers_per_session: Some(4),
+            },
         };
         // Orchestrator: explicit beats the persisted record beats the config.
         assert_eq!(
@@ -630,10 +725,16 @@ mod tests {
         assert_eq!(config.worker_model(Some("glm-5.3")), Some("glm-5.3"));
         assert_eq!(config.worker_model(None), Some("deepseek-v4-flash"));
         assert_eq!(config.worker_provider(None), Some("opencode-go"));
+        // Limits: the configured cap wins over the default.
+        assert_eq!(config.max_workers_per_session(), 4);
         // Nothing anywhere: the empty config still yields defaults.
         assert_eq!(UserConfig::default().orchestrator_model(None, None), None);
         assert_eq!(UserConfig::default().worker_model(None), None);
         assert_eq!(UserConfig::default().worker_provider(None), None);
+        assert_eq!(
+            UserConfig::default().max_workers_per_session(),
+            DEFAULT_MAX_WORKERS_PER_SESSION
+        );
     }
 
     #[test]

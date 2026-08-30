@@ -86,12 +86,32 @@ impl SteerKind {
     }
 }
 
-/// The orchestrator party the CLI attributes steering to: the default
-/// session. Sessions wire their own identity through later; until then the
-/// default's canonical spelling (bare `"orchestrator"`) keeps the wire
-/// shape identical to what older writers produced.
-fn cli_orchestrator_party() -> Party {
-    Party::Orchestrator(crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION)
+/// The orchestrator party of a fleet's acting session: the session a
+/// console or orchestrator monitor most recently recorded in `fleet.json`,
+/// or the default session when the fleet has no session rows yet. The
+/// default's canonical on-wire spelling (bare `"orchestrator"`) keeps the
+/// wire shape identical to what older writers produced.
+pub(crate) fn session_orchestrator_party(fleet_dir: &Path) -> Party {
+    Party::Orchestrator(super::acting_session(fleet_dir))
+}
+
+/// The orchestrator party the CLI attributes steering to, resolved from the
+/// same `cwd`/`$PARL_DIR` the cores use — so provenance can never split
+/// from where the envelope lands — falling back to the default session when
+/// the fleet cannot be resolved.
+async fn cli_orchestrator_party(cwd: Option<&Path>) -> Party {
+    cli_orchestrator_party_with_env(cwd, super::ambient_parl_dir().as_deref()).await
+}
+
+/// [`cli_orchestrator_party`] with the `$PARL_DIR` value injected, so tests
+/// never resolve an ambient variable into an unrelated fleet.
+async fn cli_orchestrator_party_with_env(cwd: Option<&Path>, parl_dir: Option<&str>) -> Party {
+    let fleet = resolve_fleet_dir_with_env(cwd, parl_dir).await;
+    fleet
+        .map(|f| session_orchestrator_party(f.paths.root()))
+        .unwrap_or(Party::Orchestrator(
+            crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION,
+        ))
 }
 
 /// Steer a running worker (delivered after its current tool calls).
@@ -106,7 +126,7 @@ pub async fn send(
     message: &str,
 ) -> anyhow::Result<crate::cli::ExitCode> {
     Ok(print_result(
-        send_core(name, cwd, message, cli_orchestrator_party()).await?,
+        send_core(name, cwd, message, cli_orchestrator_party(cwd).await).await?,
     ))
 }
 
@@ -121,7 +141,7 @@ pub async fn followup(
     message: &str,
 ) -> anyhow::Result<crate::cli::ExitCode> {
     Ok(print_result(
-        followup_core(name, cwd, message, cli_orchestrator_party()).await?,
+        followup_core(name, cwd, message, cli_orchestrator_party(cwd).await).await?,
     ))
 }
 
@@ -137,7 +157,14 @@ pub async fn answer(
     message: &str,
 ) -> anyhow::Result<crate::cli::ExitCode> {
     Ok(print_result(
-        answer_core(name, cwd, question_id, message, cli_orchestrator_party()).await?,
+        answer_core(
+            name,
+            cwd,
+            question_id,
+            message,
+            cli_orchestrator_party(cwd).await,
+        )
+        .await?,
     ))
 }
 
@@ -148,7 +175,7 @@ pub async fn answer(
 /// Fails when the fleet dir cannot be resolved.
 pub async fn stop(name: &str, cwd: Option<&Path>) -> anyhow::Result<crate::cli::ExitCode> {
     Ok(print_result(
-        stop_core(name, cwd, cli_orchestrator_party()).await?,
+        stop_core(name, cwd, cli_orchestrator_party(cwd).await).await?,
     ))
 }
 
@@ -688,5 +715,68 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(err, "<name> required");
+    }
+
+    #[tokio::test]
+    async fn the_cli_attributes_steering_to_the_fleets_acting_session() {
+        let dir = tmp_dir("parl-steer-session-");
+        let paths = FleetPaths::new(dir.join(crate::paths::STATE_DIR_NAME));
+        let run_id = "auth-20260828141530";
+        let run_dir = paths.run_dir(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut state = RunState::new(
+            paths.root().to_string_lossy().as_ref(),
+            run_id,
+            "auth",
+            "/tmp/x",
+            "b",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        state.status = RunStatus::Running;
+        state.pid = Some(std::process::id().cast_signed());
+        crate::fleet::run::save_state(&run_dir, &state).unwrap();
+        // fleet.json names the fleet's session; the wrapper attributes
+        // the envelope to *it*, not the default. The `$PARL_DIR` value is
+        // injected as `None`, so the ambient environment can never redirect
+        // this test's resolution.
+        let mut store = crate::orch::session::FleetSessions::new();
+        store.upsert(crate::orch::session::OrchestratorSession::new("/repo"));
+        let session = store.last_used().unwrap().uuid;
+        crate::orch::session::save(paths.root(), &mut store).unwrap();
+
+        let party = cli_orchestrator_party_with_env(Some(&dir), None).await;
+        assert_eq!(party, Party::Orchestrator(session));
+        send_core_with_env("auth", Some(&dir), "use tabs", party, None)
+            .await
+            .unwrap();
+        let envelopes = inbox_lines(&paths, run_id);
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].from, Party::Orchestrator(session));
+        // Without a fleet.json the wrapper falls back to the default
+        // session's canonical on-wire spelling.
+        let dir2 = tmp_dir("parl-steer-nosession-");
+        let paths2 = FleetPaths::new(dir2.join(crate::paths::STATE_DIR_NAME));
+        let run_dir2 = paths2.run_dir(run_id);
+        std::fs::create_dir_all(&run_dir2).unwrap();
+        let mut state2 = state.clone();
+        state2.orchestrator_id = None;
+        crate::fleet::run::save_state(&run_dir2, &state2).unwrap();
+        let party = cli_orchestrator_party_with_env(Some(&dir2), None).await;
+        assert_eq!(party, orch());
+        stop_core_with_env("auth", Some(&dir2), party, None)
+            .await
+            .unwrap();
+        let envelopes = inbox_lines(&paths2, run_id);
+        assert_eq!(envelopes[0].from, orch());
     }
 }
