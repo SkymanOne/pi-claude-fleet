@@ -53,11 +53,15 @@ const DIFF_STAT_MS: i64 = 10_000;
 // ---------------------------------------------------------------------------
 // Terminal install / teardown
 
-/// Is this an interactive terminal? A size query only succeeds on a TTY,
-/// which is exactly what raw mode and the alternate screen need.
+/// Is this an interactive terminal? Both ends must be a TTY, the way the
+/// TypeScript console asked (`process.stdin.isTTY && process.stdout.isTTY`).
+/// A crossterm size query lies here: its `tput` fallback answers even on a
+/// worker session with no controlling terminal, and raw mode would then die
+/// later on the missing `/dev/tty` with a bare io error.
 #[must_use]
 pub fn is_interactive() -> bool {
-    crossterm::terminal::size().is_ok()
+    use crossterm::tty::IsTty as _;
+    io::stdin().is_tty() && io::stdout().is_tty()
 }
 
 /// Install the terminal: raw mode, alternate screen, backend.
