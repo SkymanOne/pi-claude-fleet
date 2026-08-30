@@ -230,9 +230,10 @@ fn draw_transcript(frame: &mut Frame, area: Rect, console: &mut Console, pal: &P
     });
     let lines = {
         let transcript = console.open_transcript();
+        let partial = transcript.partial();
         render_rows(
             transcript.blocks(),
-            transcript.partial(),
+            partial.as_deref(),
             scroll,
             search.as_ref(),
             width,
