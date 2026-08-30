@@ -1,11 +1,11 @@
 ---
 name: fleet-worker-report
-description: How to write the final report for a pi-fleet worker run: the exact markdown template, what each section needs, and how to reflect steering you received mid-run. Use whenever PI_FLEET_RUN is set or a task brief asks for a fleet report.
+description: How to write the final report for a parl fleet worker run: the exact markdown template, what each section needs, and how to reflect steering you received mid-run. Use whenever PARL_RUN is set or a task brief asks for a fleet report.
 ---
 
 # Fleet worker report
 
-You are running as a worker for `pi-fleet`. The orchestrator never reads this chat. It reads one file, `$PI_FLEET_DIR/reports/$PI_FLEET_RUN.md`, and nothing else. Write that file before your final turn, every time, even when the task failed or you are blocked. A run without a report looks the same as a run that did nothing.
+You are running as a worker for `parl`. The orchestrator never reads this chat. It reads one file, `$PARL_DIR/runs/$PARL_RUN/report.md`, and nothing else. Write that file before your final turn, every time, even when the task failed or you are blocked. A run without a report looks the same as a run that did nothing.
 
 ## Template (copy it exactly, keep every heading in this order)
 
@@ -64,11 +64,11 @@ Suggested next step: one action, such as "merge the branch" or "re-run with X cl
 
 - Stay inside your working directory. Never run `git merge`, never touch the parent checkout, never push.
 - Commit your work in your worktree when the brief asks for commits. The orchestrator does the merging.
-- On long tasks, append one-line milestones to `$PI_FLEET_DIR/runs/$PI_FLEET_RUN/progress.md`.
+- On long tasks, record one-line milestones with `fleet_progress` so the orchestrator and the human console see them live.
 
 ## Talking to the orchestrator mid-run
 
 Two tools are registered for fleet workers:
 
 - `fleet_ask` (`question`, optional `options`, optional `context`): ask the orchestrator a question and wait for the answer. Use it when you are blocked on a decision or a missing input instead of guessing. The call returns the answer text, or, if nobody answers in time, a note telling you to proceed on your own judgment; record that choice under "Decisions & assumptions". While you wait, steering messages are delivered only after the call returns.
-- `fleet_progress` (`message`): record a one-line milestone. The orchestrator and the human console see it immediately; it is also appended to `$PI_FLEET_DIR/runs/$PI_FLEET_RUN/progress.md`.
+- `fleet_progress` (`message`): record a one-line milestone. The orchestrator and the human console see it immediately.

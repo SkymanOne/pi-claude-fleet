@@ -13,7 +13,9 @@
 //! **inbox** (orchestrator/console -> worker monitor), `to` is
 //! `worker:<runId>`, `from` is `orchestrator` or `console`:
 //! `steer`/`follow_up`/`command`/`thinking` carry `{"message"}`, `abort`
-//! carries `{}`, `answer` carries `{"message","questionId"}`.
+//! carries `{}`, `answer` carries `{"message","questionId"}`, `model`
+//! carries `{"message","provider"}` (`provider` null to resolve from the
+//! models pi has configured).
 //!
 //! **outbox** (worker -> monitor), `from` is `worker:<runId>`, `to` is
 //! `fleet`: `question`, `progress`, `question_resolved`.
@@ -142,6 +144,10 @@ impl Envelope {
                 message: self.payload.get("message").and_then(Value::as_str),
                 question_id: self.payload.get("questionId").and_then(Value::as_str),
             }),
+            "model" => Some(Decoded::Model {
+                model_id: message(&self.payload)?,
+                provider: self.payload.get("provider").and_then(Value::as_str),
+            }),
             "question" => Some(Decoded::Question(QuestionPayload {
                 question: self
                     .payload
@@ -197,6 +203,11 @@ pub enum Decoded<'a> {
         message: Option<&'a str>,
         question_id: Option<&'a str>,
     },
+    /// Switch the worker's model; `model_id` is the pi model id.
+    Model {
+        model_id: &'a str,
+        provider: Option<&'a str>,
+    },
     Question(QuestionPayload),
     Progress(String),
     QuestionResolved {
@@ -222,7 +233,7 @@ pub enum Resolution {
     Aborted,
 }
 
-/// Builder helpers for the six inbox types, with the payload shapes the
+/// Builder helpers for the seven inbox types, with the payload shapes the
 /// contract pins.
 impl Envelope {
     /// `steer` — delivered after the worker's current tool call.
@@ -259,6 +270,23 @@ impl Envelope {
         question_id: Option<String>,
     ) -> Self {
         Self::control(from, to, "answer", Some(message.into()), question_id)
+    }
+
+    /// `model` — switch the running worker's model. A `provider` of `None`
+    /// serializes as null: the monitor resolves it from pi's model list.
+    pub fn model(
+        from: Party,
+        to: Party,
+        model_id: impl Into<String>,
+        provider: Option<String>,
+    ) -> Self {
+        let mut payload = serde_json::Map::new();
+        payload.insert("message".into(), Value::String(model_id.into()));
+        payload.insert(
+            "provider".into(),
+            provider.map(Value::String).unwrap_or(Value::Null),
+        );
+        Self::new(from, to, "model", Value::Object(payload))
     }
 
     fn control(
@@ -374,7 +402,9 @@ mod tests {
             Envelope::thinking(from.clone(), to.clone(), "max"),
             Envelope::abort(from.clone(), to.clone()),
             Envelope::answer(Party::Console, to.clone(), "argon2", Some("m_q1".into())),
-            Envelope::answer(Party::Console, to, "go with option a", None),
+            Envelope::answer(Party::Console, to.clone(), "go with option a", None),
+            Envelope::model(from.clone(), to, "claude-fable-5", Some("anthropic".into())),
+            Envelope::model(from, Party::worker("run-2"), "glm-5.3", None),
         ];
         for env in &cases {
             let parsed = round_trip(env);
@@ -404,6 +434,25 @@ mod tests {
             Some(Decoded::Answer {
                 message: Some("go with option a"),
                 question_id: None
+            })
+        );
+        let model = round_trip(&cases[7]);
+        assert_eq!(
+            model.decode(),
+            Some(Decoded::Model {
+                model_id: "claude-fable-5",
+                provider: Some("anthropic")
+            })
+        );
+        // A null provider serializes as null and decodes to None.
+        let model_line = serde_json::to_string(&cases[8]).unwrap();
+        assert!(model_line.contains(r#""provider":null"#), "{model_line}");
+        let model_null = round_trip(&cases[8]);
+        assert_eq!(
+            model_null.decode(),
+            Some(Decoded::Model {
+                model_id: "glm-5.3",
+                provider: None
             })
         );
     }
@@ -494,6 +543,12 @@ mod tests {
         // Known type with a payload of the wrong shape: parses, decodes to None.
         let env = Envelope::parse_line(
             r#"{"id":"m_1","ts":"t","from":"console","to":"worker:r","type":"steer","payload":{"oops":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(env.decode(), None);
+        // `model` without a message is skipped like any other malformed payload.
+        let env = Envelope::parse_line(
+            r#"{"id":"m_1","ts":"t","from":"console","to":"worker:r","type":"model","payload":{"provider":"p"}}"#,
         )
         .unwrap();
         assert_eq!(env.decode(), None);

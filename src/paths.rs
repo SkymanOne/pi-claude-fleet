@@ -138,6 +138,26 @@ impl FleetPaths {
         self.run_dir(run_id).join("session")
     }
 
+    /// `pi/extensions/fleet-worker.ts` — the worker extension, embedded in
+    /// the binary and materialized here at spawn time (single-binary
+    /// installs cannot rely on the package's `pi/` tree existing).
+    pub fn pi_extension(&self) -> PathBuf {
+        self.root
+            .join("pi")
+            .join("extensions")
+            .join("fleet-worker.ts")
+    }
+
+    /// `pi/skills/fleet-worker-report/SKILL.md` — the report skill, embedded
+    /// and materialized like [`FleetPaths::pi_extension`].
+    pub fn pi_skill(&self) -> PathBuf {
+        self.root
+            .join("pi")
+            .join("skills")
+            .join("fleet-worker-report")
+            .join("SKILL.md")
+    }
+
     /// Create the layout and make sure git ignores it.
     ///
     /// Returns whether the `.gitignore` gained an entry. Subdirectories
@@ -244,6 +264,14 @@ mod tests {
         assert_eq!(
             paths.run_session_dir("a-20260828141530"),
             PathBuf::from("/repo/x/.parl/runs/a-20260828141530/session")
+        );
+        assert_eq!(
+            paths.pi_extension(),
+            PathBuf::from("/repo/x/.parl/pi/extensions/fleet-worker.ts")
+        );
+        assert_eq!(
+            paths.pi_skill(),
+            PathBuf::from("/repo/x/.parl/pi/skills/fleet-worker-report/SKILL.md")
         );
     }
 

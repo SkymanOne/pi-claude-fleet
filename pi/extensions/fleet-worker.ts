@@ -1,7 +1,7 @@
 /**
- * pi-fleet worker protocol (pi extension).
+ * parl worker protocol (pi extension).
  *
- * When pi runs as a fleet worker (PI_FLEET_RUN + PI_FLEET_DIR set by `pi-fleet`'s
+ * When pi runs as a fleet worker (PARL_RUN + PARL_DIR set by `parl`'s
  * monitor) this extension:
  *  - appends the report protocol to the system prompt (`before_agent_start`), so
  *    report-writing does not depend on the model discovering the skill;
@@ -50,18 +50,17 @@ done | blocked | failed
 (one concrete next action for the orchestrator)`;
 
 export interface FleetEnv {
-  PI_FLEET_RUN?: string;
-  PI_FLEET_DIR?: string;
-  PI_FLEET_ASK_POLL_MS?: string;
-  PI_FLEET_ASK_TIMEOUT_MS?: string;
+  PARL_RUN?: string;
+  PARL_DIR?: string;
+  PARL_ASK_POLL_MS?: string;
+  PARL_ASK_TIMEOUT_MS?: string;
 }
 
 export function buildFleetProtocol(env: FleetEnv, cwd: string): string | null {
-  const runId = env.PI_FLEET_RUN;
-  const fleetDir = env.PI_FLEET_DIR;
+  const runId = env.PARL_RUN;
+  const fleetDir = env.PARL_DIR;
   if (!runId || !fleetDir) return null;
-  const reportPath = `${fleetDir}/reports/${runId}.md`;
-  const progressPath = `${fleetDir}/runs/${runId}/progress.md`;
+  const reportPath = `${fleetDir}/runs/${runId}/report.md`;
   return [
     FLEET_PROTOCOL_MARKER,
     "",
@@ -69,7 +68,7 @@ export function buildFleetProtocol(env: FleetEnv, cwd: string): string | null {
     "",
     "Rules:",
     `1. Before you finish (before your final assistant turn), write your final report to \`${reportPath}\` using EXACTLY the template below — keep every heading, in order.`,
-    `2. For long tasks, call \`fleet_progress\` with a one-line note at each milestone (it also appends to \`${progressPath}\`). The orchestrator sees it live.`,
+    "2. For long tasks, call `fleet_progress` with a one-line note at each milestone. The orchestrator sees it live.",
     "3. Stay scoped to your task brief. Do not touch files outside your working directory. Never run `git merge`, never modify the parent checkout, never push.",
     "4. If you receive steering messages mid-run (course corrections from the orchestrator or from the user's console), incorporate them immediately. Your final report MUST reflect the adjusted direction: list every steering message under \"Steering received\" and keep Status/Verification consistent with the work as finally done.",
     "5. When you are blocked on a decision or a missing input, call `fleet_ask` (question, optional options and context) instead of guessing. It waits for the orchestrator's answer and returns it. If it reports that no answer arrived in time, proceed on your best judgment and record the choice under \"Decisions & assumptions\".",
@@ -84,7 +83,7 @@ export function buildFleetProtocol(env: FleetEnv, cwd: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Mailbox helpers (mirror of src/fleet/envelope.ts; keep the shapes aligned)
+// Mailbox helpers (mirror of src/fleet/envelope.rs; keep the shapes aligned)
 
 export type QuestionResolution = "answered" | "timeout" | "aborted";
 
@@ -113,12 +112,8 @@ export function outboxPath(fleetDir: string, runId: string): string {
   return path.join(runDir(fleetDir, runId), "outbox.jsonl");
 }
 
-export function controlPath(fleetDir: string, runId: string): string {
-  return path.join(runDir(fleetDir, runId), "control.jsonl");
-}
-
-export function progressPath(fleetDir: string, runId: string): string {
-  return path.join(runDir(fleetDir, runId), "progress.md");
+export function inboxPath(fleetDir: string, runId: string): string {
+  return path.join(runDir(fleetDir, runId), "inbox.jsonl");
 }
 
 export function appendOutbox(fleetDir: string, runId: string, line: Omit<OutboxLine, "id" | "ts" | "from" | "to"> & { id?: string }): OutboxLine {
@@ -126,7 +121,7 @@ export function appendOutbox(fleetDir: string, runId: string, line: Omit<OutboxL
     id: line.id ?? newId("m"),
     ts: nowIso(),
     from: `worker:${runId}`,
-    to: "orchestrator",
+    to: "fleet",
     type: line.type,
     payload: line.payload,
   };
@@ -171,17 +166,22 @@ export interface Answer {
   source: string;
 }
 
-/** The `answer` control line for `questionId` among `lines`, if any. */
+/**
+ * The `answer` envelope for `questionId` among `lines`, if any. The inbox
+ * carries envelopes: `{"id","ts","from","to","type":"answer",
+ * "payload":{"message","questionId"}}`.
+ */
 export function findAnswer(lines: string[], questionId: string): Answer | null {
   for (const line of lines) {
-    let msg: { type?: unknown; questionId?: unknown; message?: unknown; source?: unknown };
+    let msg: { type?: unknown; from?: unknown; payload?: { questionId?: unknown; message?: unknown } };
     try {
       msg = JSON.parse(line);
     } catch {
       continue;
     }
-    if (msg?.type === "answer" && msg.questionId === questionId && typeof msg.message === "string") {
-      return { message: msg.message, source: typeof msg.source === "string" ? msg.source : "unknown" };
+    const payload = msg?.payload;
+    if (msg?.type === "answer" && payload && payload.questionId === questionId && typeof payload.message === "string") {
+      return { message: payload.message, source: typeof msg.from === "string" ? msg.from : "unknown" };
     }
   }
   return null;
@@ -211,11 +211,11 @@ export async function askOrchestrator(
   params: AskParams,
   opts: { signal?: AbortSignal; onWaiting?: (questionId: string) => void } = {},
 ): Promise<AskResult> {
-  const fleetDir = env.PI_FLEET_DIR!;
-  const runId = env.PI_FLEET_RUN!;
-  const pollMs = Number(env.PI_FLEET_ASK_POLL_MS) > 0 ? Number(env.PI_FLEET_ASK_POLL_MS) : DEFAULT_ASK_POLL_MS;
-  const timeoutMs = Number(env.PI_FLEET_ASK_TIMEOUT_MS) > 0 ? Number(env.PI_FLEET_ASK_TIMEOUT_MS) : DEFAULT_ASK_TIMEOUT_MS;
-  const inbox = controlPath(fleetDir, runId);
+  const fleetDir = env.PARL_DIR!;
+  const runId = env.PARL_RUN!;
+  const pollMs = Number(env.PARL_ASK_POLL_MS) > 0 ? Number(env.PARL_ASK_POLL_MS) : DEFAULT_ASK_POLL_MS;
+  const timeoutMs = Number(env.PARL_ASK_TIMEOUT_MS) > 0 ? Number(env.PARL_ASK_TIMEOUT_MS) : DEFAULT_ASK_TIMEOUT_MS;
+  const inbox = inboxPath(fleetDir, runId);
   // Answers can only arrive after the question is posted, so start reading at the current end.
   let offset = fileSize(inbox);
   const questionId = newId("q");
@@ -258,15 +258,11 @@ export async function askOrchestrator(
   return { questionId, how, text, answer };
 }
 
-/** Append a milestone to the outbox and to progress.md. */
+/** Append a milestone to the outbox. */
 export function noteProgress(env: FleetEnv, message: string): OutboxLine {
-  const fleetDir = env.PI_FLEET_DIR!;
-  const runId = env.PI_FLEET_RUN!;
-  const line = appendOutbox(fleetDir, runId, { type: "progress", payload: { message } });
-  const p = progressPath(fleetDir, runId);
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.appendFileSync(p, `- ${line.ts} ${message}\n`);
-  return line;
+  const fleetDir = env.PARL_DIR!;
+  const runId = env.PARL_RUN!;
+  return appendOutbox(fleetDir, runId, { type: "progress", payload: { message } });
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +307,7 @@ export function fleetTools(env: FleetEnv) {
     {
       name: "fleet_progress",
       label: "Report progress",
-      description: "Record a one-line milestone for the fleet orchestrator (also appended to progress.md).",
+      description: "Record a one-line milestone for the fleet orchestrator.",
       promptSnippet: "Record a one-line milestone for the orchestrator",
       parameters: PROGRESS_PARAMS,
       async execute(_toolCallId: string, params: { message: string }) {
@@ -329,7 +325,7 @@ export default function fleetWorker(pi: ExtensionAPI): void {
     if (event.systemPrompt.includes(FLEET_PROTOCOL_MARKER)) return;
     return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
   });
-  if (process.env.PI_FLEET_RUN && process.env.PI_FLEET_DIR) {
+  if (process.env.PARL_RUN && process.env.PARL_DIR) {
     for (const tool of fleetTools(process.env)) pi.registerTool(tool as any);
   }
 }

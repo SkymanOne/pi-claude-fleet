@@ -142,6 +142,31 @@ pub struct PendingQuestion {
     pub asked_at: String,
 }
 
+/// A pi extension dialog (`extension_ui_request`) awaiting an answer, shaped
+/// like [`PendingQuestion`] so the console renders both the same way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDialog {
+    pub id: String,
+    /// The dialog method: `select`, `confirm`, `input` or `editor`.
+    pub method: String,
+    pub question: String,
+    #[serde(default)]
+    pub options: Option<Vec<String>>,
+    #[serde(default)]
+    pub context: Option<String>,
+    pub asked_at: String,
+}
+
+/// A model pi has configured (from `get_available_models`), slimmed to what
+/// the console needs to offer and switch models.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerModel {
+    pub provider: String,
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 /// The run's durable facts, stored as `runs/<id>/run.json`.
 ///
 /// Field names stay camelCase on disk to match the JSON the fleet tooling and
@@ -207,6 +232,14 @@ pub struct RunState {
     /// written before this field existed.
     #[serde(default)]
     pub pending_question: Option<PendingQuestion>,
+    /// Set while the worker is blocked on a pi extension dialog; rendered
+    /// like [`Self::pending_question`].
+    #[serde(default)]
+    pub pending_dialog: Option<PendingDialog>,
+    /// The models pi has configured (its `get_available_models`), for the
+    /// console's model switcher.
+    #[serde(default)]
+    pub available_models: Vec<WorkerModel>,
     /// The model pi actually resolved (from its `get_state`), as opposed to
     /// the `--model` pattern asked for.
     #[serde(default)]
@@ -281,6 +314,8 @@ impl RunState {
             steering_log: Vec::new(),
             error: None,
             pending_question: None,
+            pending_dialog: None,
+            available_models: Vec::new(),
             active_model: None,
             active_provider: None,
             commands: Vec::new(),
@@ -362,7 +397,7 @@ pub fn derive_status(
 }
 
 /// [`derive_status`] plus the `blocked` view for a running worker waiting on
-/// a `fleet_ask` answer.
+/// a `fleet_ask` answer or an extension dialog.
 #[must_use]
 pub fn derive_view(
     state: &RunState,
@@ -370,7 +405,9 @@ pub fn derive_view(
     now_ms: i64,
 ) -> DerivedView {
     let status = derive_status(state, liveness, now_ms);
-    if status == RunStatus::Running && state.pending_question.is_some() {
+    if status == RunStatus::Running
+        && (state.pending_question.is_some() || state.pending_dialog.is_some())
+    {
         return DerivedView::Blocked;
     }
     DerivedView::from(status)
@@ -579,6 +616,38 @@ mod tests {
         assert!(s.steering_log.is_empty());
         assert_eq!(s.task_brief, "b");
         assert_eq!(s.model_label(), Some("m"));
+        assert_eq!(s.pending_dialog, None);
+        assert!(s.available_models.is_empty());
+    }
+
+    #[test]
+    fn derive_view_blocks_on_pending_dialogs_too() {
+        let fleet = fleet_dir("parl-run-");
+        let mut s = base_state(&fleet, "auth-20260828141530");
+        s.status = RunStatus::Running;
+        s.pid = Some(1);
+        s.pending_dialog = Some(PendingDialog {
+            id: "u-1".into(),
+            method: "select".into(),
+            question: "Pick one".into(),
+            options: Some(vec!["a".into()]),
+            context: None,
+            asked_at: now_iso(),
+        });
+        assert_eq!(derive_view(&s, |_| true, fixed_now()), DerivedView::Blocked);
+        s.pending_dialog = None;
+        assert_eq!(derive_view(&s, |_| true, fixed_now()), DerivedView::Running);
+        // A state file written before the field existed still loads.
+        let run_dir = fleet.join("runs/auth-20260828141530");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_json_path(&run_dir),
+            r#"{"id":"auth-20260828141530","name":"auth","status":"running","cwd":"/tmp/x","fleetDir":"/f","createdAt":"2026-08-28T14:15:30.000Z","taskBrief":"b"}"#,
+        )
+        .unwrap();
+        let old = load_state(&run_dir).unwrap();
+        assert_eq!(old.pending_dialog, None);
+        assert!(old.available_models.is_empty());
     }
 
     #[test]
