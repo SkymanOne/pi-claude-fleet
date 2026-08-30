@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::fleet::event::{FleetEvent, FleetEventKind, last_line};
 use crate::fleet::run::{self, DerivedView, RunState};
@@ -45,6 +46,10 @@ const fn kind_by_view(view: DerivedView) -> Option<FleetEventKind> {
 #[derive(Debug, Clone)]
 pub struct FleetWatcherOptions {
     pub fleet_dir: PathBuf,
+    /// Only the runs this session owns (`run.json`'s orchestratorId) are
+    /// watched and reported. None watches every run — the single-session
+    /// shape, kept for callers that predate multi-session fleets.
+    pub owner: Option<Uuid>,
     /// Cursor state saved by an earlier watcher (from the session record), so
     /// a resumed watcher continues where it left off.
     pub cursors: HashMap<String, RunCursor>,
@@ -59,6 +64,7 @@ impl Default for FleetWatcherOptions {
     fn default() -> Self {
         Self {
             fleet_dir: PathBuf::new(),
+            owner: None,
             cursors: HashMap::new(),
             progress_events: false,
             progress_throttle_ms: 60_000,
@@ -82,6 +88,7 @@ pub struct RunSnapshot {
 /// orchestrator as one user message.
 pub struct FleetWatcher {
     fleet_dir: PathBuf,
+    owner: Option<Uuid>,
     cursors: HashMap<String, RunCursor>,
     progress_events: bool,
     progress_throttle_ms: u64,
@@ -98,6 +105,7 @@ impl FleetWatcher {
     pub fn new(options: FleetWatcherOptions) -> Self {
         Self {
             fleet_dir: options.fleet_dir,
+            owner: options.owner,
             cursors: options.cursors,
             progress_events: options.progress_events,
             progress_throttle_ms: options.progress_throttle_ms,
@@ -119,10 +127,16 @@ impl FleetWatcher {
         self.max_per_batch
     }
 
-    /// Live runs right now, for the rail and for the `snapshot` event.
+    /// Live runs right now, for the rail and for the `snapshot` event:
+    /// every run when no owner is set, otherwise only the runs whose
+    /// `run.json` records this session as their orchestrator.
     #[must_use]
     pub fn runs(&self) -> Vec<RunSnapshot> {
-        run::list_runs(&self.fleet_dir)
+        let summaries = match self.owner {
+            Some(owner) => run::list_runs_for_owner(&self.fleet_dir, owner),
+            None => run::list_runs(&self.fleet_dir),
+        };
+        summaries
             .into_iter()
             .filter_map(|summary| {
                 let state = run::load_state(&summary.run_dir).ok()?;
@@ -779,6 +793,77 @@ mod tests {
         let text = crate::fleet::event::format_fleet_event(question);
         assert!(text.contains("question-id: u-1"), "{text}");
         assert!(text.contains("(select)"), "{text}");
+        drop(tmp);
+    }
+
+    /// The core multi-session guarantee: a watcher pinned to one session
+    /// reports only the runs that session owns, so a worker settling in
+    /// session B can never produce a `<fleet-event>` in session A's
+    /// transcript.
+    #[test]
+    fn a_watcher_reports_only_the_runs_its_session_owns() {
+        let (tmp, fleet_dir) = mk_fleet("owner");
+        // Two live sessions sharing one store.
+        let a = crate::orch::session::create_session(&fleet_dir, Some("session-a")).unwrap();
+        let b = crate::orch::session::create_session(&fleet_dir, Some("session-b")).unwrap();
+
+        let (b_run, b_run_dir, _) = add_run(&fleet_dir, "db", 0);
+        let (a_run, a_run_dir, _) = add_run(&fleet_dir, "auth", 1);
+        for (run_dir, owner) in [(&b_run_dir, b.uuid), (&a_run_dir, a.uuid)] {
+            let mut state = run::load_state(run_dir).unwrap();
+            state.orchestrator_id = Some(owner);
+            state.status = run::RunStatus::Running;
+            run::save_state(run_dir, &state).unwrap();
+        }
+
+        let mut watcher_a = FleetWatcher::new(FleetWatcherOptions {
+            fleet_dir: fleet_dir.clone(),
+            owner: Some(a.uuid),
+            ..FleetWatcherOptions::default()
+        });
+        let mut watcher_b = FleetWatcher::new(FleetWatcherOptions {
+            fleet_dir: fleet_dir.clone(),
+            owner: Some(b.uuid),
+            ..FleetWatcherOptions::default()
+        });
+        watcher_a.start(false);
+        watcher_b.start(false);
+        watcher_a.tick();
+        watcher_b.tick();
+        assert!(watcher_a.take_batch().is_empty());
+        assert!(watcher_b.take_batch().is_empty());
+
+        // B's run settles while both watchers watch: only B's watcher sees it.
+        {
+            let mut state = run::load_state(&b_run_dir).unwrap();
+            state.status = run::RunStatus::Settled;
+            run::save_state(&b_run_dir, &state).unwrap();
+        }
+        watcher_a.tick();
+        watcher_a.tick();
+        assert!(
+            watcher_a.take_batch().is_empty(),
+            "a run of session B must never produce a fleet event in session A's watcher"
+        );
+        watcher_b.tick();
+        let events = watcher_b.take_batch();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].kind, FleetEventKind::Settled);
+        assert_eq!(events[0].run_id, b_run);
+
+        // A's own run settling reaches A (and, already reported, not B).
+        {
+            let mut state = run::load_state(&a_run_dir).unwrap();
+            state.status = run::RunStatus::Settled;
+            run::save_state(&a_run_dir, &state).unwrap();
+        }
+        watcher_a.tick();
+        let events = watcher_a.take_batch();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].kind, FleetEventKind::Settled);
+        assert_eq!(events[0].run_id, a_run);
+        watcher_b.tick();
+        assert!(watcher_b.take_batch().is_empty());
         drop(tmp);
     }
 }

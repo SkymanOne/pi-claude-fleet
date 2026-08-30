@@ -487,14 +487,21 @@ fn the_hidden_orchestrator_monitor_reaches_its_implementation() {
         Some(0),
         "the monitor ends cleanly when claude cannot start"
     );
-    // The boot state landed in the documented layout, and the failure was
-    // diagnosed in the raw protocol log.
+    // The boot state landed in the documented layout (the monitor's own
+    // session directory), and the failure was diagnosed in the raw
+    // protocol log.
+    let key = parl::orch::session::resolve_session(&fleet_dir)
+        .expect("boot writes the session row")
+        .key();
     assert!(
-        fleet_dir.join("orchestrator/state.json").is_file(),
+        parl::paths::FleetPaths::new(&fleet_dir)
+            .orchestrator_state(&key)
+            .is_file(),
         "the boot state landed in the documented layout"
     );
     let claude_log =
-        std::fs::read_to_string(fleet_dir.join("orchestrator/claude.log")).unwrap_or_default();
+        std::fs::read_to_string(parl::paths::FleetPaths::new(&fleet_dir).claude_log(&key))
+            .unwrap_or_default();
     assert!(claude_log.contains("could not spawn"), "{claude_log}");
 }
 
@@ -973,18 +980,19 @@ fn the_orchestrator_side_writes_the_documented_fleet_layout() {
         .spawn()
         .unwrap();
 
-    // Wait for boot (the orchestrator dir appears), then send one user
+    // Wait for boot (the session dir appears), then send one user
     // message — the fake claude emits init after it, and init is when the
     // monitor persists the session record.
-    let inbox = fleet_dir.join("orchestrator").join("inbox.jsonl");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !fleet_dir.join("orchestrator").is_dir() {
+    while !path_exists(&fleet_dir.join("orchestrators")) {
         assert!(
             std::time::Instant::now() < deadline,
             "the monitor never booted"
         );
         std::thread::sleep(POLL);
     }
+    let session_path = session_dir(&fleet_dir);
+    let inbox = session_path.join("inbox.jsonl");
     let user = parl::orch::records::OrchestratorCommand::User {
         text: "hello fleet".into(),
     }
@@ -997,25 +1005,31 @@ fn the_orchestrator_side_writes_the_documented_fleet_layout() {
         assert!(
             std::time::Instant::now() < deadline,
             "fleet.json never appeared; claude.log: {}",
-            std::fs::read_to_string(fleet_dir.join("orchestrator/claude.log")).unwrap_or_default()
+            std::fs::read_to_string(session_path.join("claude.log")).unwrap_or_default()
         );
         std::thread::sleep(POLL);
     }
 
-    let session: Value =
+    let store: Value =
         serde_json::from_str(&std::fs::read_to_string(&fleet_json).unwrap()).unwrap();
-    assert_eq!(session["version"], json!(1), "{session}");
+    assert_eq!(store["version"], json!(2), "{store}");
+    let sessions = store["sessions"].as_object().unwrap();
+    assert_eq!(sessions.len(), 1, "{store}");
+    let session = sessions.values().next().unwrap();
     assert_eq!(session["sessionId"], "sess-e2e-12345678");
     assert_eq!(session["cwd"], root.to_string_lossy().as_ref());
-    let state = parl::orch::monitor::load_orchestrator_state(&fleet_dir).unwrap();
+    assert!(session["uuid"].is_string(), "{store}");
+    let key =
+        parl::paths::SessionKey::new(None, session["uuid"].as_str().unwrap().parse().unwrap());
+    let state = parl::orch::monitor::load_orchestrator_state(&fleet_dir, &key).unwrap();
     assert_eq!(state.session_id.as_deref(), Some("sess-e2e-12345678"));
 
     for documented in [
-        fleet_dir.join("orchestrator").join("state.json"),
-        fleet_dir.join("orchestrator").join("events.jsonl"),
-        fleet_dir.join("orchestrator").join("inbox.jsonl"),
-        fleet_dir.join("orchestrator").join("claude.log"),
-        fleet_dir.join("orchestrator").join("prompt.md"),
+        session_path.join("state.json"),
+        session_path.join("events.jsonl"),
+        session_path.join("inbox.jsonl"),
+        session_path.join("claude.log"),
+        session_path.join("prompt.md"),
     ] {
         assert!(documented.is_file(), "missing {}", documented.display());
     }
@@ -1027,7 +1041,7 @@ fn the_orchestrator_side_writes_the_documented_fleet_layout() {
     // The prompt was rendered from the copy embedded in the binary: the
     // placeholders are substituted with this fleet's paths, nothing unknown
     // remains, and nothing was copied outside the state directory.
-    let prompt = std::fs::read_to_string(fleet_dir.join("orchestrator/prompt.md")).unwrap();
+    let prompt = std::fs::read_to_string(session_path.join("prompt.md")).unwrap();
     assert!(prompt.starts_with("# Fleet orchestrator"), "{prompt}");
     assert!(!prompt.contains("{{"), "{prompt}");
     assert!(
@@ -1060,12 +1074,24 @@ fn the_orchestrator_side_writes_the_documented_fleet_layout() {
     let _ = monitor.wait(); // reap: no zombie
 
     // The state records the ended session for the next console open.
-    let ended = parl::orch::monitor::load_orchestrator_state(&fleet_dir).unwrap();
+    let ended = parl::orch::monitor::load_orchestrator_state(&fleet_dir, &key).unwrap();
     assert!(
         ended.exited.is_some(),
         "the state records the ended child: {ended:?}"
     );
     let _ = tmp; // the tree outlives the monitor
+}
+
+/// The one session directory under `<fleet>/orchestrators/`.
+fn session_dir(fleet_dir: &Path) -> PathBuf {
+    let dirs: Vec<PathBuf> = std::fs::read_dir(fleet_dir.join("orchestrators"))
+        .unwrap_or_else(|_| panic!("no orchestrators dir under {}", fleet_dir.display()))
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(dirs.len(), 1, "expected one session dir: {dirs:?}");
+    dirs.into_iter().next().unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,7 +1120,7 @@ fn full_worker_lifecycle_happy_path() {
         &[],
     );
     assert!(
-        regex::Regex::new(r"^alpha-\d{14}$")
+        regex::Regex::new(r"^alpha-[0-9a-f]{7}$")
             .unwrap()
             .is_match(&run_id),
         "{run_id}"
@@ -1288,7 +1314,7 @@ fn full_worker_lifecycle_happy_path() {
         run_dir.join("pi.log"),
         run_dir.join("session"),
         fleet.join("runs"),
-        fleet.join("orchestrator"),
+        fleet.join("orchestrators"),
         fleet.join("pi").join("extensions").join("fleet-worker.ts"),
         fleet
             .join("pi")

@@ -97,13 +97,21 @@ async fn wait(timeout: Duration, mut check: impl FnMut() -> bool) {
     }
 }
 
+fn session_key(fleet_dir: &Path) -> parl::paths::SessionKey {
+    parl::orch::session::resolve_session(fleet_dir)
+        .expect("the monitor writes a session row")
+        .key()
+}
+
 fn monitor_pid(fleet_dir: &Path) -> Option<i32> {
-    load_orchestrator_state(fleet_dir).and_then(|state| state.pid)
+    load_orchestrator_state(fleet_dir, &session_key(fleet_dir)).and_then(|state| state.pid)
 }
 
 fn count_results(fleet_dir: &Path) -> usize {
-    let raw = std::fs::read_to_string(FleetPaths::new(fleet_dir).orchestrator_events())
-        .unwrap_or_default();
+    let raw = std::fs::read_to_string(
+        FleetPaths::new(fleet_dir).orchestrator_events(&session_key(fleet_dir)),
+    )
+    .unwrap_or_default();
     raw.lines()
         .filter_map(|line| serde_json::from_str::<EventRecord>(line).ok())
         .filter(|record| record.kind == "result")
@@ -114,7 +122,9 @@ fn count_results(fleet_dir: &Path) -> usize {
 /// process wrote into `claude.log` (`[ts] spawn pid=1234 node …`). Read
 /// before the fleet directory is deleted, since the log goes with it.
 fn claude_pid(fleet_dir: &Path) -> Option<i32> {
-    let log = std::fs::read_to_string(FleetPaths::new(fleet_dir).claude_log()).ok()?;
+    let log =
+        std::fs::read_to_string(FleetPaths::new(fleet_dir).claude_log(&session_key(fleet_dir)))
+            .ok()?;
     let line = log
         .lines()
         .rfind(|l| l.contains("spawn pid=") && l.contains("fake-claude"))?;

@@ -86,6 +86,34 @@ impl SteerKind {
     }
 }
 
+/// The orchestrator party of a fleet's acting session: the session a
+/// console or orchestrator monitor most recently recorded in `fleet.json`,
+/// or the default session when the fleet has no session rows yet. The
+/// default's canonical on-wire spelling (bare `"orchestrator"`) keeps the
+/// wire shape identical to what older writers produced.
+pub(crate) fn session_orchestrator_party(fleet_dir: &Path) -> Party {
+    Party::Orchestrator(super::acting_session(fleet_dir))
+}
+
+/// The orchestrator party the CLI attributes steering to, resolved from the
+/// same `cwd`/`$PARL_DIR` the cores use — so provenance can never split
+/// from where the envelope lands — falling back to the default session when
+/// the fleet cannot be resolved.
+async fn cli_orchestrator_party(cwd: Option<&Path>) -> Party {
+    cli_orchestrator_party_with_env(cwd, super::ambient_parl_dir().as_deref()).await
+}
+
+/// [`cli_orchestrator_party`] with the `$PARL_DIR` value injected, so tests
+/// never resolve an ambient variable into an unrelated fleet.
+async fn cli_orchestrator_party_with_env(cwd: Option<&Path>, parl_dir: Option<&str>) -> Party {
+    let fleet = resolve_fleet_dir_with_env(cwd, parl_dir).await;
+    fleet
+        .map(|f| session_orchestrator_party(f.paths.root()))
+        .unwrap_or(Party::Orchestrator(
+            crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION,
+        ))
+}
+
 /// Steer a running worker (delivered after its current tool calls).
 ///
 /// # Errors
@@ -98,7 +126,7 @@ pub async fn send(
     message: &str,
 ) -> anyhow::Result<crate::cli::ExitCode> {
     Ok(print_result(
-        send_core(name, cwd, message, Party::Orchestrator).await?,
+        send_core(name, cwd, message, cli_orchestrator_party(cwd).await).await?,
     ))
 }
 
@@ -113,7 +141,7 @@ pub async fn followup(
     message: &str,
 ) -> anyhow::Result<crate::cli::ExitCode> {
     Ok(print_result(
-        followup_core(name, cwd, message, Party::Orchestrator).await?,
+        followup_core(name, cwd, message, cli_orchestrator_party(cwd).await).await?,
     ))
 }
 
@@ -129,7 +157,14 @@ pub async fn answer(
     message: &str,
 ) -> anyhow::Result<crate::cli::ExitCode> {
     Ok(print_result(
-        answer_core(name, cwd, question_id, message, Party::Orchestrator).await?,
+        answer_core(
+            name,
+            cwd,
+            question_id,
+            message,
+            cli_orchestrator_party(cwd).await,
+        )
+        .await?,
     ))
 }
 
@@ -140,7 +175,7 @@ pub async fn answer(
 /// Fails when the fleet dir cannot be resolved.
 pub async fn stop(name: &str, cwd: Option<&Path>) -> anyhow::Result<crate::cli::ExitCode> {
     Ok(print_result(
-        stop_core(name, cwd, Party::Orchestrator).await?,
+        stop_core(name, cwd, cli_orchestrator_party(cwd).await).await?,
     ))
 }
 
@@ -357,20 +392,20 @@ async fn control_core_with_env(
                     )],
                 ));
             };
-            Envelope::answer(source, Party::worker(&target.run_id), message, Some(id))
+            Envelope::answer(source, target.worker_party(), message, Some(id))
         }
-        SteerKind::Stop => Envelope::abort(source, Party::worker(&target.run_id)),
+        SteerKind::Stop => Envelope::abort(source, target.worker_party()),
         SteerKind::Send => {
             let Some(message) = message else {
                 anyhow::bail!("send: message required after \"--\"");
             };
-            Envelope::steer(source, Party::worker(&target.run_id), message)
+            Envelope::steer(source, target.worker_party(), message)
         }
         SteerKind::FollowUp => {
             let Some(message) = message else {
                 anyhow::bail!("followup: message required after \"--\"");
             };
-            Envelope::follow_up(source, Party::worker(&target.run_id), message)
+            Envelope::follow_up(source, target.worker_party(), message)
         }
     };
     append_envelope(&paths.run_inbox(&target.run_id), &envelope)?;
@@ -404,10 +439,23 @@ async fn control_core_with_env(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::envelope::Decoded;
+    use crate::fleet::envelope::{DEFAULT_ORCHESTRATOR_SESSION, Decoded};
     use crate::fleet::run::{PendingDialog, PendingQuestion, RunState, RunStatus};
     use crate::util::new_id;
     use std::path::PathBuf;
+    use uuid::Uuid;
+
+    /// The default orchestrator party, as the CLI and MCP attribute steering.
+    fn orch() -> Party {
+        Party::Orchestrator(DEFAULT_ORCHESTRATOR_SESSION)
+    }
+
+    /// The state's uuid for an envelope's `to` address.
+    fn run_uuid(paths: &FleetPaths, run_id: &str) -> Uuid {
+        crate::fleet::run::load_state(&paths.run_dir(run_id))
+            .unwrap()
+            .uuid
+    }
 
     fn tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -467,15 +515,15 @@ mod tests {
     #[tokio::test]
     async fn send_appends_a_steer_envelope_and_queues() {
         let (dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
-        let result = send_core_with_env("auth", Some(&dir), "use tabs", Party::Orchestrator, None)
+        let result = send_core_with_env("auth", Some(&dir), "use tabs", orch(), None)
             .await
             .unwrap();
         assert_eq!(result.code, ExitCode::Ok);
         assert_eq!(result.out, vec!["steer queued for auth"]);
         let envelopes = inbox_lines(&paths, &run_id);
         assert_eq!(envelopes.len(), 1);
-        assert_eq!(envelopes[0].from, Party::Orchestrator);
-        assert_eq!(envelopes[0].to, Party::worker(&run_id));
+        assert_eq!(envelopes[0].from, orch());
+        assert_eq!(envelopes[0].to, Party::worker(run_uuid(&paths, &run_id)));
         assert_eq!(envelopes[0].decode(), Some(Decoded::Steer("use tabs")));
         assert_eq!(
             result.data,
@@ -490,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn followup_and_stop_append_their_envelope_types() {
         let (dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
-        followup_core_with_env("auth", Some(&dir), "then fmt", Party::Orchestrator, None)
+        followup_core_with_env("auth", Some(&dir), "then fmt", orch(), None)
             .await
             .unwrap();
         stop_core_with_env("auth", Some(&dir), Party::Console, None)
@@ -501,7 +549,7 @@ mod tests {
         assert_eq!(envelopes[0].kind, "follow_up");
         assert_eq!(envelopes[1].kind, "abort", "stop appends an abort envelope");
         // Provenance is threaded honestly.
-        assert_eq!(envelopes[0].from, Party::Orchestrator);
+        assert_eq!(envelopes[0].from, orch());
         assert_eq!(envelopes[1].from, Party::Console);
         let payload = &envelopes[1].payload;
         assert!(
@@ -515,15 +563,15 @@ mod tests {
         let (dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
         for (core, expect) in [
             (
-                send_core_with_env("auth", Some(&dir), "  ", Party::Orchestrator, None).await,
+                send_core_with_env("auth", Some(&dir), "  ", orch(), None).await,
                 "send: message",
             ),
             (
-                followup_core_with_env("auth", Some(&dir), "", Party::Orchestrator, None).await,
+                followup_core_with_env("auth", Some(&dir), "", orch(), None).await,
                 "followup: message",
             ),
             (
-                answer_core_with_env("auth", Some(&dir), None, "", Party::Orchestrator, None).await,
+                answer_core_with_env("auth", Some(&dir), None, "", orch(), None).await,
                 "answer: message",
             ),
         ] {
@@ -538,8 +586,8 @@ mod tests {
     async fn steering_a_terminal_run_refuses_with_the_resume_hint() {
         let (dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Settled, None);
         for core in [
-            send_core_with_env("auth", Some(&dir), "m", Party::Orchestrator, None).await,
-            followup_core_with_env("auth", Some(&dir), "m", Party::Orchestrator, None).await,
+            send_core_with_env("auth", Some(&dir), "m", orch(), None).await,
+            followup_core_with_env("auth", Some(&dir), "m", orch(), None).await,
         ] {
             let result = core.unwrap();
             assert_eq!(result.code, ExitCode::Error);
@@ -550,12 +598,12 @@ mod tests {
                 "carries the copy-pasteable resume command: {err}"
             );
         }
-        let stop = stop_core_with_env("auth", Some(&dir), Party::Orchestrator, None)
+        let stop = stop_core_with_env("auth", Some(&dir), orch(), None)
             .await
             .unwrap();
         assert_eq!(stop.code, ExitCode::Error);
         assert!(stop.err[0].contains("nothing to stop"), "{}", stop.err[0]);
-        let answer = answer_core_with_env("auth", Some(&dir), None, "x", Party::Orchestrator, None)
+        let answer = answer_core_with_env("auth", Some(&dir), None, "x", orch(), None)
             .await
             .unwrap();
         assert!(answer.err[0].contains("nothing is waiting for an answer"));
@@ -566,16 +614,9 @@ mod tests {
     #[tokio::test]
     async fn answer_needs_a_question_dialog_or_explicit_id() {
         let (dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
-        let refused = answer_core_with_env(
-            "auth",
-            Some(&dir),
-            None,
-            "argon2",
-            Party::Orchestrator,
-            None,
-        )
-        .await
-        .unwrap();
+        let refused = answer_core_with_env("auth", Some(&dir), None, "argon2", orch(), None)
+            .await
+            .unwrap();
         assert_eq!(refused.code, ExitCode::Error);
         assert!(
             refused.err[0].contains("no pending question — use send"),
@@ -632,10 +673,9 @@ mod tests {
         });
         crate::fleet::run::save_state(&run_dir, &state).unwrap();
 
-        let result =
-            answer_core_with_env("auth", Some(&dir), None, "yes", Party::Orchestrator, None)
-                .await
-                .unwrap();
+        let result = answer_core_with_env("auth", Some(&dir), None, "yes", orch(), None)
+            .await
+            .unwrap();
         assert_eq!(result.data.question_id.as_deref(), Some("ui-9"));
         let envelopes = inbox_lines(&paths, &run_id);
         assert_eq!(
@@ -647,16 +687,9 @@ mod tests {
         );
 
         // An explicit id wins even when it is not the pending one.
-        let result = answer_core_with_env(
-            "auth",
-            Some(&dir),
-            Some("q_other"),
-            "no",
-            Party::Orchestrator,
-            None,
-        )
-        .await
-        .unwrap();
+        let result = answer_core_with_env("auth", Some(&dir), Some("q_other"), "no", orch(), None)
+            .await
+            .unwrap();
         assert_eq!(result.data.question_id.as_deref(), Some("q_other"));
         let envelopes = inbox_lines(&paths, &run_id);
         assert_eq!(envelopes.len(), 2);
@@ -672,15 +705,78 @@ mod tests {
     #[tokio::test]
     async fn unknown_runs_and_empty_names_are_errors() {
         let dir = tmp_dir("parl-steer-none-");
-        let err = send_core_with_env("ghost", Some(&dir), "m", Party::Orchestrator, None)
+        let err = send_core_with_env("ghost", Some(&dir), "m", orch(), None)
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("No run found"), "{err}");
-        let err = send_core_with_env("  ", Some(&dir), "m", Party::Orchestrator, None)
+        let err = send_core_with_env("  ", Some(&dir), "m", orch(), None)
             .await
             .unwrap_err()
             .to_string();
         assert_eq!(err, "<name> required");
+    }
+
+    #[tokio::test]
+    async fn the_cli_attributes_steering_to_the_fleets_acting_session() {
+        let dir = tmp_dir("parl-steer-session-");
+        let paths = FleetPaths::new(dir.join(crate::paths::STATE_DIR_NAME));
+        let run_id = "auth-20260828141530";
+        let run_dir = paths.run_dir(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut state = RunState::new(
+            paths.root().to_string_lossy().as_ref(),
+            run_id,
+            "auth",
+            "/tmp/x",
+            "b",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        state.status = RunStatus::Running;
+        state.pid = Some(std::process::id().cast_signed());
+        crate::fleet::run::save_state(&run_dir, &state).unwrap();
+        // fleet.json names the fleet's session; the wrapper attributes
+        // the envelope to *it*, not the default. The `$PARL_DIR` value is
+        // injected as `None`, so the ambient environment can never redirect
+        // this test's resolution.
+        let mut store = crate::orch::session::FleetSessions::new();
+        store.upsert(crate::orch::session::OrchestratorSession::new("/repo"));
+        let session = store.last_used().unwrap().uuid;
+        crate::orch::session::save(paths.root(), &mut store).unwrap();
+
+        let party = cli_orchestrator_party_with_env(Some(&dir), None).await;
+        assert_eq!(party, Party::Orchestrator(session));
+        send_core_with_env("auth", Some(&dir), "use tabs", party, None)
+            .await
+            .unwrap();
+        let envelopes = inbox_lines(&paths, run_id);
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].from, Party::Orchestrator(session));
+        // Without a fleet.json the wrapper falls back to the default
+        // session's canonical on-wire spelling.
+        let dir2 = tmp_dir("parl-steer-nosession-");
+        let paths2 = FleetPaths::new(dir2.join(crate::paths::STATE_DIR_NAME));
+        let run_dir2 = paths2.run_dir(run_id);
+        std::fs::create_dir_all(&run_dir2).unwrap();
+        let mut state2 = state.clone();
+        state2.orchestrator_id = None;
+        crate::fleet::run::save_state(&run_dir2, &state2).unwrap();
+        let party = cli_orchestrator_party_with_env(Some(&dir2), None).await;
+        assert_eq!(party, orch());
+        stop_core_with_env("auth", Some(&dir2), party, None)
+            .await
+            .unwrap();
+        let envelopes = inbox_lines(&paths2, run_id);
+        assert_eq!(envelopes[0].from, orch());
     }
 }

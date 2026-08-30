@@ -94,6 +94,16 @@ impl Fleet {
         run::load_state(&self.run_dir).unwrap()
     }
 
+    /// The worker party this run is addressed as: its recorded uuid.
+    fn worker_party(&self) -> Party {
+        Party::Worker(run::load_state(&self.run_dir).unwrap().uuid)
+    }
+
+    /// The default orchestrator party, as CLI/MCP steering writes it.
+    fn orch_party(&self) -> Party {
+        Party::Orchestrator(parl::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION)
+    }
+
     /// Poll `run.json` until `check` holds or the timeout lapses.
     fn wait_state(&self, timeout: Duration, check: impl Fn(&RunState) -> bool) -> RunState {
         let deadline = Instant::now() + timeout;
@@ -200,6 +210,12 @@ impl Drop for Fleet {
     }
 }
 
+/// The fleet-level pi catalogue, as the monitor wrote it.
+fn read_cache(parl_dir: &Path) -> parl::fleet::run::PiCache {
+    let raw = std::fs::read_to_string(parl_dir.join("pi-cache.json")).unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
 fn tail(path: &Path, n: usize) -> String {
     let bytes = std::fs::read(path).unwrap_or_default();
     let start = bytes.len().saturating_sub(4000);
@@ -279,6 +295,9 @@ fn full_run_settles_and_captures_report_events_and_exits() {
     assert_eq!(code, Some(0), "monitor exits cleanly");
 }
 
+/// The pi catalogue is a fleet property: the monitor writes it to
+/// `pi-cache.json` at boot; run.json never carries it (`load_state` merges
+/// the cache back in, which is what the waits below observe).
 #[test]
 fn records_commands_and_forwards_a_command_as_a_prompt() {
     let mut fleet = spawn_slow("pf-cmds-", &[("FAKE_PI_DELAY_MS", "20000")]);
@@ -289,10 +308,19 @@ fn records_commands_and_forwards_a_command_as_a_prompt() {
         vec!["skill:fleet-worker-report", "compact-notes", "session-name"]
     );
     assert_eq!(state.commands[0].source, "skill");
+    // The fleet cache carries them, and the per-run file does not.
+    let cache = read_cache(&fleet.parl_dir);
+    let names: Vec<&str> = cache.commands.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["skill:fleet-worker-report", "compact-notes", "session-name"]
+    );
+    let run_raw = fleet.read("run.json");
+    assert!(!run_raw.contains("\"commands\""), "{run_raw}");
 
     fleet.append_inbox(&Envelope::command(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "/session-name mine",
     ));
     // The `command_delivered` event is written before the steering record is
@@ -310,10 +338,7 @@ fn records_commands_and_forwards_a_command_as_a_prompt() {
         "a command_delivered event was written"
     );
 
-    fleet.append_inbox(&Envelope::abort(
-        Party::Console,
-        Party::worker(&fleet.run_id),
-    ));
+    fleet.append_inbox(&Envelope::abort(Party::Console, fleet.worker_party()));
     settled_or(&fleet, Duration::from_secs(20));
     assert_eq!(fleet.wait_monitor_exit(Duration::from_secs(15)), Some(0));
 }
@@ -367,7 +392,7 @@ fn reports_and_changes_the_thinking_level() {
 
     fleet.append_inbox(&Envelope::thinking(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "xhigh",
     ));
     let state = fleet.wait_state(Duration::from_secs(20), |state| {
@@ -381,7 +406,7 @@ fn reports_and_changes_the_thinking_level() {
 
     fleet.append_inbox(&Envelope::thinking(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "ludicrous",
     ));
     fleet.wait_event(Duration::from_secs(20), |ev| {
@@ -394,10 +419,7 @@ fn reports_and_changes_the_thinking_level() {
         "a rejected level does not stick"
     );
 
-    fleet.append_inbox(&Envelope::abort(
-        Party::Console,
-        Party::worker(&fleet.run_id),
-    ));
+    fleet.append_inbox(&Envelope::abort(Party::Console, fleet.worker_party()));
     settled_or(&fleet, Duration::from_secs(20));
     assert_eq!(fleet.wait_monitor_exit(Duration::from_secs(15)), Some(0));
 }
@@ -415,7 +437,9 @@ fn records_the_model_pi_resolved_and_the_available_models() {
     });
     assert_eq!(state.active_model.as_deref(), Some("vendor/model-9"));
     assert_eq!(state.active_provider.as_deref(), Some("vendorco"));
-    // The available-model list lands on the run state too (with the fake's provider).
+    // The available-model list is a fleet property now: it lands in
+    // pi-cache.json (with the fake's provider), not in run.json — the state
+    // only reflects it through the load-time cache merge.
     let state = fleet.wait_state(Duration::from_secs(20), |state| {
         !state.available_models.is_empty()
     });
@@ -425,6 +449,15 @@ fn records_the_model_pi_resolved_and_the_available_models() {
             .iter()
             .any(|m| m.id == "glm-5.3-flash" && m.provider == "vendorco")
     );
+    let cache = read_cache(&fleet.parl_dir);
+    assert!(
+        cache
+            .available_models
+            .iter()
+            .any(|m| m.id == "glm-5.3-flash" && m.provider == "vendorco")
+    );
+    let run_raw = fleet.read("run.json");
+    assert!(!run_raw.contains("availableModels"), "{run_raw}");
 }
 
 #[test]
@@ -495,12 +528,12 @@ fn console_steering_mid_run_is_delivered_logged_and_reflected_in_the_report() {
     let fleet = spawn_slow("pf-steer-", &[("FAKE_PI_DELAY_MS", "4000")]);
     fleet.append_inbox(&Envelope::steer(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "use tabs not spaces",
     ));
     fleet.append_inbox(&Envelope::follow_up(
-        Party::Orchestrator,
-        Party::worker(&fleet.run_id),
+        fleet.orch_party(),
+        fleet.worker_party(),
         "then summarize",
     ));
     let state = settled_or(&fleet, Duration::from_secs(30));
@@ -535,10 +568,7 @@ fn console_steering_mid_run_is_delivered_logged_and_reflected_in_the_report() {
 #[test]
 fn abort_via_the_inbox_stops_the_run() {
     let fleet = spawn_slow("pf-abort-", &[("FAKE_PI_DELAY_MS", "4000")]);
-    fleet.append_inbox(&Envelope::abort(
-        Party::Orchestrator,
-        Party::worker(&fleet.run_id),
-    ));
+    fleet.append_inbox(&Envelope::abort(fleet.orch_party(), fleet.worker_party()));
     let state = settled_or(&fleet, Duration::from_secs(30));
     assert_eq!(state.status, RunStatus::Stopped);
     assert!(state.settled_at.is_some(), "the stop was recorded");
@@ -558,7 +588,7 @@ fn steering_after_settle_is_dropped_not_forwarded() {
     assert_eq!(state.status, RunStatus::Settled);
     fleet.append_inbox(&Envelope::steer(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "too late",
     ));
     let dropped = fleet.wait_event(Duration::from_secs(10), |ev| {
@@ -576,8 +606,8 @@ fn a_steer_sent_before_the_monitor_boots_is_still_delivered() {
     fleet.write_state();
     // Written before the monitor starts; the inbox is read from byte 0.
     fleet.append_inbox(&Envelope::steer(
-        Party::Orchestrator,
-        Party::worker(&fleet.run_id),
+        fleet.orch_party(),
+        fleet.worker_party(),
         "early bird",
     ));
     fleet.spawn_monitor(&[("FAKE_PI_DELAY_MS", "3000")]);
@@ -640,8 +670,8 @@ fn outbox_questions_and_progress_mirror_into_state_and_events_and_answers_resolv
     );
 
     fleet.append_inbox(&Envelope::answer(
-        Party::Orchestrator,
-        Party::worker(&fleet.run_id),
+        fleet.orch_party(),
+        fleet.worker_party(),
         "argon2",
         Some(pending.id.clone()),
     ));
@@ -797,7 +827,7 @@ fn the_model_envelope_switches_the_worker_model() {
     });
     fleet.append_inbox(&Envelope::model(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "glm-5.3-flash",
         Some("fakeprovider".into()),
     ));
@@ -808,10 +838,7 @@ fn the_model_envelope_switches_the_worker_model() {
         state.active_model.as_deref() == Some("glm-5.3-flash")
     });
     assert_eq!(state.active_provider.as_deref(), Some("fakeprovider"));
-    fleet.append_inbox(&Envelope::abort(
-        Party::Console,
-        Party::worker(&fleet.run_id),
-    ));
+    fleet.append_inbox(&Envelope::abort(Party::Console, fleet.worker_party()));
     settled_or(&fleet, Duration::from_secs(20));
     assert_eq!(fleet.wait_monitor_exit(Duration::from_secs(15)), Some(0));
 }
@@ -830,7 +857,7 @@ fn the_model_envelope_resolves_a_null_provider_from_pis_model_list() {
     });
     fleet.append_inbox(&Envelope::model(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "glm-5.3-flash",
         None,
     ));
@@ -839,10 +866,7 @@ fn the_model_envelope_resolves_a_null_provider_from_pis_model_list() {
     });
     // The provider came from the cached list, not from the envelope.
     assert_eq!(state.active_provider.as_deref(), Some("fakeprovider"));
-    fleet.append_inbox(&Envelope::abort(
-        Party::Console,
-        Party::worker(&fleet.run_id),
-    ));
+    fleet.append_inbox(&Envelope::abort(Party::Console, fleet.worker_party()));
     settled_or(&fleet, Duration::from_secs(20));
 }
 
@@ -860,7 +884,7 @@ fn an_unresolvable_model_is_reported_not_guessed() {
     });
     fleet.append_inbox(&Envelope::model(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "ghost-model",
         None,
     ));
@@ -880,10 +904,7 @@ fn an_unresolvable_model_is_reported_not_guessed() {
         !fleet.has_event(|ev| ev["type"] == "model_rejected"),
         "pi was never told to switch"
     );
-    fleet.append_inbox(&Envelope::abort(
-        Party::Console,
-        Party::worker(&fleet.run_id),
-    ));
+    fleet.append_inbox(&Envelope::abort(Party::Console, fleet.worker_party()));
     settled_or(&fleet, Duration::from_secs(20));
 }
 
@@ -909,8 +930,8 @@ fn a_dialog_request_is_recorded_and_an_answer_reaches_pi() {
     assert_eq!(request["questionId"], "dlg_fake_1");
 
     fleet.append_inbox(&Envelope::answer(
-        Party::Orchestrator,
-        Party::worker(&fleet.run_id),
+        fleet.orch_party(),
+        fleet.worker_party(),
         "b",
         Some("dlg_fake_1".into()),
     ));
@@ -999,7 +1020,7 @@ fn a_confirm_dialog_answer_maps_to_confirmed() {
     });
     fleet.append_inbox(&Envelope::answer(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "yes",
         Some("dlg_fake_1".into()),
     ));
@@ -1030,10 +1051,11 @@ fn spawn_failures_are_diagnosed_in_pi_log() {
     assert!(pi_log.contains("[monitor] failed to start pi"), "{pi_log}");
 }
 
-/// The console-facing summary of a settled run's JSON state keeps the new
-/// fields (a smoke check for later steps reading run.json).
+/// The console-facing summary of a settled run's JSON state keeps the run
+/// facts (a smoke check for later steps reading run.json) and never picks up
+/// the pi catalogue: that lives in the fleet cache and is merged at load.
 #[test]
-fn run_json_serializes_the_new_fields() {
+fn run_json_keeps_run_facts_and_strips_the_pi_catalogue() {
     let fleet = Fleet::new("pf-json-");
     fleet.write_state();
     let mut state = fleet.state();
@@ -1054,10 +1076,25 @@ fn run_json_serializes_the_new_fields() {
     let raw: Value =
         serde_json::from_str(&std::fs::read_to_string(fleet.run_dir.join("run.json")).unwrap())
             .unwrap();
-    assert_eq!(raw["availableModels"][0]["id"], "glm-5.3");
+    // The catalogue never lands in run.json; run facts still do.
+    assert!(raw.get("availableModels").is_none(), "{raw}");
     assert_eq!(raw["pendingDialog"]["method"], "select");
-    // Round-trips through the tolerant reader.
+    // Round-trips through the tolerant reader; without a fleet cache the
+    // catalogue reads empty.
+    let loaded = run::load_state(&fleet.run_dir).unwrap();
+    assert!(loaded.available_models.is_empty());
+    assert_eq!(loaded.pending_dialog.unwrap().method, "select");
+    // With the fleet cache present, loading sources the catalogue from it.
+    let cache = parl::fleet::run::PiCache {
+        available_models: vec![parl::fleet::run::WorkerModel {
+            provider: "fakeprovider".into(),
+            id: "glm-5.3".into(),
+            name: Some("GLM 5.3".into()),
+        }],
+        commands: Vec::new(),
+    };
+    run::write_pi_cache(&fleet.parl_dir, &cache).unwrap();
     let loaded = run::load_state(&fleet.run_dir).unwrap();
     assert_eq!(loaded.available_models.len(), 1);
-    assert_eq!(loaded.pending_dialog.unwrap().method, "select");
+    assert_eq!(loaded.available_models[0].id, "glm-5.3");
 }

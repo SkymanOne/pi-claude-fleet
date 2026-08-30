@@ -4,21 +4,23 @@
 //! it):
 //!
 //! ```json
-//! {"id":"m_ab12cd","ts":"2026-08-30T12:00:00.000Z","from":"orchestrator","to":"worker:r-1","type":"steer","payload":{"message":"..."}}
+//! {"id":"m_ab12cd","ts":"2026-08-30T12:00:00.000Z","from":"orchestrator","to":"worker:<uuid>","type":"steer","payload":{"message":"..."}}
 //! ```
 //!
 //! `from`/`to` are [`Party`] values. `id` is `m_` plus a short random suffix
 //! everywhere (inbox included), `ts` is RFC3339 UTC with milliseconds.
 //!
 //! **inbox** (orchestrator/console -> worker monitor), `to` is
-//! `worker:<runId>`, `from` is `orchestrator` or `console`:
+//! `worker:<uuid>` (a legacy `worker:<runId>` parses too), `from` is
+//! `orchestrator` / `orchestrator:<uuid>` or `console`:
 //! `steer`/`follow_up`/`command`/`thinking` carry `{"message"}`, `abort`
 //! carries `{}`, `answer` carries `{"message","questionId"}`, `model`
 //! carries `{"message","provider"}` (`provider` null to resolve from the
 //! models pi has configured).
 //!
-//! **outbox** (worker -> monitor), `from` is `worker:<runId>`, `to` is
-//! `fleet`: `question`, `progress`, `question_resolved`.
+//! **outbox** (worker -> monitor), `from` is `worker:<uuid>` (legacy
+//! `worker:<runId>` parses too), `to` is `fleet`: `question`,
+//! `progress`, `question_resolved`.
 //!
 //! The old flat `control.jsonl` shape is gone: no back-compat reader, no
 //! migration. Deserialisation tolerates unknown `type` values and unknown
@@ -28,35 +30,64 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::util::{append_json_line, new_id, now_iso};
 
+/// The session a bare `"orchestrator"` party refers to: the pre-identity
+/// fleet, and the provenance CLI- and MCP-driven steering carries until
+/// sessions wire themselves through. Its canonical on-wire spelling is the
+/// bare `"orchestrator"`, so files written before session identities keep
+/// round-tripping byte-for-byte.
+pub const DEFAULT_ORCHESTRATOR_SESSION: Uuid = Uuid::nil();
+
+/// Namespace for deriving the stable party uuid of a legacy run id (a
+/// `worker:<payload>` whose payload predates run uuids). Derived uuid, not
+/// random: the same run id must parse to the same party forever.
+const LEGACY_RUN_NAMESPACE: Uuid = Uuid::from_u128(0x7061_726c_2d6c_6567_6163_792d_7275_6e73);
+
+/// The stable [`Party::Worker`] identity of a legacy run id (`"abc-1"` in
+/// `worker:abc-1`, or a run whose state file predates run uuids).
+#[must_use]
+pub fn legacy_worker_uuid(run_id: &str) -> Uuid {
+    Uuid::new_v5(&LEGACY_RUN_NAMESPACE, run_id.as_bytes())
+}
+
 /// Who a mailbox line is from or to.
 ///
-/// `worker:<runId>` for anything addressed at one worker's mailbox.
+/// Parsing accepts, permanently: `"orchestrator"` (the default session),
+/// `"orchestrator:<uuid>"`, `"worker:<uuid>"`, and `"worker:<anything-not-a-uuid>"`
+/// (a legacy run id, encoded as a derived uuid). `Console` and `Fleet` are
+/// unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Party {
-    Orchestrator,
+    Orchestrator(Uuid),
     Console,
     Fleet,
-    Worker(String),
+    Worker(Uuid),
 }
 
 impl Party {
-    /// The `worker:<runId>` party for a run.
+    /// The `worker:<uuid>` party of a run.
     #[must_use]
-    pub fn worker(run_id: &str) -> Self {
-        Self::Worker(run_id.to_string())
+    pub fn worker(uuid: Uuid) -> Self {
+        Self::Worker(uuid)
     }
 }
 
 impl std::fmt::Display for Party {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Orchestrator => f.write_str("orchestrator"),
+            // The default session's canonical spelling is the bare
+            // `"orchestrator"` (its own round-trips), so legacy provenance
+            // and event labels written before identities stay byte-identical.
+            Self::Orchestrator(uuid) if *uuid == DEFAULT_ORCHESTRATOR_SESSION => {
+                f.write_str("orchestrator")
+            }
+            Self::Orchestrator(uuid) => write!(f, "orchestrator:{uuid}"),
             Self::Console => f.write_str("console"),
             Self::Fleet => f.write_str("fleet"),
-            Self::Worker(run_id) => write!(f, "worker:{run_id}"),
+            Self::Worker(uuid) => write!(f, "worker:{uuid}"),
         }
     }
 }
@@ -66,14 +97,26 @@ impl std::str::FromStr for Party {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "orchestrator" => Ok(Self::Orchestrator),
+            "orchestrator" => Ok(Self::Orchestrator(DEFAULT_ORCHESTRATOR_SESSION)),
             "console" => Ok(Self::Console),
             "fleet" => Ok(Self::Fleet),
-            other => other
-                .strip_prefix("worker:")
-                .filter(|run_id| !run_id.is_empty())
-                .map(|run_id| Self::Worker(run_id.to_string()))
-                .ok_or_else(|| format!("not a party: {other}")),
+            other => {
+                if let Some(rest) = other.strip_prefix("orchestrator:") {
+                    return Uuid::parse_str(rest)
+                        .map(Self::Orchestrator)
+                        .map_err(|_| format!("not a party: {other}"));
+                }
+                if let Some(rest) = other.strip_prefix("worker:") {
+                    return if rest.is_empty() {
+                        Err(format!("not a party: {other}"))
+                    } else {
+                        Ok(Self::Worker(
+                            Uuid::parse_str(rest).unwrap_or_else(|_| legacy_worker_uuid(rest)),
+                        ))
+                    };
+                }
+                Err(format!("not a party: {other}"))
+            }
         }
     }
 }
@@ -363,6 +406,15 @@ pub fn append_envelope(path: &std::path::Path, envelope: &Envelope) -> std::io::
 mod tests {
     use super::*;
     use serde_json::json;
+    use uuid::Uuid;
+
+    fn worker_uuid() -> Uuid {
+        Uuid::parse_str("9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c").unwrap()
+    }
+
+    fn sess_uuid() -> Uuid {
+        Uuid::parse_str("6e1c9a86-3b7d-4f5a-9e2c-1b8d4a7f0c3e").unwrap()
+    }
 
     fn round_trip(envelope: &Envelope) -> Envelope {
         let line = serde_json::to_string(envelope).unwrap();
@@ -374,8 +426,8 @@ mod tests {
     #[test]
     fn envelope_shape_matches_the_pinned_contract() {
         let mut env = Envelope::new(
-            Party::Orchestrator,
-            Party::worker("r-1"),
+            Party::Orchestrator(DEFAULT_ORCHESTRATOR_SESSION),
+            Party::worker(worker_uuid()),
             "steer",
             json!({"message": "hi"}),
         );
@@ -384,22 +436,22 @@ mod tests {
         let line = serde_json::to_string(&env).unwrap();
         assert_eq!(
             line,
-            r#"{"id":"m_ab12cd","ts":"2026-08-30T12:00:00.000Z","from":"orchestrator","to":"worker:r-1","type":"steer","payload":{"message":"hi"}}"#
+            r#"{"id":"m_ab12cd","ts":"2026-08-30T12:00:00.000Z","from":"orchestrator","to":"worker:9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c","type":"steer","payload":{"message":"hi"}}"#
         );
     }
 
     #[test]
     fn ids_and_timestamps_are_generated() {
-        let env = Envelope::abort(Party::Console, Party::worker("r-1"));
+        let env = Envelope::abort(Party::Console, Party::worker(worker_uuid()));
         assert!(env.id.starts_with("m_"));
         assert!(env.ts.ends_with('Z') && env.ts.len() == 24, "{}", env.ts);
-        assert_eq!(env.to, Party::Worker("r-1".into()));
+        assert_eq!(env.to, Party::Worker(worker_uuid()));
     }
 
     #[test]
     fn every_inbox_variant_round_trips_and_decodes() {
-        let from = Party::Orchestrator;
-        let to = Party::worker("run-1");
+        let from = Party::Orchestrator(DEFAULT_ORCHESTRATOR_SESSION);
+        let to = Party::worker(worker_uuid());
         let cases: Vec<Envelope> = vec![
             Envelope::steer(from.clone(), to.clone(), "use tabs"),
             Envelope::follow_up(from.clone(), to.clone(), "after this, run fmt"),
@@ -409,7 +461,7 @@ mod tests {
             Envelope::answer(Party::Console, to.clone(), "argon2", Some("m_q1".into())),
             Envelope::answer(Party::Console, to.clone(), "go with option a", None),
             Envelope::model(from.clone(), to, "claude-fable-5", Some("anthropic".into())),
-            Envelope::model(from, Party::worker("run-2"), "glm-5.3", None),
+            Envelope::model(from, Party::worker(worker_uuid()), "glm-5.3", None),
         ];
         for env in &cases {
             let parsed = round_trip(env);
@@ -464,7 +516,7 @@ mod tests {
 
     #[test]
     fn every_outbox_variant_round_trips_and_decodes() {
-        let from = Party::worker("run-1");
+        let from = Party::worker(worker_uuid());
         let question = QuestionPayload {
             question: "which fixture style?".to_string(),
             options: Some(vec!["a".into(), "b".into()]),
@@ -561,12 +613,76 @@ mod tests {
 
     #[test]
     fn parties_round_trip_through_strings() {
-        for s in ["orchestrator", "console", "fleet", "worker:r-1"] {
+        for s in ["orchestrator", "console", "fleet"] {
             let party: Party = s.parse().unwrap();
             assert_eq!(party.to_string(), s);
         }
+        // The default session's canonical spelling is the bare form.
+        assert_eq!(
+            Party::Orchestrator(DEFAULT_ORCHESTRATOR_SESSION).to_string(),
+            "orchestrator"
+        );
         assert!("bogus".parse::<Party>().is_err());
-        assert_eq!(Party::worker("abc"), Party::Worker("abc".into()));
+        assert_eq!(Party::worker(worker_uuid()), Party::Worker(worker_uuid()));
+    }
+
+    #[test]
+    fn the_four_legacy_and_new_parse_forms_are_accepted_forever() {
+        // bare orchestrator — the default session
+        assert_eq!(
+            "orchestrator".parse::<Party>().unwrap(),
+            Party::Orchestrator(DEFAULT_ORCHESTRATOR_SESSION)
+        );
+        // orchestrator:<uuid> — that session
+        assert_eq!(
+            format!("orchestrator:{}", sess_uuid())
+                .parse::<Party>()
+                .unwrap(),
+            Party::Orchestrator(sess_uuid())
+        );
+        // worker:<uuid> — that worker
+        assert_eq!(
+            format!("worker:{}", worker_uuid())
+                .parse::<Party>()
+                .unwrap(),
+            Party::Worker(worker_uuid())
+        );
+        // worker:<anything not a uuid> — a legacy run id, mapped to a
+        // stable derived uuid (same id, same party; different ids differ)
+        let legacy: Party = "worker:auth-20260828141530".parse().unwrap();
+        assert_eq!(
+            legacy,
+            Party::Worker(legacy_worker_uuid("auth-20260828141530"))
+        );
+        assert_eq!(
+            "worker:auth-20260828141530".parse::<Party>().unwrap(),
+            legacy
+        );
+        assert_eq!(
+            legacy.to_string(),
+            format!("worker:{}", legacy_worker_uuid("auth-20260828141530"))
+        );
+        assert_ne!(
+            legacy_worker_uuid("auth-20260828141530"),
+            legacy_worker_uuid("other-20990101000000")
+        );
+        // An unparseable orchestrator payload is not a party (the line is
+        // skipped by readers, exactly like the other malformed forms).
+        assert!("orchestrator:nope".parse::<Party>().is_err());
+        assert!("worker:".parse::<Party>().is_err());
+    }
+
+    #[test]
+    fn the_new_display_forms_round_trip() {
+        for uuid in [worker_uuid(), sess_uuid()] {
+            let orchestrator = format!("orchestrator:{uuid}");
+            assert_eq!(
+                orchestrator.parse::<Party>().unwrap().to_string(),
+                orchestrator
+            );
+            let worker = format!("worker:{uuid}");
+            assert_eq!(worker.parse::<Party>().unwrap().to_string(), worker);
+        }
     }
 
     #[test]
@@ -580,10 +696,18 @@ mod tests {
         let path = dir.join("inbox.jsonl");
         append_envelope(
             &path,
-            &Envelope::steer(Party::Orchestrator, Party::worker("r"), "a"),
+            &Envelope::steer(
+                Party::Orchestrator(DEFAULT_ORCHESTRATOR_SESSION),
+                Party::worker(worker_uuid()),
+                "a",
+            ),
         )
         .unwrap();
-        append_envelope(&path, &Envelope::abort(Party::Console, Party::worker("r"))).unwrap();
+        append_envelope(
+            &path,
+            &Envelope::abort(Party::Console, Party::worker(worker_uuid())),
+        )
+        .unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = raw.trim_end().split('\n').collect();
         assert_eq!(lines.len(), 2);

@@ -23,7 +23,7 @@ use crate::orch::records::{
     PermissionDecisionRecord,
 };
 use crate::orch::session::{self, LaunchOptions, OrchestratorSession};
-use crate::paths::FleetPaths;
+use crate::paths::{FleetPaths, SessionKey};
 use crate::util::read_new_lines;
 
 /// How much of an old transcript is carried into a restarted session.
@@ -123,16 +123,48 @@ impl ClientInner {
 /// The console's handle on the orchestrator.
 pub struct OrchestratorClient {
     options: OrchestratorClientOptions,
+    /// The session this console serves; every `orchestrators/` path derives
+    /// from its key. Resolved at construction, so reads before `start()`
+    /// (liveness probes, for instance) address the right session already.
+    key: SessionKey,
     inner: Mutex<ClientInner>,
     poll_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl OrchestratorClient {
-    /// A client for the fleet rooted at `fleet_dir`.
+    /// A client for the fleet rooted at `fleet_dir`, serving the current
+    /// session: the most recently used one, or — with `fresh`, or when the
+    /// fleet has none — a new session row the console writes and the
+    /// monitor's boot picks up.
     #[must_use]
     pub fn new(options: OrchestratorClientOptions) -> Arc<Self> {
+        let fleet_dir = options.fleet_dir.clone();
+        let cwd = options.cwd.to_string_lossy().into_owned();
+        let key = if options.fresh {
+            // --fresh opens a new session: a fresh row whose most-recent
+            // stamp makes it the one the monitor boots into.
+            let record = OrchestratorSession::new(&cwd);
+            let key = record.key();
+            let mut store = session::FleetSessions::new();
+            store.upsert(record);
+            let _ = session::save(&fleet_dir, &mut store);
+            key
+        } else {
+            match session::resolve_session(&fleet_dir) {
+                Some(record) => record.key(),
+                None => {
+                    let record = OrchestratorSession::new(&cwd);
+                    let key = record.key();
+                    let mut store = session::FleetSessions::new();
+                    store.upsert(record);
+                    let _ = session::save(&fleet_dir, &mut store);
+                    key
+                }
+            }
+        };
         Arc::new(Self {
             options,
+            key,
             inner: Mutex::new(ClientInner {
                 offset: 0,
                 caught_up: false,
@@ -171,7 +203,7 @@ impl OrchestratorClient {
     /// True when a monitor is alive and owns a claude child.
     #[must_use]
     pub fn running(&self) -> bool {
-        let Some(state) = load_orchestrator_state(&self.options.fleet_dir) else {
+        let Some(state) = load_orchestrator_state(&self.options.fleet_dir, &self.key) else {
             return false;
         };
         is_alive(state.pid) && state.exited.is_none()
@@ -188,19 +220,19 @@ impl OrchestratorClient {
     /// the monitor cannot be spawned.
     pub fn start(self: &Arc<Self>) -> anyhow::Result<bool> {
         let paths = self.paths();
-        std::fs::create_dir_all(paths.orchestrator_dir())?;
+        std::fs::create_dir_all(paths.orchestrator_dir(&self.key))?;
         let attached = self.running() && !self.options.fresh;
         if !attached {
             if self.options.fresh {
                 // only --fresh throws the conversation away; otherwise the
                 // transcript is the history, and the monitor resumes the same
                 // claude session under it
-                let _ = std::fs::remove_file(paths.orchestrator_events());
-                let _ = std::fs::remove_file(paths.orchestrator_inbox());
+                let _ = std::fs::remove_file(paths.orchestrator_events(&self.key));
+                let _ = std::fs::remove_file(paths.orchestrator_inbox(&self.key));
             } else {
                 // a control file from a dead monitor would be replayed by the new one
-                let _ = std::fs::remove_file(paths.orchestrator_inbox());
-                Self::trim_transcript(&paths.orchestrator_events());
+                let _ = std::fs::remove_file(paths.orchestrator_inbox(&self.key));
+                Self::trim_transcript(&paths.orchestrator_events(&self.key));
             }
             self.spawn_monitor()?;
         }
@@ -237,7 +269,8 @@ impl OrchestratorClient {
     pub fn tick(&self) {
         let lines = {
             let mut inner = self.inner();
-            let (lines, offset) = read_new_lines(&self.paths().orchestrator_events(), inner.offset);
+            let (lines, offset) =
+                read_new_lines(&self.paths().orchestrator_events(&self.key), inner.offset);
             inner.offset = offset;
             lines
         };
@@ -260,7 +293,7 @@ impl OrchestratorClient {
         }
         inner.caught_up = true;
 
-        let Some(state) = load_orchestrator_state(&self.options.fleet_dir) else {
+        let Some(state) = load_orchestrator_state(&self.options.fleet_dir, &self.key) else {
             return;
         };
         let json = serde_json::to_string(&state).unwrap_or_default();
@@ -423,7 +456,7 @@ impl OrchestratorClient {
     }
 
     async fn command(&self, command: &OrchestratorCommand) -> anyhow::Result<()> {
-        append_command(&self.options.fleet_dir, command)
+        append_command(&self.options.fleet_dir, &self.key, command)
             .context("cannot write to the orchestrator inbox")
     }
 
@@ -444,11 +477,11 @@ impl OrchestratorClient {
     /// true`: the console leaves, the orchestrator does not.
     fn spawn_monitor(&self) -> anyhow::Result<()> {
         let paths = self.paths();
-        std::fs::create_dir_all(paths.orchestrator_dir())?;
+        std::fs::create_dir_all(paths.orchestrator_dir(&self.key))?;
         let cwd_string = self.options.cwd.to_string_lossy().into_owned();
 
         // a restarted monitor keeps the mode the last one was running in
-        let previous = load_orchestrator_state(&self.options.fleet_dir);
+        let previous = load_orchestrator_state(&self.options.fleet_dir, &self.key);
         let mode = self.options.permission_mode.clone().or_else(|| {
             previous
                 .as_ref()
@@ -462,13 +495,17 @@ impl OrchestratorClient {
             .clone()
             .or_else(|| previous.as_ref().and_then(|s| s.remote_control.clone()));
 
-        let mut session_record = if self.options.fresh {
-            OrchestratorSession::new(&cwd_string)
-        } else {
-            // a session file the dead monitor left is still the conversation
-            session::load(&self.options.fleet_dir)
-                .unwrap_or_else(|| OrchestratorSession::new(&cwd_string))
-        };
+        // The row this console serves; --fresh drops the claude session id
+        // (never the session's own identity).
+        let mut store = session::load(&self.options.fleet_dir).unwrap_or_default();
+        let mut session_record = store
+            .sessions
+            .get(&self.key.uuid)
+            .cloned()
+            .unwrap_or_else(|| OrchestratorSession::new(&cwd_string));
+        if self.options.fresh {
+            session_record.session_id = None;
+        }
         // The model, most specific wins: the explicit option, then the
         // session's persisted launch record (the project layer), then
         // `~/.parl/config.toml`, then claude's own default. The resolved
@@ -499,7 +536,10 @@ impl OrchestratorClient {
             remote_control: remote,
             fresh: Some(self.options.fresh),
         };
-        session::save(&self.options.fleet_dir, &mut session_record)?;
+        // Opening this session makes it the one a reopened console resumes.
+        session_record.last_used_at = crate::util::now_iso();
+        store.upsert(session_record);
+        session::save(&self.options.fleet_dir, &mut store)?;
 
         // The monitor outlives the console: its own process group, streams to
         // the orchestrator log. The child is reaped by a background task —
@@ -513,7 +553,7 @@ impl OrchestratorClient {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(paths.claude_log())
+            .open(paths.claude_log(&self.key))
             .context("cannot open the orchestrator log for the monitor")?;
         let stderr = log
             .try_clone()
@@ -522,6 +562,12 @@ impl OrchestratorClient {
         command
             .args(["orchestrator-monitor", "--fleet-dir"])
             .arg(&self.options.fleet_dir)
+            // The monitor is pinned to this console's session: with N
+            // sessions sharing a fleet, "the most recently used one" would
+            // be a race. The marker also gives the orphan reaper its
+            // session-unique matcher.
+            .args(["--session"])
+            .arg(self.key.uuid.to_string())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(log))
             .stderr(std::process::Stdio::from(stderr));
@@ -575,7 +621,7 @@ mod tests {
             tmp.path().join(".parl"),
             tmp.path().to_path_buf(),
         ));
-        let events = client.paths().orchestrator_events();
+        let events = client.paths().orchestrator_events(&client.key);
         std::fs::create_dir_all(events.parent().unwrap()).unwrap();
         for text in ["one", "two"] {
             crate::util::append_json_line(&events, &record("stream_text", text)).unwrap();
@@ -602,8 +648,12 @@ mod tests {
     fn an_exit_in_a_restored_transcript_is_not_announced() {
         let tmp = tempfile::tempdir().unwrap();
         let fleet = tmp.path().join(".parl");
-        std::fs::create_dir_all(fleet.join("orchestrator")).unwrap();
-        let events = fleet.join("orchestrator/events.jsonl");
+        let client = OrchestratorClient::new(OrchestratorClientOptions::new(
+            fleet,
+            tmp.path().to_path_buf(),
+        ));
+        let events = client.paths().orchestrator_events(&client.key);
+        std::fs::create_dir_all(events.parent().unwrap()).unwrap();
         crate::util::append_json_line(
             &events,
             &crate::orch::records::OrchestratorEvent::Exit {
@@ -614,10 +664,6 @@ mod tests {
         )
         .unwrap();
 
-        let client = OrchestratorClient::new(OrchestratorClientOptions::new(
-            fleet,
-            tmp.path().to_path_buf(),
-        ));
         let mut rx = client.subscribe();
         client.tick();
         // the restored record is replayed...
@@ -656,20 +702,20 @@ mod tests {
     fn pending_requests_are_reannounced_to_a_console_that_attaches_later() {
         let tmp = tempfile::tempdir().unwrap();
         let fleet = tmp.path().join(".parl");
-        std::fs::create_dir_all(fleet.join("orchestrator")).unwrap();
+        let client = OrchestratorClient::new(OrchestratorClientOptions::new(
+            fleet.clone(),
+            tmp.path().to_path_buf(),
+        ));
         let mut state = crate::orch::records::new_orchestrator_state("/repo");
         state.pending_requests = vec![crate::orch::protocol::PermissionRequest {
             request_id: "req_1".into(),
             request: crate::orch::protocol::CanUseToolRequest::default(),
             received_at: crate::util::now_iso(),
         }];
-        crate::util::atomic_write_json(&FleetPaths::new(&fleet).orchestrator_state(), &state)
+        std::fs::create_dir_all(client.paths().orchestrator_dir(&client.key)).unwrap();
+        crate::util::atomic_write_json(&client.paths().orchestrator_state(&client.key), &state)
             .unwrap();
 
-        let client = OrchestratorClient::new(OrchestratorClientOptions::new(
-            fleet.clone(),
-            tmp.path().to_path_buf(),
-        ));
         client.tick(); // nothing subscribed: the request stays unannounced
         let mut rx = client.subscribe();
         client.tick();
@@ -684,7 +730,7 @@ mod tests {
         assert_eq!(announced.request_id, "req_1");
         // answered (removed from state): the announced id is pruned
         state.pending_requests.clear();
-        atomic_write_json(&FleetPaths::new(&fleet).orchestrator_state(), &state).unwrap();
+        atomic_write_json(&client.paths().orchestrator_state(&client.key), &state).unwrap();
         client.tick();
         client.tick();
         // no duplicate announcements for the same request
@@ -738,7 +784,6 @@ mod tests {
     async fn spawn_monitor_records_the_most_specific_orchestrator_model() {
         let tmp = tempfile::tempdir().unwrap();
         let fleet = tmp.path().join(".parl");
-        std::fs::create_dir_all(fleet.join("orchestrator")).unwrap();
         let user_root = tmp.path().join("user");
         let user_dir = user_root.join(".parl");
         std::fs::create_dir_all(&user_dir).unwrap();
@@ -750,28 +795,35 @@ mod tests {
         let user = Some(user_dir.as_path());
 
         // A persisted launch record (the per-project layer) beats the config.
+        let mut store = crate::orch::session::FleetSessions::new();
         let mut record = crate::orch::session::OrchestratorSession::new("/repo");
         record.launch.model = Some("sonnet".into());
-        crate::orch::session::save(&fleet, &mut record).unwrap();
+        let record_uuid = record.uuid;
+        store.upsert(record);
+        crate::orch::session::save(&fleet, &mut store).unwrap();
         let client = monitor_client(&fleet, user, None);
         client.spawn_monitor().unwrap();
-        let session = crate::orch::session::load(&fleet).unwrap();
+        let store = crate::orch::session::load(&fleet).unwrap();
+        let session = &store.sessions[&client.key.uuid];
         assert_eq!(session.launch.model.as_deref(), Some("sonnet"));
+        // The console serves the persisted session, not a fresh one.
+        assert_eq!(client.key.uuid, record_uuid);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // An explicit option beats everything.
         let client = monitor_client(&fleet, user, Some("haiku"));
         client.spawn_monitor().unwrap();
-        let session = crate::orch::session::load(&fleet).unwrap();
+        let store = crate::orch::session::load(&fleet).unwrap();
+        let session = &store.sessions[&client.key.uuid];
         assert_eq!(session.launch.model.as_deref(), Some("haiku"));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Nothing persisted anywhere else: the config supplies the default.
         let fresh = tmp.path().join(".parl-2");
-        std::fs::create_dir_all(fresh.join("orchestrator")).unwrap();
         let client = monitor_client(&fresh, user, None);
         client.spawn_monitor().unwrap();
-        let session = crate::orch::session::load(&fresh).unwrap();
+        let store = crate::orch::session::load(&fresh).unwrap();
+        let session = &store.sessions[&client.key.uuid];
         assert_eq!(session.launch.model.as_deref(), Some("claude-fable-5"));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }

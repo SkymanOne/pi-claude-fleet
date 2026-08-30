@@ -387,6 +387,29 @@ pub async fn cleanup_runs(
     let mut err: Vec<String> = Vec::new();
     let mut data = CleanupData::default();
     let mut failed_any = false;
+    // A whole-fleet sweep is legitimate, but crossing sessions is said out
+    // loud: runs owned by other orchestrator sessions are not this session's
+    // to tidy silently. The acting session's own set is the fold-in view
+    // (the default session inherits the unowned legacy runs).
+    if all {
+        let session = super::acting_session(fleet_dir);
+        let mine: std::collections::HashSet<String> =
+            super::runs_for_acting_session(fleet_dir, session)
+                .into_iter()
+                .map(|r| r.run_id)
+                .collect();
+        let foreign = targets
+            .iter()
+            .filter(|t| t.state.status != RunStatus::Archived)
+            .filter(|t| !mine.contains(&t.run_id))
+            .count();
+        if foreign > 0 {
+            out.push(format!(
+                "cleanup all: note — the sweep also covers {foreign} run(s) owned by other \
+orchestrator session(s)"
+            ));
+        }
+    }
     for target in targets {
         match cleanup_one(&target, force, all).await {
             CleanupOutcome::AlreadyArchived => {
@@ -538,11 +561,16 @@ inspect or commit them, or use --force to discard."
 /// Send the abort envelope and wait (up to [`CLEANUP_ABORT_WAIT_MS`]) for
 /// the run to be terminal *and* its monitor gone — the monitor's final
 /// flush must not race the archive write. `true` when it stopped in time.
+/// The abort's provenance is the fleet's acting session, like every other
+/// orchestrator-originated steering.
 async fn abort_and_wait(target: &RunRef) -> bool {
     let paths = run::fleet_paths_of(&target.state);
     append_envelope(
         &paths.run_inbox(&target.run_id),
-        &Envelope::abort(Party::Orchestrator, Party::worker(&target.run_id)),
+        &Envelope::abort(
+            Party::Orchestrator(super::acting_session(paths.root())),
+            target.worker_party(),
+        ),
     )
     .ok();
     let start = std::time::Instant::now();
@@ -1059,5 +1087,81 @@ mod tests {
         assert!(err.to_string().contains("No run found"), "{err}");
         let err = cleanup_runs(&fleet, "  ", false).await.unwrap_err();
         assert_eq!(err.to_string(), "cleanup: <name|all> required");
+    }
+
+    #[tokio::test]
+    async fn cleanup_all_says_when_it_crosses_sessions() {
+        let dir = init_repo("parl-int-xsession-");
+        let (fleet, mine) = make_run(&dir, "mine", false).await;
+        settle(&mine.run_dir);
+        let (_, theirs) = make_run(&dir, "theirs", false).await;
+        // The second run belongs to another orchestrator session.
+        let mut state = run::load_state(&theirs.run_dir).unwrap();
+        state.orchestrator_id =
+            Some(uuid::Uuid::parse_str("9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c").unwrap());
+        run::save_state(&theirs.run_dir, &state).unwrap();
+        settle(&theirs.run_dir);
+
+        // The whole-fleet sweep is still legitimate, but it says out loud
+        // that it crosses sessions.
+        let all = cleanup_runs(&fleet, "all", false).await.unwrap();
+        assert_eq!(all.code, ExitCode::Ok, "{:?}", all.err);
+        assert!(
+            all.out
+                .iter()
+                .any(|l| l.contains("also covers 1 run(s) owned by other")),
+            "{:?}",
+            all.out
+        );
+        assert_eq!(all.data.archived.len(), 2, "both runs are still cleaned");
+        // A fleet where everything is this session's gets no note (the
+        // default-session fold includes the unowned legacy runs).
+        let (_f2, own) = make_run(&dir, "own2", false).await;
+        settle(&own.run_dir);
+        let again = cleanup_runs(&fleet, "all", false).await.unwrap();
+        assert!(
+            !again.out.iter().any(|l| l.contains("also covers")),
+            "no foreign runs left: {:?}",
+            again.out
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_force_abort_carries_the_acting_session_provenance() {
+        let dir = init_repo("parl-int-abortparty-");
+        let (fleet, target) = make_run(&dir, "slowp", false).await;
+        let mut state = run::load_state(&target.run_dir).unwrap();
+        state.status = RunStatus::Running;
+        state.pid = Some(std::process::id().cast_signed());
+        run::save_state(&target.run_dir, &state).unwrap();
+        let tardy = target.run_dir.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if let Ok(mut s) = run::load_state(&tardy) {
+                s.status = RunStatus::Stopped;
+                s.pid = None;
+                run::save_state(&tardy, &s).unwrap();
+            }
+        });
+
+        let forced = cleanup_runs(&fleet, "slowp", true).await.unwrap();
+        assert_eq!(forced.code, ExitCode::Ok, "{:?}", forced.err);
+        // The abort envelope is attributed to the fleet's acting session —
+        // the default session when fleet.json names none, like every other
+        // orchestrator-originated steering.
+        let raw = std::fs::read_to_string(
+            crate::paths::FleetPaths::new(&fleet).run_inbox(&target.run_id),
+        )
+        .unwrap();
+        let envelopes: Vec<Envelope> = raw
+            .lines()
+            .filter(|l| !l.is_empty())
+            .filter_map(Envelope::parse_line)
+            .collect();
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(
+            envelopes[0].from,
+            Party::Orchestrator(crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION)
+        );
     }
 }

@@ -161,8 +161,8 @@ async fn dispatch(cli: Cli) -> std::process::ExitCode {
         Some(Command::Monitor { fleet_dir, run }) => {
             finish(worker::monitor::run_monitor(&fleet_dir, &run).await)
         }
-        Some(Command::OrchestratorMonitor { fleet_dir }) => {
-            finish(orch::monitor::run_orchestrator_monitor(&fleet_dir).await)
+        Some(Command::OrchestratorMonitor { fleet_dir, session }) => {
+            finish(orch::monitor::run_orchestrator_monitor(&fleet_dir, session).await)
         }
     }
 }

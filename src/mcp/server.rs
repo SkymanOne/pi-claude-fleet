@@ -129,6 +129,21 @@ impl FleetServer {
             .or_else(crate::ops::ambient_parl_dir)
     }
 
+    /// The party steering runs under: the fleet's acting session — resolved
+    /// from the same `cwd`/`$PARL_DIR` every tool call uses, so the
+    /// envelope never parts company with the ownership bookkeeping — or the
+    /// default orchestrator session when the fleet has no session rows yet.
+    /// The default's on-wire spelling is the bare `"orchestrator"` the
+    /// tools have always written.
+    async fn tool_party(&self) -> Party {
+        let fleet =
+            crate::ops::resolve_fleet_dir_with_env(self.cwd(), self.parl_dir().as_deref()).await;
+        let session = fleet
+            .ok()
+            .map(|f| crate::ops::acting_session(f.paths.root()));
+        Party::Orchestrator(session.unwrap_or(crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION))
+    }
+
     /// Route one `tools/call` to its ops core. Argument problems and unknown
     /// tools are protocol errors; everything the core itself refused comes
     /// back as a tool result with its exit code.
@@ -233,7 +248,7 @@ impl FleetServer {
             &name,
             self.cwd(),
             &message,
-            Party::Orchestrator,
+            self.tool_party().await,
             self.parl_dir().as_deref(),
         )
         .await
@@ -250,7 +265,7 @@ impl FleetServer {
             &name,
             self.cwd(),
             &message,
-            Party::Orchestrator,
+            self.tool_party().await,
             self.parl_dir().as_deref(),
         )
         .await
@@ -269,7 +284,7 @@ impl FleetServer {
             self.cwd(),
             question_id.as_deref(),
             &answer,
-            Party::Orchestrator,
+            self.tool_party().await,
             self.parl_dir().as_deref(),
         )
         .await
@@ -284,7 +299,7 @@ impl FleetServer {
         match stop_core_with_env(
             &name,
             self.cwd(),
-            Party::Orchestrator,
+            self.tool_party().await,
             self.parl_dir().as_deref(),
         )
         .await
@@ -422,7 +437,9 @@ fn spawn_status_tools() -> Vec<Tool> {
             "Spawn a pi worker",
             "Start a headless pi worker on a task brief. By default it works on its own git worktree and branch; \
              set worktree=false for read-only steps (research, review). The brief must be self-contained: the worker \
-             sees nothing else. Returns the run id; fleet events arrive as the run progresses. exit 0 on success.",
+             sees nothing else. Returns the run id; fleet events arrive as the run progresses. Each orchestrator \
+             session may hold at most [limits] max_workers_per_session live workers (default 3); exit 1 with the \
+             holders named when this session is at its cap. exit 0 on success.",
             properties([
                 (
                     "name",
@@ -474,13 +491,18 @@ fn spawn_status_tools() -> Vec<Tool> {
             "Fleet status",
             "The fleet table (name, state, last activity, last tool, steer count, age), or one run's full state with \
              name. States: starting, running, blocked (waiting on a fleet_answer question or a pi dialog), settled, \
-             stopped, error, dead, archived. Events are pushed to you as they happen; do not poll this in a loop.",
+             stopped, error, dead, archived. The table shows this session's runs; all=true is the whole-fleet \
+             diagnostic view (every session's runs, archived included). Events are pushed to you as they happen; do \
+             not poll this in a loop.",
             properties([
                 (
                     "name",
                     string_prop("Run name for the full state of one run"),
                 ),
-                ("all", bool_prop("Include archived runs")),
+                (
+                    "all",
+                    bool_prop("Include archived runs and other sessions' runs (whole-fleet view)"),
+                ),
             ]),
             &[],
             Some(object_schema([(
@@ -656,7 +678,8 @@ fn integration_tools() -> Vec<Tool> {
             "Clean up runs",
             "Remove a finished run's worktree and branch and archive it (reports and events are kept). target is a \
              run name or 'all'. force discards unmerged branches and uncommitted changes; running workers are \
-             aborted only when named explicitly — 'all' always skips them.",
+             aborted only when named explicitly — 'all' always skips them. 'all' sweeps the whole fleet and says so \
+             when it includes runs owned by other orchestrator sessions.",
             properties([
                 ("target", string_prop("Run name or id, or 'all'")),
                 (
@@ -873,6 +896,40 @@ mod tests {
             Some(ContentBlock::Text(text)) => text.text.clone(),
             other => panic!("expected one text block, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn tool_party_is_the_fleets_acting_session_or_the_default() {
+        let cwd = std::env::temp_dir().join(format!(
+            "parl-mcp-party-cwd-{}-{}",
+            std::process::id(),
+            crate::util::new_id("t").replace('_', "")
+        ));
+        let fleet = std::env::temp_dir().join(format!(
+            "parl-mcp-party-{}-{}",
+            std::process::id(),
+            crate::util::new_id("t").replace('_', "")
+        ));
+        for dir in [&cwd, &fleet] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // No fleet.json: the default session, spelled "orchestrator".
+        let server = FleetServer::with_parl_dir(
+            Some(cwd.clone()),
+            Some(fleet.to_string_lossy().into_owned()),
+        );
+        assert_eq!(
+            server.tool_party().await,
+            Party::Orchestrator(crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION)
+        );
+        // With fleet.json, the acting session is its last-used row.
+        let mut store = crate::orch::session::FleetSessions::new();
+        store.upsert(crate::orch::session::OrchestratorSession::new("/repo"));
+        let session = store.last_used().unwrap().uuid;
+        crate::orch::session::save(&fleet, &mut store).unwrap();
+        let server =
+            FleetServer::with_parl_dir(Some(cwd), Some(fleet.to_string_lossy().into_owned()));
+        assert_eq!(server.tool_party().await, Party::Orchestrator(session));
     }
 
     #[test]

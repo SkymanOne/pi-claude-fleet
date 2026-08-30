@@ -118,8 +118,14 @@ async fn wait_event(
     }
 }
 
+fn session_key(fleet_dir: &Path) -> parl::paths::SessionKey {
+    parl::orch::session::resolve_session(fleet_dir)
+        .expect("the monitor writes a session row")
+        .key()
+}
+
 fn state_of(fleet_dir: &Path) -> Option<parl::orch::records::OrchestratorState> {
-    load_orchestrator_state(fleet_dir)
+    load_orchestrator_state(fleet_dir, &session_key(fleet_dir))
 }
 
 fn monitor_pid(fleet_dir: &Path) -> Option<i32> {
@@ -128,8 +134,10 @@ fn monitor_pid(fleet_dir: &Path) -> Option<i32> {
 
 /// The parsed transcript records, oldest first.
 fn transcript_of(fleet_dir: &Path) -> Vec<EventRecord> {
-    let raw = std::fs::read_to_string(FleetPaths::new(fleet_dir).orchestrator_events())
-        .unwrap_or_default();
+    let raw = std::fs::read_to_string(
+        FleetPaths::new(fleet_dir).orchestrator_events(&session_key(fleet_dir)),
+    )
+    .unwrap_or_default();
     raw.lines()
         .filter(|line| !line.is_empty())
         .filter_map(|line| serde_json::from_str::<EventRecord>(line).ok())

@@ -6,17 +6,66 @@
 
 use std::path::{Path, PathBuf};
 
+use uuid::Uuid;
+
+use crate::util::short_uuid;
+
 /// The fleet's state directory, created under the repository root.
 pub const STATE_DIR_NAME: &str = ".parl";
 /// Prefix for every environment variable this tool reads (`PARL_DIR`, …).
 pub const ENV_PREFIX: &str = "PARL";
 /// The command name users type; used in help text, hints, and the prompt.
 pub const BIN_NAME: &str = "parl";
+/// The fleet-level pi catalogue (`availableModels` + `commands`): a property
+/// of the pi installation, byte-identical across runs, so it lives once
+/// here instead of being copied into every `run.json`.
+pub const PI_CACHE_FILE: &str = "pi-cache.json";
 
 /// Env-var name from its suffix: `_DIR` -> `PARL_DIR`.
 #[must_use]
 pub fn env_var(suffix: &str) -> String {
     format!("{ENV_PREFIX}_{suffix}")
+}
+
+/// The key naming one orchestrator session's directory under
+/// `orchestrators/`: `<alias|-default>-<short-uuid>`. A session's alias is
+/// optional (a later stage derives it from the session's first prompt), so
+/// the directory falls back to `default` — the name must stay readable in
+/// `ls` either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionKey {
+    pub alias: Option<String>,
+    pub uuid: Uuid,
+}
+
+impl SessionKey {
+    /// A key for a session with `alias` (may be `None`) and `uuid`.
+    #[must_use]
+    pub fn new(alias: Option<String>, uuid: Uuid) -> Self {
+        Self { alias, uuid }
+    }
+
+    /// `orchestrators/<alias>-<short-uuid>`: the sanitized alias (or
+    /// `default`) plus the last 7 hex chars of the uuid.
+    #[must_use]
+    pub fn dir_name(&self) -> String {
+        let alias = self
+            .alias
+            .as_deref()
+            .map(crate::util::sanitize_name)
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| "default".to_string());
+        format!("{alias}-{}", short_uuid(&self.uuid))
+    }
+}
+
+impl Default for SessionKey {
+    fn default() -> Self {
+        Self {
+            alias: None,
+            uuid: crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION,
+        }
+    }
 }
 
 /// Resolved `.parl` layout for one fleet.
@@ -61,36 +110,54 @@ impl FleetPaths {
         self.root.join("fleet.json")
     }
 
+    /// `pi-cache.json` — the fleet-level pi catalogue (models + commands),
+    /// written by a worker monitor at boot and read back through run state
+    /// loading so the console needs no other source.
+    pub fn pi_cache(&self) -> PathBuf {
+        self.root.join(PI_CACHE_FILE)
+    }
+
     /// `console.lock` — single-instance lock for the TUI.
     pub fn console_lock(&self) -> PathBuf {
         self.root.join("console.lock")
     }
 
-    /// `orchestrator/`.
-    pub fn orchestrator_dir(&self) -> PathBuf {
-        self.root.join("orchestrator")
+    /// `orchestrators/` — the per-session parent.
+    pub fn orchestrators_dir(&self) -> PathBuf {
+        self.root.join("orchestrators")
     }
 
-    /// `orchestrator/state.json` — monitor pid, session id, model, commands,
-    /// cost, turns, activity, pending permission.
-    pub fn orchestrator_state(&self) -> PathBuf {
-        self.orchestrator_dir().join("state.json")
+    /// `orchestrators/<alias>-<short-uuid>/` — one session's whole state:
+    /// `state.json`, `events.jsonl`, `inbox.jsonl`, `claude.log`, `prompt.md`.
+    pub fn orchestrator_dir(&self, key: &SessionKey) -> PathBuf {
+        self.orchestrators_dir().join(key.dir_name())
     }
 
-    /// `orchestrator/events.jsonl` — the orchestrator transcript.
-    pub fn orchestrator_events(&self) -> PathBuf {
-        self.orchestrator_dir().join("events.jsonl")
+    /// `orchestrators/<key>/state.json` — monitor pid, session id, model,
+    /// commands, cost, turns, activity, pending permission.
+    pub fn orchestrator_state(&self, key: &SessionKey) -> PathBuf {
+        self.orchestrator_dir(key).join("state.json")
     }
 
-    /// `orchestrator/inbox.jsonl` — console -> monitor.
-    pub fn orchestrator_inbox(&self) -> PathBuf {
-        self.orchestrator_dir().join("inbox.jsonl")
+    /// `orchestrators/<key>/events.jsonl` — the orchestrator transcript.
+    pub fn orchestrator_events(&self, key: &SessionKey) -> PathBuf {
+        self.orchestrator_dir(key).join("events.jsonl")
     }
 
-    /// `orchestrator/claude.log` — raw protocol both directions, plus the
-    /// monitor's own diagnostics.
-    pub fn claude_log(&self) -> PathBuf {
-        self.orchestrator_dir().join("claude.log")
+    /// `orchestrators/<key>/inbox.jsonl` — console -> monitor.
+    pub fn orchestrator_inbox(&self, key: &SessionKey) -> PathBuf {
+        self.orchestrator_dir(key).join("inbox.jsonl")
+    }
+
+    /// `orchestrators/<key>/claude.log` — raw protocol both directions, plus
+    /// the monitor's own diagnostics.
+    pub fn claude_log(&self, key: &SessionKey) -> PathBuf {
+        self.orchestrator_dir(key).join("claude.log")
+    }
+
+    /// `orchestrators/<key>/prompt.md` — the rendered orchestrator prompt.
+    pub fn orchestrator_prompt(&self, key: &SessionKey) -> PathBuf {
+        self.orchestrator_dir(key).join("prompt.md")
     }
 
     /// `runs/`.
@@ -162,8 +229,10 @@ impl FleetPaths {
     /// Create the layout and make sure git ignores it.
     ///
     /// Returns whether the `.gitignore` gained an entry. Subdirectories
-    /// (`runs/`, `orchestrator/`) are created here too: they are part of the
-    /// fixed layout and callers otherwise race to make them.
+    /// (`runs/`, `orchestrators/`) are created here too: they are part of the
+    /// fixed layout and callers otherwise race to make them. Per-session
+    /// directories under `orchestrators/` are created lazily, once a session
+    /// exists.
     ///
     /// # Errors
     ///
@@ -172,7 +241,7 @@ impl FleetPaths {
     pub fn ensure(&self) -> std::io::Result<bool> {
         std::fs::create_dir_all(&self.root)?;
         std::fs::create_dir_all(self.runs_dir())?;
-        std::fs::create_dir_all(self.orchestrator_dir())?;
+        std::fs::create_dir_all(self.orchestrators_dir())?;
         ensure_gitignore_entry(&git_root_of(&self.root), &format!("{STATE_DIR_NAME}/"))
     }
 }
@@ -229,6 +298,8 @@ pub struct UserConfig {
     pub orchestrator: OrchestratorConfig,
     /// Defaults for workers.
     pub worker: WorkerConfig,
+    /// Fleet-wide limits.
+    pub limits: LimitsConfig,
 }
 
 /// The `[orchestrator]` section.
@@ -250,6 +321,33 @@ pub struct WorkerConfig {
     pub provider: Option<String>,
 }
 
+/// The default per-session worker cap when `[limits] max_workers_per_session`
+/// is absent from the user config: the same number the orchestrator prompt
+/// substitutes as `MAX_WORKERS`, so the prompt's advice and the enforced
+/// refusal agree.
+pub const DEFAULT_MAX_WORKERS_PER_SESSION: usize = 3;
+
+/// The `[limits]` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// How many live (non-terminal) workers one orchestrator session may
+    /// have at once; `None` means the default. An enforced cap: `spawn`
+    /// refuses once a session's live runs reach this number.
+    pub max_workers_per_session: Option<usize>,
+}
+
+impl LimitsConfig {
+    /// The per-session worker cap: the configured value, or
+    /// [`DEFAULT_MAX_WORKERS_PER_SESSION`] when absent. Zero deliberately
+    /// means "no spawning allowed", never "unlimited".
+    #[must_use]
+    pub fn max_workers_per_session(&self) -> usize {
+        self.max_workers_per_session
+            .unwrap_or(DEFAULT_MAX_WORKERS_PER_SESSION)
+    }
+}
+
 impl UserConfig {
     /// The worker model, most specific wins: the explicit argument, then
     /// the config's `[worker] model`, then `None` (let pi decide).
@@ -262,6 +360,12 @@ impl UserConfig {
     #[must_use]
     pub fn worker_provider<'a>(&'a self, explicit: Option<&'a str>) -> Option<&'a str> {
         explicit.or(self.worker.provider.as_deref())
+    }
+
+    /// The per-session worker cap, resolved from the `[limits]` section.
+    #[must_use]
+    pub fn max_workers_per_session(&self) -> usize {
+        self.limits.max_workers_per_session()
     }
 
     /// The orchestrator model, most specific wins: the explicit argument,
@@ -371,6 +475,9 @@ mod tests {
     #[test]
     fn layout_paths_are_derived_from_the_root() {
         let paths = FleetPaths::new("/repo/x/.parl");
+        let uuid = uuid::Uuid::parse_str("9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c").unwrap();
+        let key = SessionKey::new(Some("s0".into()), uuid);
+        let default_key = SessionKey::default();
         assert_eq!(paths.root(), Path::new("/repo/x/.parl"));
         assert_eq!(
             paths.fleet_json(),
@@ -381,32 +488,55 @@ mod tests {
             PathBuf::from("/repo/x/.parl/console.lock")
         );
         assert_eq!(
-            paths.orchestrator_state(),
-            PathBuf::from("/repo/x/.parl/orchestrator/state.json")
+            paths.orchestrators_dir(),
+            PathBuf::from("/repo/x/.parl/orchestrators")
+        );
+        // A session's whole state sits in its own alias-prefixed directory.
+        assert_eq!(key.dir_name(), "s0-f7a8b9c");
+        assert_eq!(
+            paths.orchestrator_dir(&key),
+            PathBuf::from("/repo/x/.parl/orchestrators/s0-f7a8b9c")
         );
         assert_eq!(
-            paths.orchestrator_inbox(),
-            PathBuf::from("/repo/x/.parl/orchestrator/inbox.jsonl")
+            paths.orchestrator_state(&key),
+            PathBuf::from("/repo/x/.parl/orchestrators/s0-f7a8b9c/state.json")
         );
         assert_eq!(
-            paths.claude_log(),
-            PathBuf::from("/repo/x/.parl/orchestrator/claude.log")
+            paths.orchestrator_events(&key),
+            PathBuf::from("/repo/x/.parl/orchestrators/s0-f7a8b9c/events.jsonl")
         );
         assert_eq!(
-            paths.run_json("a-20260828141530"),
-            PathBuf::from("/repo/x/.parl/runs/a-20260828141530/run.json")
+            paths.orchestrator_inbox(&key),
+            PathBuf::from("/repo/x/.parl/orchestrators/s0-f7a8b9c/inbox.jsonl")
         );
         assert_eq!(
-            paths.run_report("a-20260828141530"),
-            PathBuf::from("/repo/x/.parl/runs/a-20260828141530/report.md")
+            paths.claude_log(&key),
+            PathBuf::from("/repo/x/.parl/orchestrators/s0-f7a8b9c/claude.log")
         );
         assert_eq!(
-            paths.pi_log("a-20260828141530"),
-            PathBuf::from("/repo/x/.parl/runs/a-20260828141530/pi.log")
+            paths.orchestrator_prompt(&key),
+            PathBuf::from("/repo/x/.parl/orchestrators/s0-f7a8b9c/prompt.md")
+        );
+        // An alias-less session dirs as `default-<short-uuid>`; the alias is
+        // sanitized before it reaches the filesystem.
+        assert_eq!(default_key.dir_name(), "default-0000000");
+        let noisy = SessionKey::new(Some("My Session!".into()), uuid);
+        assert_eq!(noisy.dir_name(), "my-session-f7a8b9c");
+        assert_eq!(
+            paths.run_json("a-1f2e3d4"),
+            PathBuf::from("/repo/x/.parl/runs/a-1f2e3d4/run.json")
         );
         assert_eq!(
-            paths.run_session_dir("a-20260828141530"),
-            PathBuf::from("/repo/x/.parl/runs/a-20260828141530/session")
+            paths.run_report("a-1f2e3d4"),
+            PathBuf::from("/repo/x/.parl/runs/a-1f2e3d4/report.md")
+        );
+        assert_eq!(
+            paths.pi_log("a-1f2e3d4"),
+            PathBuf::from("/repo/x/.parl/runs/a-1f2e3d4/pi.log")
+        );
+        assert_eq!(
+            paths.run_session_dir("a-1f2e3d4"),
+            PathBuf::from("/repo/x/.parl/runs/a-1f2e3d4/session")
         );
         assert_eq!(
             paths.pi_extension(),
@@ -495,6 +625,63 @@ mod tests {
     }
 
     #[test]
+    fn user_config_reads_the_limits_section_and_defaults_the_cap() {
+        let tmp = tmp_dir("parl-cfg-limits-");
+        // No file, an empty file, and a file with other sections alone all
+        // read as the default cap.
+        assert_eq!(
+            load_user_config(Some(&tmp)).unwrap().limits,
+            LimitsConfig::default()
+        );
+        assert_eq!(
+            load_user_config(Some(&tmp))
+                .unwrap()
+                .max_workers_per_session(),
+            DEFAULT_MAX_WORKERS_PER_SESSION
+        );
+        write_config(&tmp, "");
+        assert_eq!(
+            load_user_config(Some(&tmp))
+                .unwrap()
+                .max_workers_per_session(),
+            DEFAULT_MAX_WORKERS_PER_SESSION
+        );
+        write_config(&tmp, "[worker]\nmodel = \"deepseek-v4-flash\"\n");
+        assert_eq!(
+            load_user_config(Some(&tmp))
+                .unwrap()
+                .max_workers_per_session(),
+            DEFAULT_MAX_WORKERS_PER_SESSION
+        );
+        // The configured cap wins; zero is a real value (no spawning allowed).
+        write_config(&tmp, "[limits]\nmax_workers_per_session = 5\n");
+        let config = load_user_config(Some(&tmp)).unwrap();
+        assert_eq!(config.limits.max_workers_per_session, Some(5));
+        assert_eq!(config.max_workers_per_session(), 5);
+        write_config(&tmp, "[limits]\nmax_workers_per_session = 0\n");
+        assert_eq!(
+            load_user_config(Some(&tmp))
+                .unwrap()
+                .max_workers_per_session(),
+            0,
+            "zero means no spawning, not unlimited"
+        );
+        // All three sections parse together.
+        write_config(
+            &tmp,
+            "[orchestrator]\nmodel = \"claude-opus-5\"\n\n[worker]\nmodel = \"deepseek-v4-flash\"\n\n[limits]\nmax_workers_per_session = 7\n",
+        );
+        let config = load_user_config(Some(&tmp)).unwrap();
+        assert_eq!(config.orchestrator.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(config.max_workers_per_session(), 7);
+        // A negative cap is not a usize: a malformed config stays a hard
+        // error naming the path, never a silent fallback.
+        write_config(&tmp, "[limits]\nmax_workers_per_session = -1\n");
+        let err = load_user_config(Some(&tmp)).unwrap_err().to_string();
+        assert!(err.contains("config.toml"), "names the file: {err}");
+    }
+
+    #[test]
     fn user_config_parses_both_sections() {
         let tmp = tmp_dir("parl-cfg-full-");
         write_config(
@@ -528,6 +715,9 @@ mod tests {
                 model: Some("deepseek-v4-flash".into()),
                 provider: Some("opencode-go".into()),
             },
+            limits: LimitsConfig {
+                max_workers_per_session: Some(4),
+            },
         };
         // Orchestrator: explicit beats the persisted record beats the config.
         assert_eq!(
@@ -546,10 +736,16 @@ mod tests {
         assert_eq!(config.worker_model(Some("glm-5.3")), Some("glm-5.3"));
         assert_eq!(config.worker_model(None), Some("deepseek-v4-flash"));
         assert_eq!(config.worker_provider(None), Some("opencode-go"));
+        // Limits: the configured cap wins over the default.
+        assert_eq!(config.max_workers_per_session(), 4);
         // Nothing anywhere: the empty config still yields defaults.
         assert_eq!(UserConfig::default().orchestrator_model(None, None), None);
         assert_eq!(UserConfig::default().worker_model(None), None);
         assert_eq!(UserConfig::default().worker_provider(None), None);
+        assert_eq!(
+            UserConfig::default().max_workers_per_session(),
+            DEFAULT_MAX_WORKERS_PER_SESSION
+        );
     }
 
     #[test]
@@ -564,7 +760,14 @@ mod tests {
         assert!(ensure_with_retry(&paths).unwrap());
         assert!(paths.root().is_dir());
         assert!(paths.runs_dir().is_dir());
-        assert!(paths.orchestrator_dir().is_dir());
+        assert!(paths.orchestrators_dir().is_dir());
+        // Per-session directories are created lazily, by whoever owns a key.
+        assert!(
+            paths
+                .orchestrator_dir(&SessionKey::default())
+                .parent()
+                .is_some()
+        );
         let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert!(gitignore.contains("# parl\n.parl/"), "{gitignore}");
         // Second run: already covered, no change.

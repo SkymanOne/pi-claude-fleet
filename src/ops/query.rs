@@ -140,13 +140,23 @@ fn derived_json(state: &run::RunState) -> Value {
     value
 }
 
-/// Every run state under the fleet dir, newest first, optionally keeping
-/// archived rows. Unreadable `run.json` files are skipped.
-fn load_states(fleet_dir: &Path, all: bool) -> Vec<run::RunState> {
+/// Every run state under the fleet dir, newest first, archived included —
+/// the `--all` whole-fleet diagnostic path. Unreadable `run.json` files are
+/// skipped.
+fn load_states(fleet_dir: &Path) -> Vec<run::RunState> {
     run::list_runs(fleet_dir)
         .into_iter()
         .filter_map(|r| run::load_state(&r.run_dir).ok())
-        .filter(|state| all || state.status != RunStatus::Archived)
+        .collect()
+}
+
+/// The acting session's run states, archived hidden: what the fleet view
+/// shows a session of the runs it owns (`--all` is the unfiltered path).
+fn load_session_states(fleet_dir: &Path, session: uuid::Uuid) -> Vec<run::RunState> {
+    super::runs_for_acting_session(fleet_dir, session)
+        .into_iter()
+        .filter_map(|r| run::load_state(&r.run_dir).ok())
+        .filter(|state| state.status != RunStatus::Archived)
         .collect()
 }
 
@@ -197,7 +207,13 @@ pub(crate) async fn status_core_with_env(
             vec![rendered],
         ));
     }
-    let states = load_states(&fleet_dir, all);
+    let states = if all {
+        // `--all` is the whole-fleet diagnostic path: every session's runs,
+        // archived included.
+        load_states(&fleet_dir)
+    } else {
+        load_session_states(&fleet_dir, super::acting_session(&fleet_dir))
+    };
     let runs: Vec<Value> = states.iter().map(derived_json).collect();
     if json {
         let rendered = serde_json::to_string_pretty(&runs)?;
@@ -714,6 +730,75 @@ mod tests {
         state.pid = pid;
         run::save_state(&run_dir, &state).unwrap();
         (dir, paths, run_id.to_string())
+    }
+
+    #[tokio::test]
+    async fn the_fleet_view_shows_the_acting_sessions_runs_and_all_shows_everything() {
+        let dir = tmp_dir("parl-query-scope-");
+        let paths = crate::paths::FleetPaths::new(dir.join(crate::paths::STATE_DIR_NAME));
+        let other = uuid::Uuid::parse_str("9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c").unwrap();
+        let write = |run_id: &str, name: &str, status: RunStatus, owner: Option<uuid::Uuid>| {
+            let run_dir = paths.run_dir(run_id);
+            std::fs::create_dir_all(&run_dir).unwrap();
+            let mut state = RunState::new(
+                paths.root().to_string_lossy().as_ref(),
+                run_id,
+                name,
+                "/tmp/x",
+                "b",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            state.status = status;
+            state.orchestrator_id = owner;
+            run::save_state(&run_dir, &state).unwrap();
+        };
+        // Mine: owned by the (default) session — plus an unowned legacy run
+        // the default session inherits. Theirs: another session's run.
+        write("mine-60828141530", "mine", RunStatus::Settled, None);
+        write("legacy-60828141531", "legacy", RunStatus::Running, None);
+        write(
+            "theirs-60828141532",
+            "theirs",
+            RunStatus::Running,
+            Some(other),
+        );
+        write("old-60828141533", "old", RunStatus::Archived, None);
+
+        // The default session's table: its own + inherited legacy runs,
+        // archived hidden; the other session's run is invisible.
+        let scoped = status_core_with_env(None, Some(&dir), false, false, None)
+            .await
+            .unwrap();
+        let text = scoped.out.join("\n");
+        assert!(text.contains("legacy"), "{text}");
+        assert!(text.contains("mine"), "{text}");
+        assert!(!text.contains("theirs"), "{text}");
+        assert!(!text.contains("old-"), "{text}");
+        // `--all` is the whole-fleet diagnostic path: every session, every
+        // status.
+        let all = status_core_with_env(None, Some(&dir), false, true, None)
+            .await
+            .unwrap();
+        let text = all.out.join("\n");
+        assert!(text.contains("theirs"), "{text}");
+        assert!(text.contains("old") && text.contains("archived"), "{text}");
+        // Named status is by name, fleet-wide: another session's run is
+        // addressable explicitly.
+        let named = status_core_with_env(Some("theirs"), Some(&dir), false, false, None)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&named.out[0]).unwrap();
+        assert_eq!(parsed["name"], "theirs");
     }
 
     #[tokio::test]

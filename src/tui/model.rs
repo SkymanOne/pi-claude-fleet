@@ -6,14 +6,19 @@
 //! the dashboard-and-drill-down console: the old rail's rows *are* the
 //! dashboard's rows, the orchestrator first, then every live worker.
 
+use uuid::Uuid;
+
 use crate::fleet::run::{DerivedView, RunState, derive_view};
 use crate::orch::records::{Activity, ActivityKind};
 use crate::util::{first_line, format_age, parse_ts_ms};
 
-/// Which session a row (and therefore a command) is aimed at.
+/// Which session a row (and therefore a command) is aimed at. The
+/// orchestrator row carries the session it serves — the `Party::Orchestrator`
+/// identity, and the key every console action (`Console.orch_key`) derives
+/// from. The nil uuid is the legacy default session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionTarget {
-    Orchestrator,
+    Orchestrator(Uuid),
     Worker { run_id: String },
 }
 
@@ -23,7 +28,7 @@ impl SessionTarget {
     #[must_use]
     pub fn key(&self) -> &str {
         match self {
-            Self::Orchestrator => "orchestrator",
+            Self::Orchestrator(_) => "orchestrator",
             Self::Worker { run_id } => run_id,
         }
     }
@@ -33,6 +38,21 @@ impl SessionTarget {
     pub const fn is_worker(&self) -> bool {
         matches!(self, Self::Worker { .. })
     }
+}
+
+/// What to call a session in the console: its alias, or — until the
+/// orchestrator derives one from its first prompt — its short uuid. The nil
+/// uuid is the legacy default session, and keeps the old `orchestrator`
+/// spelling.
+#[must_use]
+pub fn session_display_name(alias: Option<&str>, uuid: Uuid) -> String {
+    alias.map(str::to_string).unwrap_or_else(|| {
+        if uuid.is_nil() {
+            "orchestrator".to_string()
+        } else {
+            crate::util::short_uuid(&uuid)
+        }
+    })
 }
 
 /// One dashboard row: a session at a glance — state glyph, name, what it is
@@ -59,12 +79,30 @@ pub struct DashboardRow {
 }
 
 /// The orchestrator's summary, as the console sees it (`OrchestratorState`
-/// plus the approval count the overlay holds).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// plus the approval count the overlay holds, plus the served session's
+/// identity for the row's target and name).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchSummary {
     pub turn_active: bool,
     pub exited: bool,
     pub pending_approvals: usize,
+    /// The session this row stands for; nil on a legacy/default console.
+    pub session_uuid: Uuid,
+    /// The row's name — alias, short uuid, or empty for the legacy
+    /// `orchestrator` spelling.
+    pub session_name: String,
+}
+
+impl Default for OrchSummary {
+    fn default() -> Self {
+        Self {
+            turn_active: false,
+            exited: false,
+            pending_approvals: 0,
+            session_uuid: crate::util::nil_uuid(),
+            session_name: String::new(),
+        }
+    }
 }
 
 /// One worker row's inputs: its state and, when known, its diff stat.
@@ -127,7 +165,9 @@ pub fn worker_detail(state: &RunState, view: DerivedView) -> String {
     }
 }
 
-/// The orchestrator's dashboard row.
+/// The orchestrator's dashboard row. The name is the served session's
+/// alias, its short uuid, or — for the legacy default session — the old
+/// `orchestrator` spelling; the target carries the session uuid.
 #[must_use]
 pub fn orchestrator_row(orch: &OrchSummary) -> DashboardRow {
     let glyph = if orch.exited {
@@ -151,13 +191,18 @@ pub fn orchestrator_row(orch: &OrchSummary) -> DashboardRow {
     } else {
         "idle".to_string()
     };
+    let name = if orch.session_name.is_empty() {
+        "orchestrator".to_string()
+    } else {
+        orch.session_name.clone()
+    };
     DashboardRow {
         key: "orchestrator".to_string(),
         glyph,
-        name: "orchestrator".to_string(),
+        name,
         detail,
         age: String::new(),
-        target: SessionTarget::Orchestrator,
+        target: SessionTarget::Orchestrator(orch.session_uuid),
         attention: orch.pending_approvals > 0 || orch.exited,
         branch: None,
         diff_stat: None,
@@ -301,6 +346,41 @@ mod tests {
         assert_eq!(row.glyph, "!");
         assert_eq!(row.detail, "exited");
         assert!(row.attention);
+    }
+
+    #[test]
+    fn the_orchestrator_row_uses_the_session_name_and_uuid() {
+        let uuid = uuid::Uuid::new_v4();
+        let row = orchestrator_row(&OrchSummary {
+            session_uuid: uuid,
+            session_name: "add-auth".into(),
+            ..OrchSummary::default()
+        });
+        assert_eq!(row.name, "add-auth");
+        assert_eq!(row.target, SessionTarget::Orchestrator(uuid));
+        assert_eq!(row.target.key(), "orchestrator");
+        // the legacy default session keeps the old spelling
+        let row = orchestrator_row(&OrchSummary::default());
+        assert_eq!(row.name, "orchestrator");
+        assert_eq!(
+            row.target,
+            SessionTarget::Orchestrator(crate::util::nil_uuid())
+        );
+    }
+
+    #[test]
+    fn session_display_name_uses_alias_then_short_uuid_then_legacy_spelling() {
+        let uuid = uuid::Uuid::new_v4();
+        assert_eq!(session_display_name(Some("db"), uuid), "db");
+        assert_eq!(
+            session_display_name(None, uuid),
+            crate::util::short_uuid(&uuid),
+            "an alias-less session is shown by its short uuid until one appears"
+        );
+        assert_eq!(
+            session_display_name(None, crate::util::nil_uuid()),
+            "orchestrator"
+        );
     }
 
     #[test]

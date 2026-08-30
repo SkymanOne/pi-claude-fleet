@@ -21,15 +21,14 @@ use serde_json::{Map, Value};
 
 use crate::fleet::envelope::{Envelope, Party};
 use crate::orch::protocol::{AgentCommand, CanUseToolRequest, McpServerStatus, PermissionRequest};
+use crate::paths::SessionKey;
 use crate::util::{append_json_line, now_iso};
 
 /// The rendered orchestrator prompt handed to `--append-system-prompt-file`:
-/// `<fleetDir>/orchestrator/prompt.md`.
+/// `<fleetDir>/orchestrators/<key>/prompt.md`.
 #[must_use]
-pub fn prompt_path(fleet_dir: &Path) -> PathBuf {
-    crate::paths::FleetPaths::new(fleet_dir)
-        .orchestrator_dir()
-        .join("prompt.md")
+pub fn prompt_path(fleet_dir: &Path, key: &SessionKey) -> PathBuf {
+    crate::paths::FleetPaths::new(fleet_dir).orchestrator_prompt(key)
 }
 
 /// What the orchestrator is doing right now: reasoning, writing, or in a tool.
@@ -150,18 +149,27 @@ impl OrchestratorCommand {
     }
 
     /// Wrap this command as an envelope from `from` to the orchestrator.
+    /// Addresses the default session: the inbox file it lands in is the
+    /// session's own, and the monitor accepts any orchestrator party.
     #[must_use]
     pub fn to_envelope(&self, from: Party) -> Envelope {
         let (kind, payload) = self.payload();
-        Envelope::new(from, Party::Orchestrator, &kind, payload)
+        Envelope::new(
+            from,
+            Party::Orchestrator(crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION),
+            &kind,
+            payload,
+        )
     }
 }
 
-/// Decode a mailbox envelope into a command. Only envelopes addressed to the
-/// orchestrator decode; unknown types yield `None`.
+/// Decode a mailbox envelope into a command. Only envelopes addressed to
+/// the orchestrator decode; unknown types yield `None`. Any orchestrator
+/// party counts — a session's own line and a legacy bare `"orchestrator"`
+/// line land in the same physical inbox file.
 #[must_use]
 pub fn decode_command(envelope: &Envelope) -> Option<OrchestratorCommand> {
-    if envelope.to != Party::Orchestrator {
+    if !matches!(envelope.to, Party::Orchestrator(_)) {
         return None;
     }
     OrchestratorCommand::decode(&envelope.kind, &envelope.payload)
@@ -500,10 +508,14 @@ mod tests {
     }
 
     #[test]
-    fn prompt_path_sits_under_the_orchestrator_dir() {
+    fn prompt_path_sits_under_the_orchestrators_dir() {
+        let key = crate::paths::SessionKey::new(
+            Some("s0".into()),
+            uuid::Uuid::parse_str("9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c").unwrap(),
+        );
         assert_eq!(
-            prompt_path(Path::new("/repo/.parl")),
-            PathBuf::from("/repo/.parl/orchestrator/prompt.md")
+            prompt_path(Path::new("/repo/.parl"), &key),
+            PathBuf::from("/repo/.parl/orchestrators/s0-f7a8b9c/prompt.md")
         );
     }
 
@@ -549,7 +561,10 @@ mod tests {
         ];
         for command in &commands {
             let envelope = command.to_envelope(Party::Console);
-            assert_eq!(envelope.to, Party::Orchestrator);
+            assert_eq!(
+                envelope.to,
+                Party::Orchestrator(crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION)
+            );
             assert!(envelope.id.starts_with("m_"));
             let line = serde_json::to_string(&envelope).unwrap();
             let parsed = Envelope::parse_line(&line).unwrap();

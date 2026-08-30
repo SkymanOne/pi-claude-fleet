@@ -29,8 +29,9 @@ use tokio::time::MissedTickBehavior;
 
 use crate::cli::ExitCode;
 use crate::orch::records::{EventRecord, OrchestratorState};
+use crate::orch::session::{self, OrchestratorSession};
 use crate::orch::watcher::{FleetWatcher, FleetWatcherOptions};
-use crate::paths::FleetPaths;
+use crate::paths::{FleetPaths, SessionKey};
 use crate::tui::app::{Console, Effect, RunEntry, TuiOptions};
 use crate::tui::completions::list_repo_files;
 use crate::tui::theme::Palette;
@@ -167,12 +168,39 @@ fn write_lock(path: &Path) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 // Feeds: what `.parl` says, folded into the state machine
 
+/// The session this console serves: the most recently used one, or — on a
+/// fleet without a store yet — a fresh row this console writes under the
+/// store's lock (the monitor boots into the most recently used, which that
+/// row now is). A store this code cannot parse is left alone, and the
+/// default session key is used read-only: nothing a console does may clobber
+/// a newer writer's store.
+#[must_use]
+pub(crate) fn resolve_console_key(fleet: &FleetPaths) -> SessionKey {
+    let store = session::load(fleet.root()).unwrap_or_default();
+    match store.last_used() {
+        Some(record) => record.key(),
+        None if !fleet.fleet_json().exists() => {
+            let record = OrchestratorSession::new(&repo_cwd(fleet));
+            let key = record.key();
+            let fleet_dir = fleet.root().to_path_buf();
+            let _ = crate::orch::session::with_store_mutation(&fleet_dir, |store| {
+                store.upsert(record);
+            });
+            key
+        }
+        None => SessionKey::default(),
+    }
+}
+
 /// The runtime's polled view of `.parl`, kept beside the `Console`: the
 /// renderer reads the orchestrator state and run entries directly (they carry
 /// the permission mode, pending approvals and worker facts the status line
 /// needs), while the `Console` gets the same facts through its feeds.
 struct Poll {
     fleet: FleetPaths,
+    /// The session this console serves; every `orchestrators/` read derives
+    /// from it.
+    key: SessionKey,
     runs: Vec<RunEntry>,
     orch: OrchestratorState,
     orch_offset: u64,
@@ -189,9 +217,10 @@ struct Poll {
 }
 
 impl Poll {
-    fn new(fleet: FleetPaths, watcher: FleetWatcher) -> Self {
+    fn new(fleet: FleetPaths, key: SessionKey, watcher: FleetWatcher) -> Self {
         Self {
             fleet,
+            key,
             runs: Vec::new(),
             orch: OrchestratorState::default(),
             orch_offset: 0,
@@ -203,7 +232,10 @@ impl Poll {
     }
 
     fn reload_runs(&mut self) {
-        self.runs = crate::fleet::run::list_runs(self.fleet.root())
+        // the rail shows THIS session's workers only: other sessions' runs
+        // are filtered out by ownership, the same predicate that scopes the
+        // event routing
+        self.runs = crate::fleet::run::list_runs_for_owner(self.fleet.root(), self.key.uuid)
             .into_iter()
             .filter_map(|summary| {
                 crate::fleet::run::load_state(&summary.run_dir)
@@ -216,8 +248,20 @@ impl Poll {
             .collect();
     }
 
+    /// Follow the session row: when the orchestrator derives an alias (or a
+    /// row disappears), the key every `orchestrators/` read derives from
+    /// follows it, so the console's inbox writes and transcript reads land
+    /// wherever the session currently lives.
+    fn reconcile_session(&mut self) {
+        if let Some(session) =
+            crate::orch::session::session_by_key(self.fleet.root(), &self.key.uuid.to_string())
+        {
+            self.key = session.key();
+        }
+    }
+
     fn reload_orchestrator(&mut self) {
-        let Ok(raw) = std::fs::read_to_string(self.fleet.orchestrator_state()) else {
+        let Ok(raw) = std::fs::read_to_string(self.fleet.orchestrator_state(&self.key)) else {
             return;
         };
         if let Ok(state) = serde_json::from_str::<OrchestratorState>(&raw) {
@@ -230,7 +274,8 @@ impl Poll {
     /// *is* the replay on console open — the same ingest path a live tail
     /// uses.
     fn tail_events(&mut self, console: &mut Console) {
-        let (lines, offset) = read_new_lines(&self.fleet.orchestrator_events(), self.orch_offset);
+        let (lines, offset) =
+            read_new_lines(&self.fleet.orchestrator_events(&self.key), self.orch_offset);
         self.orch_offset = offset;
         for line in &lines {
             if let Ok(record) = serde_json::from_str::<EventRecord>(line) {
@@ -269,22 +314,21 @@ impl Poll {
         self.save_cursors();
     }
 
-    /// Save the watcher's cursors into the session record (`fleet.json`),
-    /// preserving whatever else it holds. A record this code cannot parse —
-    /// a newer writer's — is left alone rather than clobbered with a fresh
-    /// one; on a fleet without a record yet, the console writes the first
-    /// one and the monitor's boot keeps it (and its cursors) intact.
+    /// Save the watcher's cursors into this console's session row
+    /// (`fleet.json`) under the store's lock. A store this code cannot
+    /// parse — a newer writer's — is left alone rather than clobbered with
+    /// a fresh one; the mutation also round-trips the console prefs key and
+    /// every session row it did not touch.
     fn save_cursors(&self) {
-        let mut session = if self.fleet.fleet_json().exists() {
-            let Some(session) = crate::orch::session::load(self.fleet.root()) else {
-                return;
+        let cursors = self.watcher.cursors();
+        let key = self.key.clone();
+        let fleet_dir = self.fleet.root().to_path_buf();
+        let _ = crate::orch::session::with_store_mutation(&fleet_dir, |store| {
+            let Some(record) = store.sessions.get_mut(&key.uuid) else {
+                return; // the row this console serves is gone: nothing to save into
             };
-            session
-        } else {
-            crate::orch::session::OrchestratorSession::new(&repo_cwd(&self.fleet))
-        };
-        session.watcher.cursors = self.watcher.cursors();
-        let _ = crate::orch::session::save(self.fleet.root(), &mut session);
+            record.watcher.cursors = cursors;
+        });
     }
 
     /// Refresh the dashboard's diff stats, on the [`DIFF_STAT_MS`] cadence:
@@ -359,15 +403,18 @@ fn compact_stat(stat: &str) -> Option<String> {
 
 /// The orchestrator monitor keeps the claude child alive across consoles;
 /// the console only makes sure one is running, detached, with its output on
-/// `orchestrator/claude.log`.
+/// the session's `claude.log`.
 ///
 /// Returns whether a monitor was started (`false`: one was already running
-/// and this console is attaching). The frozen `orchestrator-monitor` CLI
-/// takes only `--fleet-dir`, so before spawning, the console's launch flags
-/// are recorded in the session store ([`crate::orch::session::LaunchOptions`])
-/// where the monitor's boot reads them; on attach they are left alone so a
-/// running monitor keeps whatever it was launched or live-changed to. The
-/// user config dir is injectable so tests never resolve a real home.
+/// and this console is attaching). The `orchestrator-monitor` CLI takes
+/// `--fleet-dir` and — since the monitor slice — `--session <uuid>`; the
+/// console passes the anchored session's uuid so the spawned monitor serves
+/// exactly that row, not whichever happened to be most recently stamped.
+/// The console's launch flags are recorded in the session store
+/// ([`crate::orch::session::LaunchOptions`]) where the monitor's boot reads
+/// them; on attach they are left alone so a running monitor keeps whatever
+/// it was launched or live-changed to. The user config dir is injectable so
+/// tests never resolve a real home.
 ///
 /// # Errors
 ///
@@ -377,8 +424,9 @@ fn ensure_orchestrator(
     fleet: &FleetPaths,
     options: &TuiOptions,
     user_config_dir: Option<&Path>,
+    key: &SessionKey,
 ) -> anyhow::Result<bool> {
-    let state = std::fs::read_to_string(fleet.orchestrator_state())
+    let state = std::fs::read_to_string(fleet.orchestrator_state(key))
         .ok()
         .and_then(|raw| serde_json::from_str::<OrchestratorState>(&raw).ok());
     if let Some(pid) = state.as_ref().and_then(|s| s.pid)
@@ -386,17 +434,20 @@ fn ensure_orchestrator(
     {
         return Ok(false);
     }
-    record_launch_options(fleet, options, user_config_dir)?;
+    record_launch_options(fleet, options, user_config_dir, key)?;
     let exe = std::env::current_exe().context("finding the parl binary")?;
+    // The session's directory is created lazily by whoever owns the key;
+    // the monitor's log must exist before the monitor itself does.
+    std::fs::create_dir_all(fleet.orchestrator_dir(key))
+        .context("creating the session directory")?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(fleet.claude_log())
+        .open(fleet.claude_log(key))
         .context("opening orchestrator/claude.log")?;
     let err = log.try_clone().context("cloning the log handle")?;
     std::process::Command::new(exe)
-        .args(["orchestrator-monitor", "--fleet-dir"])
-        .arg(fleet.root())
+        .args(monitor_argv(fleet, key))
         .stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(err)
@@ -406,29 +457,39 @@ fn ensure_orchestrator(
     Ok(true)
 }
 
-/// Record the console's launch flags for the monitor it is about to spawn.
-/// The channel is the session store's `launch` record — the monitor CLI takes
-/// nothing but `--fleet-dir`, and its boot applies what is written here (the
-/// monitor writes its own mode changes back, so a restarted monitor keeps
-/// running the way the last one did). Same parsing as the ops client's
-/// spawn: the budget rides in as a display string and leaves as dollars.
+/// The `orchestrator-monitor` argv for the anchored session: `--session`
+/// pins the monitor to exactly that row — not whichever happened to be
+/// most recently stamped, which two consoles anchored on different
+/// sessions would race over. The nil uuid (the legacy default session) is
+/// left to the monitor's own resolution, so a bare `--fleet-dir` spawn
+/// keeps working everywhere.
+#[must_use]
+fn monitor_argv(fleet: &FleetPaths, key: &SessionKey) -> Vec<String> {
+    let mut args = vec![
+        "orchestrator-monitor".to_string(),
+        "--fleet-dir".to_string(),
+        fleet.root().to_string_lossy().into_owned(),
+    ];
+    if !key.uuid.is_nil() {
+        args.push("--session".to_string());
+        args.push(key.uuid.to_string());
+    }
+    args
+}
+
+/// Record the console's launch flags for the monitor it is about to spawn,
+/// under the store's lock so an interleaving heartbeat cannot be lost.
 fn record_launch_options(
     fleet: &FleetPaths,
     options: &TuiOptions,
     user_config_dir: Option<&Path>,
+    key: &SessionKey,
 ) -> anyhow::Result<()> {
-    let mut session = if fleet.fleet_json().exists() {
-        let Some(session) = crate::orch::session::load(fleet.root()) else {
-            return Ok(());
-        };
-        session
-    } else {
-        crate::orch::session::OrchestratorSession::new(&repo_cwd(fleet))
-    };
-    // The config layer sits under the explicit flag and above the built-in
-    // default: the model launched can come from `~/.parl/config.toml`.
     let config = crate::paths::load_user_config(user_config_dir)?;
-    session.launch = crate::orch::session::LaunchOptions {
+    if session::load(fleet.root()).is_none() {
+        return Ok(()); // unreadable or foreign: a monitor would boot its own row
+    }
+    let launch = crate::orch::session::LaunchOptions {
         model: config
             .orchestrator_model(options.model.as_deref(), None)
             .map(str::to_string),
@@ -441,7 +502,17 @@ fn record_launch_options(
         remote_control: options.remote_control.clone(),
         fresh: Some(options.fresh),
     };
-    let _ = crate::orch::session::save(fleet.root(), &mut session);
+    // Opening this session makes it the one a reopened console resumes.
+    let now = crate::util::now_iso();
+    let uuid = key.uuid;
+    let fleet_dir = fleet.root().to_path_buf();
+    let _ = crate::orch::session::with_store_mutation(&fleet_dir, |store| {
+        let Some(record) = store.sessions.get_mut(&uuid) else {
+            return;
+        };
+        record.launch = launch;
+        record.last_used_at = now;
+    });
     Ok(())
 }
 
@@ -451,6 +522,69 @@ fn is_interrupt(key: &KeyEvent) -> bool {
     key.kind != KeyEventKind::Release
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c' | 'C'))
+}
+
+// ---------------------------------------------------------------------------
+// Anchoring the console on a session
+
+/// Point the console and its poll at `key` and bring that session's facts
+/// in: its runs (by ownership, so the rail shows only this session's
+/// workers), its orchestrator state and transcripts, a watcher anchored on
+/// the session row's saved cursors, and its monitor running. Shared by the
+/// open path (the resumed session) and every `/session` switch.
+async fn anchor_console(
+    fleet: &FleetPaths,
+    options: &TuiOptions,
+    user_dir: Option<&Path>,
+    console: &mut Console,
+    key: SessionKey,
+) -> Poll {
+    let cursors = session::load(fleet.root())
+        .and_then(|store| {
+            store
+                .sessions
+                .get(&key.uuid)
+                .map(|record| record.watcher.cursors.clone())
+        })
+        .unwrap_or_default();
+    let mut poll = Poll::new(
+        fleet.clone(),
+        key.clone(),
+        FleetWatcher::new(FleetWatcherOptions {
+            fleet_dir: fleet.root().to_path_buf(),
+            cursors,
+            progress_events: options.progress_events,
+            ..FleetWatcherOptions::default()
+        }),
+    );
+    // the old session's texts and selections do not bleed into the new one
+    console.begin_session(&key);
+    poll.reload_runs();
+    poll.reload_orchestrator();
+    console.set_runs(poll.runs.clone());
+    console.set_orchestrator_state(poll.orch.clone());
+    poll.tail_events(console);
+    let started = match ensure_orchestrator(fleet, options, user_dir, &key) {
+        Ok(true) => {
+            console.notice("· orchestrator monitor started", false);
+            true
+        }
+        Ok(false) => {
+            console.notice(
+                "· attaching to the orchestrator that is already running here",
+                false,
+            );
+            false
+        }
+        Err(err) => {
+            console.notice(format!("! orchestrator: {err:#}"), true);
+            false
+        }
+    };
+    // Attaching to a live orchestrator means the fleet is mid-flight: tell
+    // it what is running. A freshly spawned monitor learns the fleet itself.
+    poll.watcher.start(!started);
+    poll
 }
 
 // ---------------------------------------------------------------------------
@@ -476,55 +610,34 @@ pub async fn run_console(
     let mut console = Console::new(fleet.clone());
     console.load_prefs();
 
-    // The watcher is owned for the whole console run: cursors saved by an
-    // earlier console keep it from replaying what the orchestrator already
-    // heard, and unseen runs start at the current end of their events file.
-    let cursors = crate::orch::session::load(fleet.root())
-        .map(|session| session.watcher.cursors)
-        .unwrap_or_default();
-    let mut poll = Poll::new(
-        fleet.clone(),
-        FleetWatcher::new(FleetWatcherOptions {
-            fleet_dir: fleet.root().to_path_buf(),
-            cursors,
-            progress_events: options.progress_events,
-            ..FleetWatcherOptions::default()
-        }),
-    );
-    poll.reload_runs();
-    poll.reload_orchestrator();
-    console.set_runs(poll.runs.clone());
-    console.set_orchestrator_state(poll.orch.clone());
-    poll.tail_events(&mut console);
+    // The session this console serves; its row (and cursors) may already be
+    // on disk from an earlier console. A remembered session — the uuid the
+    // `lastSessionUuid` preference holds — re-anchors the console before the
+    // first draw; the row it left open (`lastSession`) is restored within
+    // whichever session opens.
+    let mut key = resolve_console_key(&fleet);
+    let remembered = console.prefs().last_session_uuid.clone();
+    if let Some(remembered) = &remembered
+        && let Some(session) = crate::orch::session::session_by_key(fleet.root(), remembered)
+    {
+        key = session.key();
+    }
+    let mut poll = anchor_console(
+        &fleet,
+        &options,
+        crate::paths::user_dir().as_deref(),
+        &mut console,
+        key,
+    )
+    .await;
     console.set_files(list_repo_files(&repo_root).await);
 
-    // the session open when the console last closed, when it still exists —
-    // otherwise the dashboard starts on the orchestrator, as ever
-    let remembered = console.prefs().last_session.clone();
-    if let Some(key) = remembered {
-        console.select_target(&key);
+    // the row that was open when the console last closed; unknown keys fall
+    // back to the orchestrator row, as ever
+    if let Some(row) = console.prefs().last_session.clone() {
+        console.select_target(&row);
     }
 
-    let started = match ensure_orchestrator(&fleet, &options, crate::paths::user_dir().as_deref()) {
-        Ok(true) => {
-            console.notice("· orchestrator monitor started", false);
-            true
-        }
-        Ok(false) => {
-            console.notice(
-                "· attaching to the orchestrator that is already running here",
-                false,
-            );
-            false
-        }
-        Err(err) => {
-            console.notice(format!("! orchestrator: {err:#}"), true);
-            false
-        }
-    };
-    // Attaching to a live orchestrator means the fleet is mid-flight: tell
-    // it what is running. A freshly spawned monitor learns the fleet itself.
-    poll.watcher.start(!started);
     poll.save_cursors();
 
     let mut events = EventStream::new();
@@ -552,8 +665,25 @@ pub async fn run_console(
                         break;
                     }
                     let effects = console.handle_key(key);
+                    let switch = effects.iter().find_map(|effect| match effect {
+                        Effect::SwitchSession(key) => Some(key.clone()),
+                        _ => None,
+                    });
                     let quit = effects.iter().any(|effect| matches!(effect, Effect::Quit));
                     console.execute_all(effects).await;
+                    if let Some(new_key) = switch {
+                        // the session we are leaving keeps its watcher
+                        // cursors; the console re-anchors on the new one
+                        poll.save_cursors();
+                        poll = anchor_console(
+                            &fleet,
+                            &options,
+                            crate::paths::user_dir().as_deref(),
+                            &mut console,
+                            new_key,
+                        )
+                        .await;
+                    }
                     if quit {
                         break;
                     }
@@ -574,8 +704,13 @@ pub async fn run_console(
             // the clock: ages, activity lines and the elapsed counters move
             _ = tick.tick() => {}
             _ = feed.tick() => {
+                poll.reconcile_session();
                 poll.reload_runs();
                 poll.reload_orchestrator();
+                // the session may have gained an alias (the orchestrator
+                // derives one from its first prompt): the console follows
+                // where it lives now
+                console.orch_key = poll.key.clone();
                 console.set_runs(poll.runs.clone());
                 console.set_orchestrator_state(poll.orch.clone());
                 poll.tail_events(&mut console);
@@ -700,23 +835,29 @@ mod tests {
     #[test]
     fn attaching_leaves_the_running_monitors_launch_record_alone() {
         let (_dir, fleet) = tmp_fleet();
-        std::fs::create_dir_all(fleet.orchestrator_dir()).unwrap();
-        // a live monitor that was launched with its own flags
+        // a live monitor that was launched with its own flags: the session
+        // row the console resolves is that one
+        let mut store = crate::orch::session::FleetSessions::new();
         let mut record = crate::orch::session::OrchestratorSession::new("/repo");
         record.launch.model = Some("sonnet".into());
         record.pid = Some(std::process::id() as i32);
-        crate::orch::session::save(fleet.root(), &mut record).unwrap();
+        let key = record.key();
+        let key_uuid = key.uuid;
+        store.upsert(record);
+        crate::orch::session::save(fleet.root(), &mut store).unwrap();
+        std::fs::create_dir_all(fleet.orchestrator_dir(&key)).unwrap();
         let state = OrchestratorState {
             pid: Some(std::process::id() as i32),
             ..OrchestratorState::default()
         };
-        crate::util::atomic_write_json(&fleet.orchestrator_state(), &state).unwrap();
+        crate::util::atomic_write_json(&fleet.orchestrator_state(&key), &state).unwrap();
 
         // our own pid is alive: attach, and the recorded flags are untouched
         // — even though this console was opened with a different model
-        assert!(!ensure_orchestrator(&fleet, &tui_options(Some("fable")), None).unwrap());
-        let session = crate::orch::session::load(fleet.root()).unwrap();
-        assert_eq!(session.launch.model.as_deref(), Some("sonnet"));
+        assert!(!ensure_orchestrator(&fleet, &tui_options(Some("fable")), None, &key).unwrap());
+        let store = crate::orch::session::load(fleet.root()).unwrap();
+        let record = &store.sessions[&key_uuid];
+        assert_eq!(record.launch.model.as_deref(), Some("sonnet"));
     }
 
     /// A `TuiOptions` with just the fields a test names; `main.rs` builds it
@@ -734,42 +875,79 @@ mod tests {
     }
 
     #[test]
+    fn the_spawned_monitor_is_pinned_to_the_anchored_session_not_the_mru() {
+        let (_dir, fleet) = tmp_fleet();
+        // two sessions; alpha is the most recently stamped row
+        let alpha = crate::orch::session::create_session(fleet.root(), Some("alpha")).unwrap();
+        let beta = crate::orch::session::create_session(fleet.root(), Some("beta")).unwrap();
+        let mut store = crate::orch::session::load(fleet.root()).unwrap();
+        store.sessions.get_mut(&alpha.uuid).unwrap().last_used_at =
+            "2099-01-01T00:00:00.000Z".into();
+        crate::orch::session::save(fleet.root(), &mut store).unwrap();
+        assert_eq!(
+            resolve_console_key(&fleet).uuid,
+            alpha.uuid,
+            "alpha is the most recently used row"
+        );
+
+        // a console anchored on beta spawns a monitor for beta, not for
+        // whichever row the stamping race happened to leave newest
+        let args = monitor_argv(&fleet, &beta.key());
+        let at = args
+            .iter()
+            .position(|arg| arg == "--session")
+            .expect("the spawn names a session");
+        assert_eq!(
+            args[at + 1],
+            beta.uuid.to_string(),
+            "pinned to the anchored session: {args:?}"
+        );
+        // the legacy default key spawns without the flag (the monitor
+        // resolves the most recently used row on its own)
+        let args = monitor_argv(&fleet, &SessionKey::default());
+        assert!(!args.iter().any(|arg| arg == "--session"), "{args:?}");
+    }
+
+    #[test]
     fn spawning_a_monitor_records_the_launch_flags_in_the_session_store() {
         let (_dir, fleet) = tmp_fleet();
-        std::fs::create_dir_all(fleet.orchestrator_dir()).unwrap();
-        // no monitor alive: the spawn path records the flags it was given
+        // no monitor alive: the spawn path records the flags into the
+        // session row the console serves
+        let key = resolve_console_key(&fleet);
         let mut options = tui_options(Some("fable"));
         options.budget = Some(" 2.5 ".into());
         options.permission_mode = Some("acceptEdits".into());
         options.remote_control = Some(String::new());
         options.fresh = true;
-        assert!(ensure_orchestrator(&fleet, &options, None).unwrap());
-        let session = crate::orch::session::load(fleet.root()).unwrap();
-        assert_eq!(session.launch.model.as_deref(), Some("fable"));
-        assert_eq!(session.launch.budget_usd, Some(2.5));
+        assert!(ensure_orchestrator(&fleet, &options, None, &key).unwrap());
+        let store = crate::orch::session::load(fleet.root()).unwrap();
+        let record = &store.sessions[&key.uuid];
+        assert_eq!(record.launch.model.as_deref(), Some("fable"));
+        assert_eq!(record.launch.budget_usd, Some(2.5));
         assert_eq!(
-            session.launch.permission_mode.as_deref(),
+            record.launch.permission_mode.as_deref(),
             Some("acceptEdits")
         );
-        assert_eq!(session.launch.remote_control.as_deref(), Some(""));
-        assert_eq!(session.launch.fresh, Some(true));
+        assert_eq!(record.launch.remote_control.as_deref(), Some(""));
+        assert_eq!(record.launch.fresh, Some(true));
     }
 
     #[test]
     fn a_launch_record_without_flags_reads_as_claude_defaults() {
         let (_dir, fleet) = tmp_fleet();
-        std::fs::create_dir_all(fleet.orchestrator_dir()).unwrap();
-        assert!(ensure_orchestrator(&fleet, &tui_options(None), None).unwrap());
-        let session = crate::orch::session::load(fleet.root()).unwrap();
-        assert_eq!(session.launch.model, None);
-        assert_eq!(session.launch.budget_usd, None, "no budget: no dollars");
-        assert_eq!(session.launch.fresh, Some(false));
+        let key = resolve_console_key(&fleet);
+        assert!(ensure_orchestrator(&fleet, &tui_options(None), None, &key).unwrap());
+        let store = crate::orch::session::load(fleet.root()).unwrap();
+        let record = &store.sessions[&key.uuid];
+        assert_eq!(record.launch.model, None);
+        assert_eq!(record.launch.budget_usd, None, "no budget: no dollars");
+        assert_eq!(record.launch.fresh, Some(false));
     }
 
     #[test]
     fn the_user_config_supplies_the_orchestrator_model_unless_an_explicit_flag_wins() {
         let (_dir, fleet) = tmp_fleet();
-        std::fs::create_dir_all(fleet.orchestrator_dir()).unwrap();
+        let key = resolve_console_key(&fleet);
         // A fabricated `~/.parl` with an `[orchestrator] model`; injected, so
         // nothing resolves the machine's real home.
         let user_root = std::env::temp_dir().join(format!(
@@ -786,23 +964,28 @@ mod tests {
         .unwrap();
 
         // No explicit flag: the config model reaches the launch record.
-        assert!(ensure_orchestrator(&fleet, &tui_options(None), Some(&user_dir)).unwrap());
-        let session = crate::orch::session::load(fleet.root()).unwrap();
-        assert_eq!(session.launch.model.as_deref(), Some("claude-fable-5"));
+        assert!(ensure_orchestrator(&fleet, &tui_options(None), Some(&user_dir), &key).unwrap());
+        let store = crate::orch::session::load(fleet.root()).unwrap();
+        let record = &store.sessions[&key.uuid];
+        assert_eq!(record.launch.model.as_deref(), Some("claude-fable-5"));
         // An explicit flag still wins over the config.
-        assert!(ensure_orchestrator(&fleet, &tui_options(Some("opus")), Some(&user_dir)).unwrap());
-        let session = crate::orch::session::load(fleet.root()).unwrap();
-        assert_eq!(session.launch.model.as_deref(), Some("opus"));
+        assert!(
+            ensure_orchestrator(&fleet, &tui_options(Some("opus")), Some(&user_dir), &key).unwrap()
+        );
+        let store = crate::orch::session::load(fleet.root()).unwrap();
+        let record = &store.sessions[&key.uuid];
+        assert_eq!(record.launch.model.as_deref(), Some("opus"));
     }
 
     // -- the watcher seam ---------------------------------------------------
 
     /// A temp fleet with one live worker run: `run.json`, an empty
-    /// `events.jsonl`, and the orchestrator dir the console writes into.
-    fn fleet_with_run(name: &str) -> (tempfile::TempDir, FleetPaths, String) {
+    /// `events.jsonl`, and the session row the console writes into.
+    fn fleet_with_run(name: &str) -> (tempfile::TempDir, FleetPaths, String, SessionKey) {
         let tmp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
         let fleet = FleetPaths::new(tmp.path().join(".parl"));
-        std::fs::create_dir_all(fleet.orchestrator_dir()).unwrap();
+        let key = resolve_console_key(&fleet);
+        std::fs::create_dir_all(fleet.orchestrator_dir(&key)).unwrap();
         let run_id = format!("{name}-20260830000000");
         let run_dir = fleet.root().join("runs").join(&run_id);
         std::fs::create_dir_all(&run_dir).unwrap();
@@ -826,17 +1009,22 @@ mod tests {
         );
         state.status = crate::fleet::run::RunStatus::Running;
         state.pid = Some(std::process::id() as i32);
+        // the run belongs to the session the console serves, so the rail's
+        // ownership filter keeps it visible
+        state.orchestrator_id = Some(key.uuid);
         crate::fleet::run::save_state(&run_dir, &state).unwrap();
         std::fs::write(run_dir.join("events.jsonl"), "").unwrap();
-        (tmp, fleet, run_id)
+        (tmp, fleet, run_id, key)
     }
 
     fn poll_for(
         fleet: &FleetPaths,
+        key: &SessionKey,
         cursors: HashMap<String, crate::orch::session::RunCursor>,
     ) -> Poll {
         Poll::new(
             fleet.clone(),
+            key.clone(),
             FleetWatcher::new(FleetWatcherOptions {
                 fleet_dir: fleet.root().to_path_buf(),
                 cursors,
@@ -854,18 +1042,18 @@ mod tests {
         crate::util::append_json_line(&run_dir.join("events.jsonl"), question).unwrap();
     }
 
-    fn inbox_lines(fleet: &FleetPaths) -> Vec<String> {
-        std::fs::read_to_string(fleet.orchestrator_inbox())
+    fn inbox_lines(fleet: &FleetPaths, key: &SessionKey) -> Vec<String> {
+        std::fs::read_to_string(fleet.orchestrator_inbox(key))
             .unwrap_or_default()
             .lines()
             .map(str::to_string)
             .collect()
     }
 
-    fn count_kind(fleet: &FleetPaths, kind: &str) -> usize {
+    fn count_kind(fleet: &FleetPaths, key: &SessionKey, kind: &str) -> usize {
         // the payload's quotes are JSON-escaped on disk; unescape before
         // matching so the count is of what the orchestrator reads
-        inbox_lines(fleet)
+        inbox_lines(fleet, key)
             .iter()
             .filter(|line| {
                 line.replace("\\\"", "\"")
@@ -876,14 +1064,15 @@ mod tests {
 
     #[tokio::test]
     async fn fleet_events_forward_as_one_batch_and_cursors_persist() {
-        let (_tmp, fleet, run_id) = fleet_with_run("auth");
+        let (_tmp, fleet, run_id, key) = fleet_with_run("auth");
         let mut console = Console::new(fleet.clone());
-        let mut poll = poll_for(&fleet, HashMap::new());
+        console.orch_key = key.clone();
+        let mut poll = poll_for(&fleet, &key, HashMap::new());
         poll.watcher.start(false);
 
         // a running worker is not news
         poll.forward_fleet_events(&mut console).await;
-        assert!(inbox_lines(&fleet).is_empty());
+        assert!(inbox_lines(&fleet, &key).is_empty());
 
         // the worker settles and asks a question: one batch, forwarded
         settle(
@@ -894,9 +1083,9 @@ mod tests {
             ),
         );
         poll.forward_fleet_events(&mut console).await;
-        let lines = inbox_lines(&fleet);
-        assert_eq!(count_kind(&fleet, "question"), 1, "{lines:?}");
-        assert_eq!(count_kind(&fleet, "settled"), 1, "{lines:?}");
+        let lines = inbox_lines(&fleet, &key);
+        assert_eq!(count_kind(&fleet, &key, "question"), 1, "{lines:?}");
+        assert_eq!(count_kind(&fleet, &key, "settled"), 1, "{lines:?}");
         // the transcript shows the batch as the ⚑ block the renderer draws
         assert!(
             console
@@ -907,8 +1096,8 @@ mod tests {
         );
 
         // the forwarded cursors are durable: a restarted console continues
-        let session = crate::orch::session::load(fleet.root()).unwrap();
-        let cursor = &session.watcher.cursors[&run_id];
+        let store = crate::orch::session::load(fleet.root()).unwrap();
+        let cursor = &store.sessions[&key.uuid].watcher.cursors[&run_id];
         assert!(
             cursor.events_offset > 0,
             "the consumed events are remembered"
@@ -918,9 +1107,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_reopened_console_with_saved_cursors_does_not_replay() {
-        let (_tmp, fleet, run_id) = fleet_with_run("db");
+        let (_tmp, fleet, run_id, key) = fleet_with_run("db");
         let mut console = Console::new(fleet.clone());
-        let mut poll = poll_for(&fleet, HashMap::new());
+        console.orch_key = key.clone();
+        let mut poll = poll_for(&fleet, &key, HashMap::new());
         poll.watcher.start(true); // attaching: a snapshot goes out
         settle(
             &fleet,
@@ -928,22 +1118,23 @@ mod tests {
             &json!({"type":"worker_question","questionId":"q_1","question":"which db?"}),
         );
         poll.forward_fleet_events(&mut console).await;
-        assert_eq!(count_kind(&fleet, "question"), 1);
+        assert_eq!(count_kind(&fleet, &key, "question"), 1);
 
         // a fresh console over the persisted cursors: the snapshot may go
         // out again, but what the orchestrator already heard does not repeat
-        let cursors = crate::orch::session::load(fleet.root())
-            .unwrap()
+        let cursors = crate::orch::session::load(fleet.root()).unwrap().sessions[&key.uuid]
             .watcher
-            .cursors;
-        let mut reopened = poll_for(&fleet, cursors);
+            .cursors
+            .clone();
+        let mut reopened = poll_for(&fleet, &key, cursors);
         reopened.watcher.start(true);
         let mut fresh_console = Console::new(fleet.clone());
+        fresh_console.orch_key = key.clone();
         reopened.forward_fleet_events(&mut fresh_console).await;
-        assert_eq!(count_kind(&fleet, "question"), 1, "no replay");
+        assert_eq!(count_kind(&fleet, &key, "question"), 1, "no replay");
         // the snapshot is the only new message, and it names the live run
-        let lines = inbox_lines(&fleet);
-        assert_eq!(count_kind(&fleet, "snapshot"), 2, "{lines:?}");
+        let lines = inbox_lines(&fleet, &key);
+        assert_eq!(count_kind(&fleet, &key, "snapshot"), 2, "{lines:?}");
         assert!(
             lines
                 .last()
@@ -954,9 +1145,10 @@ mod tests {
 
     #[tokio::test]
     async fn watcher_batches_keep_order_across_polls() {
-        let (_tmp, fleet, run_id) = fleet_with_run("api");
+        let (_tmp, fleet, run_id, key) = fleet_with_run("api");
         let mut console = Console::new(fleet.clone());
-        let mut poll = poll_for(&fleet, HashMap::new());
+        console.orch_key = key.clone();
+        let mut poll = poll_for(&fleet, &key, HashMap::new());
         poll.watcher.start(false);
         settle(
             &fleet,
@@ -966,8 +1158,8 @@ mod tests {
         poll.forward_fleet_events(&mut console).await;
         // nothing new: the same consumed lines are not queued twice
         poll.forward_fleet_events(&mut console).await;
-        assert_eq!(count_kind(&fleet, "question"), 1);
-        assert_eq!(count_kind(&fleet, "settled"), 1);
+        assert_eq!(count_kind(&fleet, &key, "question"), 1);
+        assert_eq!(count_kind(&fleet, &key, "settled"), 1);
     }
 
     // -- the dashboard's diff stat -------------------------------------------
@@ -998,6 +1190,157 @@ mod tests {
         assert_eq!(compact_stat(""), None);
     }
 
+    // -- sessions ------------------------------------------------------------
+
+    /// A flock: two sessions, one run owned by each, both monitors attached
+    /// (state.json carries this process's pid, so anchoring never spawns).
+    async fn session_flock() -> (
+        tempfile::TempDir,
+        FleetPaths,
+        (OrchestratorSession, String),
+        (OrchestratorSession, String),
+    ) {
+        let tmp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let fleet = FleetPaths::new(tmp.path().join(".parl"));
+        let first = crate::orch::session::create_session(fleet.root(), Some("alpha")).unwrap();
+        let second = crate::orch::session::create_session(fleet.root(), Some("beta")).unwrap();
+        for session in [&first, &second] {
+            std::fs::create_dir_all(fleet.orchestrator_dir(&session.key())).unwrap();
+            let state = OrchestratorState {
+                pid: Some(std::process::id() as i32),
+                ..OrchestratorState::default()
+            };
+            crate::util::atomic_write_json(&fleet.orchestrator_state(&session.key()), &state)
+                .unwrap();
+        }
+        let run = |run_id: &str, name: &str, owner: uuid::Uuid| {
+            let mut state = crate::fleet::run::RunState::new(
+                fleet.root().to_string_lossy().as_ref(),
+                run_id,
+                name,
+                tmp.path().to_string_lossy().as_ref(),
+                "brief",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            state.status = crate::fleet::run::RunStatus::Running;
+            state.pid = Some(std::process::id() as i32);
+            state.orchestrator_id = Some(owner);
+            let dir = fleet.root().join("runs").join(run_id);
+            std::fs::create_dir_all(&dir).unwrap();
+            crate::fleet::run::save_state(&dir, &state).unwrap();
+        };
+        run("alpha-20260830000000", "auth", first.uuid);
+        run("beta-20260830000000", "db", second.uuid);
+        (
+            tmp,
+            fleet,
+            (first, "alpha-20260830000000".into()),
+            (second, "beta-20260830000000".into()),
+        )
+    }
+
+    #[tokio::test]
+    async fn reload_runs_shows_only_the_active_sessions_workers() {
+        let (_tmp, fleet, first, second) = session_flock().await;
+        let key = first.0.key();
+        let mut poll = poll_for(&fleet, &key, HashMap::new());
+        poll.reload_runs();
+        assert_eq!(
+            poll.runs.len(),
+            1,
+            "the other session's run stays off the rail"
+        );
+        assert_eq!(poll.runs[0].run_id, first.1);
+
+        // the same poll pointed at the other session sees only its own
+        poll.key = second.0.key();
+        poll.reload_runs();
+        assert_eq!(poll.runs.len(), 1);
+        assert_eq!(poll.runs[0].run_id, "beta-20260830000000");
+    }
+
+    #[tokio::test]
+    async fn reconcile_session_follows_a_newly_derived_alias() {
+        let (_tmp, fleet, _run_id, key) = fleet_with_run("auth");
+        let mut poll = poll_for(&fleet, &key, HashMap::new());
+        assert_eq!(poll.key.alias, None);
+        // the orchestrator derives an alias and saves the row
+        let mut store = crate::orch::session::load(fleet.root()).unwrap();
+        store.sessions.get_mut(&key.uuid).unwrap().alias = Some("add-auth".into());
+        crate::orch::session::save(fleet.root(), &mut store).unwrap();
+        poll.reconcile_session();
+        assert_eq!(poll.key.alias.as_deref(), Some("add-auth"));
+        assert_eq!(poll.key.uuid, key.uuid);
+    }
+
+    #[tokio::test]
+    async fn anchoring_switches_the_console_between_sessions_scoping_the_rail() {
+        let (_tmp, fleet, first, _second) = session_flock().await;
+        let mut console = Console::new(fleet.clone());
+        let first_key = first.0.key();
+        let second_key = crate::orch::session::session_by_key(fleet.root(), "beta")
+            .unwrap()
+            .key();
+        anchor_console(
+            &fleet,
+            &tui_options(None),
+            None,
+            &mut console,
+            first_key.clone(),
+        )
+        .await;
+        assert_eq!(console.orch_key, first_key);
+        let names: Vec<String> = console.rows().iter().map(|row| row.name.clone()).collect();
+        assert_eq!(names, vec!["alpha", "auth"], "only alpha's own worker");
+
+        // a switch re-anchors on the other session: fresh row set, fresh
+        // transcript, and the console follows
+        console.ingest_orchestrator_record(
+            &crate::orch::records::OrchestratorEvent::Notice {
+                text: "line from alpha".into(),
+                error: None,
+            }
+            .to_record(),
+        );
+        anchor_console(
+            &fleet,
+            &tui_options(None),
+            None,
+            &mut console,
+            second_key.clone(),
+        )
+        .await;
+        assert_eq!(console.orch_key, second_key);
+        let names: Vec<String> = console.rows().iter().map(|row| row.name.clone()).collect();
+        assert_eq!(names, vec!["beta", "db"], "only beta's own worker");
+        assert!(
+            console
+                .orchestrator_transcript()
+                .blocks()
+                .iter()
+                .all(|block| !block.text.contains("line from alpha")),
+            "alpha's transcript does not bleed into beta"
+        );
+        assert!(
+            console
+                .orchestrator_transcript()
+                .blocks()
+                .iter()
+                .all(|b| { b.text.contains("attaching") || b.text.contains("monitor started") }),
+            "only the anchor notice, nothing from alpha"
+        );
+    }
+
     #[tokio::test]
     async fn diff_stats_reach_the_dashboard_throttled() {
         let tmp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
@@ -1026,7 +1369,8 @@ mod tests {
         git(&["commit", "-qm", "seed"], &root);
 
         let fleet = FleetPaths::new(root.join(".parl"));
-        std::fs::create_dir_all(fleet.orchestrator_dir()).unwrap();
+        let key = resolve_console_key(&fleet);
+        std::fs::create_dir_all(fleet.orchestrator_dir(&key)).unwrap();
         let run_id = "auth-20260830000000";
         let info = crate::git::ensure_worktree(
             &root,
@@ -1061,6 +1405,7 @@ mod tests {
         state.pid = Some(std::process::id() as i32);
         state.worktree = Some(info.worktree_path.to_string_lossy().into_owned());
         state.base_commit = Some(info.base_commit.clone());
+        state.orchestrator_id = Some(key.uuid);
         crate::fleet::run::save_state(&run_dir, &state).unwrap();
 
         // the worker commits one file: the row carries +1 −0
@@ -1069,7 +1414,11 @@ mod tests {
         git(&["commit", "-qm", "auth"], &info.worktree_path);
 
         let mut console = Console::new(fleet.clone());
-        let mut poll = poll_for(&fleet, HashMap::new());
+        let mut poll = poll_for(&fleet, &key, HashMap::new());
+        // the run belongs to this session: the rail's ownership filter is
+        // precisely what this test exercises
+        state.orchestrator_id = Some(key.uuid);
+        crate::fleet::run::save_state(&run_dir, &state).unwrap();
         poll.reload_runs();
         console.set_runs(poll.runs.clone());
         poll.refresh_diff_stats(&mut console).await;
@@ -1087,9 +1436,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_without_a_worktree_shows_no_diff_stat() {
-        let (_tmp, fleet, _run_id) = fleet_with_run("bare");
+        let (_tmp, fleet, _run_id, key) = fleet_with_run("bare");
         let mut console = Console::new(fleet.clone());
-        let mut poll = poll_for(&fleet, HashMap::new());
+        let mut poll = poll_for(&fleet, &key, HashMap::new());
         poll.reload_runs();
         console.set_runs(poll.runs.clone());
         poll.refresh_diff_stats(&mut console).await;
