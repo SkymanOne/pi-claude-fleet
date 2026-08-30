@@ -59,6 +59,12 @@ fn fail_pi() -> PathBuf {
     fixture("fail-pi.mjs")
 }
 
+/// The shared fake plus the session files real pi writes into
+/// `--session-dir`, for the documented-layout assertions.
+fn session_pi() -> PathBuf {
+    fixture("fake-pi-session.mjs")
+}
+
 /// `PARL_PI_BIN` is an executable spec split on spaces.
 fn pi_spec(path: &Path) -> String {
     format!("node {}", path.display())
@@ -520,6 +526,268 @@ fn mcp_serves_the_fleet_tools_over_stdio() {
         std::thread::sleep(POLL);
     };
     assert_eq!(code, Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// 3. A full worker lifecycle against the fake pi.
+// ---------------------------------------------------------------------------
+
+/// spawn → status (table and --json) → send → answer a fleet_ask question →
+/// wait → report → output/logs/attach → diff → merge → cleanup, then the
+/// on-disk proof: the branch really merged, the worktree and branch are
+/// gone, the run reads `archived`, and `.parl` holds exactly the documented
+/// tree — none of the removed one.
+#[test]
+fn full_worker_lifecycle_happy_path() {
+    let _serial = serial();
+    let (_tmp, root) = init_repo();
+    let run_id = spawn_ok(
+        &root,
+        "alpha",
+        "create hello.txt with greeting content",
+        &session_pi(),
+        &[
+            ("FAKE_PI_WRITE_HELLO", "1"),
+            ("FAKE_PI_ASK", "1"),
+            ("FAKE_PI_DELAY_MS", "4000"),
+        ],
+        &[],
+    );
+    assert!(
+        regex::Regex::new(r"^alpha-\d{14}$")
+            .unwrap()
+            .is_match(&run_id),
+        "{run_id}"
+    );
+    let fleet = root
+        .canonicalize()
+        .unwrap()
+        .join(parl::paths::STATE_DIR_NAME);
+    let run_dir = fleet.join("runs").join(&run_id);
+    let _reap_guard = ReapOnDrop {
+        run_json: run_dir.join("run.json"),
+    };
+
+    let state = status_json(&root, "alpha");
+    assert_eq!(state["id"], run_id.as_str(), "{state}");
+    assert_eq!(state["name"], "alpha");
+    assert_eq!(state["taskBrief"], "create hello.txt with greeting content");
+    let worktree = PathBuf::from(state["worktree"].as_str().unwrap());
+    let branch = state["branch"].as_str().unwrap().to_string();
+    assert!(branch.starts_with("parl/alpha-"), "{branch}");
+    assert!(
+        worktree.join("seed.txt").exists(),
+        "the worktree is a checkout"
+    );
+    assert!(state["baseCommit"].as_str().is_some());
+    assert_eq!(state["isGit"], json!(true));
+
+    // The fleet table shows the run.
+    let (code, stdout, _) = run(&root, &["status"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("NAME") && stdout.contains("STATE"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("alpha"), "{stdout}");
+
+    // Steer while the worker runs (it blocks on its question, so the window
+    // is wide), then wait for the question to surface as `blocked`.
+    let (code, stdout, stderr) = run(&root, &["send", "alpha", "--", "use tabs not spaces"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout.trim(), "steer queued for alpha", "{stdout}");
+    let blocked = poll_status(&root, "alpha", SETTLE, |state| {
+        state["pendingQuestion"].is_object() || state["pendingDialog"].is_object()
+    });
+    let question_id = blocked["pendingQuestion"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(blocked["status"], "blocked", "{blocked}");
+    assert_eq!(blocked["pendingQuestion"]["question"], "bcrypt or argon2?");
+
+    // The worker has not finished, so there is no report yet.
+    let (code, _, stderr) = run(&root, &["report", "alpha"]);
+    assert_eq!(code, 2, "{stderr}");
+
+    // Answer the question; the worker proceeds and settles.
+    let (code, stdout, stderr) = run(&root, &["answer", "alpha", "--", "argon2"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.contains(&format!("answer queued for alpha (question {question_id})")),
+        "{stdout}"
+    );
+    assert_eq!(
+        wait_code(&root, "alpha", 60),
+        0,
+        "an answered, settled run waits with exit 0"
+    );
+    let state = settled(&root, "alpha");
+    assert_eq!(state["status"], "settled", "{state}");
+    assert_eq!(state["pendingQuestion"], json!(null));
+
+    // The report is the worker's file, enriched with the answer and the
+    // steering, plus the orchestrator-side appendix.
+    let (code, stdout, stderr) = run(&root, &["report", "alpha"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("# Fleet Report:"), "{stdout}");
+    assert!(stdout.contains("## Status\ndone"), "{stdout}");
+    assert!(stdout.contains("Answer received: argon2"), "{stdout}");
+    assert!(
+        stdout.contains("## Steering received\n- use tabs not spaces"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("## Steering log (orchestrator-side, most recent last)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("- [orchestrator]"), "{stdout}");
+    assert!(stdout.contains("use tabs not spaces"), "{stdout}");
+
+    // Output: the captured last text, or the tool trail with --tail.
+    let (code, stdout, _) = run(&root, &["output", "alpha"]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "Working: wrote hello.txt");
+    let (code, stdout, _) = run(&root, &["output", "alpha", "--tail", "5"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("bash: hi"), "{stdout}");
+    assert!(stdout.contains("fleet_ask:"), "{stdout}");
+    let (code, stdout, _) = run(&root, &["logs", "alpha", "--tail", "50"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("agent_settled"), "{stdout}");
+    let (code, stdout, stderr) = run(&root, &["attach", "alpha"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("▶ task: create hello.txt"), "{stdout}");
+    assert!(stdout.contains("● settled"), "{stdout}");
+    assert!(
+        stdout.contains("▶ orchestrator: use tabs not spaces"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("static tail — run `parl` for the live console"),
+        "{stderr}"
+    );
+
+    // The single-run JSON carries the session file pi wrote.
+    let state = status_json(&root, "alpha");
+    let session_file = state["sessionFile"].as_str().unwrap_or_default();
+    assert!(
+        session_file.starts_with(run_dir.join("session").to_str().unwrap())
+            && session_file.ends_with(".jsonl"),
+        "{state}"
+    );
+    assert!(Path::new(session_file).is_file());
+
+    // Diff sees the worker's committed work once it is committed.
+    git(&worktree, &["add", "."]);
+    git(&worktree, &["commit", "-qm", "worker hello"]);
+    let (code, stdout, _) = run(&root, &["diff", "alpha"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("hello.txt"), "{stdout}");
+    let (code, stdout, _) = run(&root, &["diff", "alpha", "--name-only"]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "hello.txt");
+
+    // Merge lands the branch in the recorded checkout.
+    let (code, stdout, stderr) = run(&root, &["merge", "alpha"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.contains(&format!("merged {branch} into")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Run your integration checks"), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("hello.txt")).unwrap(),
+        "hi\n",
+        "the branch actually landed"
+    );
+
+    // Cleanup archives the run, removes the worktree and deletes the merged
+    // branch.
+    let (code, stdout, stderr) = run(&root, &["cleanup", "alpha"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains(&format!("archived {run_id}")), "{stdout}");
+    assert!(!worktree.exists(), "the worktree is gone");
+    let listed = StdCommand::new("git")
+        .args(["branch", "--list", &branch])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&listed.stdout).trim().is_empty());
+    let (code, stdout, _) = run(&root, &["cleanup", "alpha"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("already archived"), "{stdout}");
+
+    // The run reads archived; the default fleet view hides it.
+    assert_eq!(status_json(&root, "alpha")["status"], "archived");
+    let (code, stdout, _) = run(&root, &["status", "--json"]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[]", "archived runs are hidden by default");
+    let (code, stdout, _) = run(&root, &["status", "--all", "--json"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("archived"), "{stdout}");
+
+    reap_monitor(&root, &run_id);
+
+    // ------------------------------------------------------------------
+    // The `.parl` layout is what AGENTS.md says it is.
+    // ------------------------------------------------------------------
+    for path in [
+        run_dir.join("run.json"),
+        run_dir.join("events.jsonl"),
+        run_dir.join("inbox.jsonl"),
+        run_dir.join("outbox.jsonl"),
+        run_dir.join("report.md"),
+        run_dir.join("pi.log"),
+        run_dir.join("session"),
+        fleet.join("runs"),
+        fleet.join("orchestrator"),
+        fleet.join("pi").join("extensions").join("fleet-worker.ts"),
+        fleet
+            .join("pi")
+            .join("skills")
+            .join("fleet-worker-report")
+            .join("SKILL.md"),
+    ] {
+        assert!(
+            path.exists(),
+            "documented layout missing: {}",
+            path.display()
+        );
+    }
+    for gone in [
+        fleet.join("reports"),
+        root.join("reports"),
+        fleet.join("orchestrator.json"),
+        run_dir.join("monitor.log"),
+        run_dir.join("progress.md"),
+        fleet.join("progress.md"),
+        run_dir.join("control.jsonl"),
+        fleet.join("tui.lock"),
+    ] {
+        assert!(
+            !path_exists(&gone),
+            "removed layout came back: {}",
+            gone.display()
+        );
+    }
+    // The mailbox files carry real envelopes.
+    let inbox = std::fs::read_to_string(run_dir.join("inbox.jsonl")).unwrap();
+    assert!(
+        inbox.contains("\"steer\"") && inbox.contains("\"answer\""),
+        "{inbox}"
+    );
+    let outbox = std::fs::read_to_string(run_dir.join("outbox.jsonl")).unwrap();
+    assert!(outbox.contains("\"question\""), "{outbox}");
+    // events.jsonl captured the run transcript.
+    let events = std::fs::read_to_string(run_dir.join("events.jsonl")).unwrap();
+    assert!(events.contains("\"task_prompt\""), "{events}");
+    assert!(events.contains("\"worker_question\""), "{events}");
+    assert!(events.contains("\"agent_settled\""), "{events}");
+}
+
+fn path_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 // ---------------------------------------------------------------------------
