@@ -226,14 +226,23 @@ fn base36(mut value: u64) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
+/// [`base36`] left-padded with zeros to exactly six characters.
+///
+/// `{:0>6}`, not `{:06}`: the numeric zero-pad flag only works on integer
+/// types, and `Display for str` renders a width as left-aligned *space*
+/// padding — trailing spaces on ~1 id in 36.
+fn base36_6(value: u64) -> String {
+    format!("{:0>6}", base36(value))
+}
+
 /// Short unique id: `<prefix>_<time36>_<random6>`; sortable enough for logs.
 pub fn new_id(prefix: &str) -> String {
     let millis = now_ms().max(0) as u64;
     let random: u64 = rand::random();
     format!(
-        "{prefix}_{}_{:06}",
+        "{prefix}_{}_{}",
         base36(millis),
-        base36(random % 36u64.pow(6))
+        base36_6(random % 36u64.pow(6))
     )
 }
 
@@ -392,6 +401,51 @@ mod tests {
         assert!(!time.is_empty());
         assert_eq!(rand.len(), 6);
         assert!(id.starts_with("m_"));
+    }
+
+    #[test]
+    fn base36_six_zero_fills_short_values_on_the_left() {
+        // The values whose base36 form is shorter than six characters —
+        // the ~2.78% of draws that `{:06}` padded with trailing spaces.
+        assert_eq!(base36_6(0), "000000");
+        assert_eq!(base36_6(9), "000009");
+        assert_eq!(base36_6(35), "00000z");
+        assert_eq!(base36_6(36), "000010");
+        assert_eq!(base36_6(36u64.pow(5) - 1), "0zzzzz");
+        assert_eq!(base36_6(36u64.pow(5)), "100000");
+        assert_eq!(base36_6(36u64.pow(6) - 1), "zzzzzz");
+    }
+
+    #[test]
+    fn new_id_stays_whitespace_free_across_thousands_of_draws() {
+        // `{:06}` left-aligned the short draws with spaces, and the shape
+        // test above passed right through it (trailing spaces kept
+        // `rand.len() == 6` true). Thousands of draws are certain to land
+        // in that ~2.78% bucket, so the real generator is pinned too.
+        for prefix in ["m", "ev", "t"] {
+            for _ in 0..2_500 {
+                let id = new_id(prefix);
+                assert!(id.chars().all(|c| !c.is_whitespace()), "{id:?}");
+                let mut parts = id.split('_');
+                assert_eq!(parts.next(), Some(prefix), "{id:?}");
+                let time = parts.next().unwrap();
+                let rand = parts.next().unwrap();
+                assert!(parts.next().is_none(), "{id:?}");
+                assert!(
+                    !time.is_empty()
+                        && time
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase()),
+                    "{id:?}"
+                );
+                assert_eq!(rand.len(), 6, "{id:?}");
+                assert!(
+                    rand.bytes()
+                        .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase()),
+                    "{id:?}"
+                );
+            }
+        }
     }
 
     #[test]

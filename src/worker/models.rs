@@ -168,6 +168,8 @@ mod tests {
                 "  fake               claude-sonnet-5                1M",
             ])
         );
+        // prime the cache; the checks below then read the one real listing
+        list_models(&pi).await;
         assert_eq!(check_model(&pi, None).await.unwrap(), None);
         assert_eq!(check_model(&pi, Some("glm-5.3")).await.unwrap(), None);
         let bad = check_model(&pi, Some("glm-5.3-max"))

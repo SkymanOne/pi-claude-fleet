@@ -104,34 +104,8 @@ pub async fn resolve_fleet_dir(cwd: Option<&Path>) -> anyhow::Result<ResolvedFle
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::new_id;
-
-    fn tmp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "{name}-{}-{}",
-            std::process::id(),
-            new_id("t").replace('_', "")
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn git_sync(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    use crate::git::test_support::{RETRY_BOUND, RETRY_INTERVAL, git_sync, tmp_dir};
+    use std::time::Instant;
 
     #[test]
     fn ok_and_fail_carry_their_sides_without_data() {
@@ -147,23 +121,66 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_fleet_dir_anchors_at_the_repo_root_and_realpaths() {
-        let root = tmp_dir("parl-ops-resolve-");
-        git_sync(&root, &["init", "-q", "-b", "main"]);
-        let sub = root.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        let in_repo = resolve_fleet_dir(Some(&sub)).await.unwrap();
-        assert!(in_repo.is_git);
+        // Under full-suite parallel load the git spawn behind the resolution
+        // fails transiently, and canonicalize() of the root git reports can
+        // come back NotFound a moment later — the environmental loss
+        // documented in src/git.rs, whose probe this retries the same way,
+        // repo setup included in the retried condition. The bound is tripled
+        // from the shared budget: when another suite churns the same OS temp
+        // directory, the NotFound windows outlast it, and a share-sized
+        // bound burned out without a surviving attempt (observed once in
+        // sixteen full-suite runs). A genuinely broken resolution still
+        // fails loudly via the bound, with what the last attempt saw.
+        let deadline = Instant::now() + 3 * RETRY_BOUND;
+        let mut last_seen = String::from("no attempt completed");
+        let (sub_real, in_repo) = loop {
+            if Instant::now() >= deadline {
+                panic!("resolve_fleet_dir never anchored at the repo root: {last_seen}");
+            }
+            let root = tmp_dir("parl-ops-resolve-");
+            git_sync(&root, &["init", "-q", "-b", "main"]);
+            let sub = root.join("sub");
+            std::fs::create_dir_all(&sub).unwrap();
+            let (root_real, sub_real) = match (root.canonicalize(), sub.canonicalize()) {
+                (Ok(root_real), Ok(sub_real)) => (root_real, sub_real),
+                (root_real, sub_real) => {
+                    last_seen = format!("setup canonicalize: root={root_real:?} sub={sub_real:?}");
+                    tokio::time::sleep(RETRY_INTERVAL).await;
+                    continue;
+                }
+            };
+            match resolve_fleet_dir(Some(&sub)).await {
+                Ok(resolved)
+                    if resolved.is_git
+                        && resolved
+                            .repo_root
+                            .as_ref()
+                            .and_then(|repo| repo.canonicalize().ok())
+                            .is_some_and(|real| *real == root_real)
+                        && resolved.paths.root() == root_real.join(".parl")
+                        && resolved.target_dir == sub_real =>
+                {
+                    break (sub_real, resolved);
+                }
+                Ok(resolved) => {
+                    // keep what the failed attempt actually saw
+                    last_seen = format!(
+                        "last attempt: is_git={} repo_root={:?} repo_root.canonicalize={:?} paths.root={:?}",
+                        resolved.is_git,
+                        resolved.repo_root,
+                        resolved
+                            .repo_root
+                            .as_ref()
+                            .and_then(|repo| repo.canonicalize().ok()),
+                        resolved.paths.root()
+                    );
+                }
+                Err(err) => last_seen = format!("last attempt errored: {err:#}"),
+            }
+            tokio::time::sleep(RETRY_INTERVAL).await;
+        };
         assert_eq!(
-            in_repo.repo_root.unwrap().canonicalize().unwrap(),
-            root.canonicalize().unwrap()
-        );
-        assert_eq!(
-            in_repo.paths.root(),
-            root.canonicalize().unwrap().join(".parl")
-        );
-        assert_eq!(
-            in_repo.target_dir,
-            sub.canonicalize().unwrap(),
+            in_repo.target_dir, sub_real,
             "the target stays where the caller pointed"
         );
 
