@@ -210,6 +210,12 @@ impl Drop for Fleet {
     }
 }
 
+/// The fleet-level pi catalogue, as the monitor wrote it.
+fn read_cache(parl_dir: &Path) -> parl::fleet::run::PiCache {
+    let raw = std::fs::read_to_string(parl_dir.join("pi-cache.json")).unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
 fn tail(path: &Path, n: usize) -> String {
     let bytes = std::fs::read(path).unwrap_or_default();
     let start = bytes.len().saturating_sub(4000);
@@ -289,6 +295,9 @@ fn full_run_settles_and_captures_report_events_and_exits() {
     assert_eq!(code, Some(0), "monitor exits cleanly");
 }
 
+/// The pi catalogue is a fleet property: the monitor writes it to
+/// `pi-cache.json` at boot; run.json never carries it (`load_state` merges
+/// the cache back in, which is what the waits below observe).
 #[test]
 fn records_commands_and_forwards_a_command_as_a_prompt() {
     let mut fleet = spawn_slow("pf-cmds-", &[("FAKE_PI_DELAY_MS", "20000")]);
@@ -299,6 +308,15 @@ fn records_commands_and_forwards_a_command_as_a_prompt() {
         vec!["skill:fleet-worker-report", "compact-notes", "session-name"]
     );
     assert_eq!(state.commands[0].source, "skill");
+    // The fleet cache carries them, and the per-run file does not.
+    let cache = read_cache(&fleet.parl_dir);
+    let names: Vec<&str> = cache.commands.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["skill:fleet-worker-report", "compact-notes", "session-name"]
+    );
+    let run_raw = fleet.read("run.json");
+    assert!(!run_raw.contains("\"commands\""), "{run_raw}");
 
     fleet.append_inbox(&Envelope::command(
         Party::Console,
@@ -419,7 +437,9 @@ fn records_the_model_pi_resolved_and_the_available_models() {
     });
     assert_eq!(state.active_model.as_deref(), Some("vendor/model-9"));
     assert_eq!(state.active_provider.as_deref(), Some("vendorco"));
-    // The available-model list lands on the run state too (with the fake's provider).
+    // The available-model list is a fleet property now: it lands in
+    // pi-cache.json (with the fake's provider), not in run.json — the state
+    // only reflects it through the load-time cache merge.
     let state = fleet.wait_state(Duration::from_secs(20), |state| {
         !state.available_models.is_empty()
     });
@@ -429,6 +449,15 @@ fn records_the_model_pi_resolved_and_the_available_models() {
             .iter()
             .any(|m| m.id == "glm-5.3-flash" && m.provider == "vendorco")
     );
+    let cache = read_cache(&fleet.parl_dir);
+    assert!(
+        cache
+            .available_models
+            .iter()
+            .any(|m| m.id == "glm-5.3-flash" && m.provider == "vendorco")
+    );
+    let run_raw = fleet.read("run.json");
+    assert!(!run_raw.contains("availableModels"), "{run_raw}");
 }
 
 #[test]
@@ -1022,10 +1051,11 @@ fn spawn_failures_are_diagnosed_in_pi_log() {
     assert!(pi_log.contains("[monitor] failed to start pi"), "{pi_log}");
 }
 
-/// The console-facing summary of a settled run's JSON state keeps the new
-/// fields (a smoke check for later steps reading run.json).
+/// The console-facing summary of a settled run's JSON state keeps the run
+/// facts (a smoke check for later steps reading run.json) and never picks up
+/// the pi catalogue: that lives in the fleet cache and is merged at load.
 #[test]
-fn run_json_serializes_the_new_fields() {
+fn run_json_keeps_run_facts_and_strips_the_pi_catalogue() {
     let fleet = Fleet::new("pf-json-");
     fleet.write_state();
     let mut state = fleet.state();
@@ -1046,10 +1076,25 @@ fn run_json_serializes_the_new_fields() {
     let raw: Value =
         serde_json::from_str(&std::fs::read_to_string(fleet.run_dir.join("run.json")).unwrap())
             .unwrap();
-    assert_eq!(raw["availableModels"][0]["id"], "glm-5.3");
+    // The catalogue never lands in run.json; run facts still do.
+    assert!(raw.get("availableModels").is_none(), "{raw}");
     assert_eq!(raw["pendingDialog"]["method"], "select");
-    // Round-trips through the tolerant reader.
+    // Round-trips through the tolerant reader; without a fleet cache the
+    // catalogue reads empty.
+    let loaded = run::load_state(&fleet.run_dir).unwrap();
+    assert!(loaded.available_models.is_empty());
+    assert_eq!(loaded.pending_dialog.unwrap().method, "select");
+    // With the fleet cache present, loading sources the catalogue from it.
+    let cache = parl::fleet::run::PiCache {
+        available_models: vec![parl::fleet::run::WorkerModel {
+            provider: "fakeprovider".into(),
+            id: "glm-5.3".into(),
+            name: Some("GLM 5.3".into()),
+        }],
+        commands: Vec::new(),
+    };
+    run::write_pi_cache(&fleet.parl_dir, &cache).unwrap();
     let loaded = run::load_state(&fleet.run_dir).unwrap();
     assert_eq!(loaded.available_models.len(), 1);
-    assert_eq!(loaded.pending_dialog.unwrap().method, "select");
+    assert_eq!(loaded.available_models[0].id, "glm-5.3");
 }
