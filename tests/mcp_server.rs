@@ -131,7 +131,12 @@ struct Client {
 
 impl Client {
     async fn connect(fleet: &Fleet) -> (Client, tokio::task::JoinHandle<()>) {
-        let server = FleetServer::new(Some(fleet.root().to_path_buf()));
+        // The fleet dir is pinned: the ambient `PARL_DIR` must never
+        // redirect the server's per-call resolution to another fleet.
+        let server = FleetServer::with_parl_dir(
+            Some(fleet.root().to_path_buf()),
+            Some(fleet.paths.root().to_string_lossy().into_owned()),
+        );
         let (client_half, server_half) = tokio::io::duplex(1 << 16);
         let (server_read, server_write) = tokio::io::split(server_half);
         let handle = tokio::spawn(async move {

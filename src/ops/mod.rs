@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::ExitCode;
 use crate::git;
-use crate::paths::FleetPaths;
+use crate::paths::{FleetPaths, env_var};
 
 /// What a command core produces: the exit code, the lines the CLI prints on
 /// stdout (`out`) and stderr (`err`), and structured data for programmatic
@@ -78,6 +78,17 @@ pub struct ResolvedFleet {
 
 /// Locate the fleet dir for `cwd` (default: the process's working directory).
 pub async fn resolve_fleet_dir(cwd: Option<&Path>) -> anyhow::Result<ResolvedFleet> {
+    resolve_fleet_dir_with_env(cwd, ambient_parl_dir().as_deref()).await
+}
+
+/// [`resolve_fleet_dir`] with the `$PARL_DIR` value injected, mirroring
+/// [`FleetPaths::discover_with_env`]: production passes the real environment
+/// value; tests pass `None` so resolution can never leave the caller's own
+/// directories by inheriting an ambient variable.
+pub async fn resolve_fleet_dir_with_env(
+    cwd: Option<&Path>,
+    parl_dir: Option<&str>,
+) -> anyhow::Result<ResolvedFleet> {
     let requested = match cwd {
         Some(dir) => dir.to_path_buf(),
         None => std::env::current_dir()?,
@@ -96,9 +107,16 @@ pub async fn resolve_fleet_dir(cwd: Option<&Path>) -> anyhow::Result<ResolvedFle
     Ok(ResolvedFleet {
         repo_root: is_git.then_some(resolved_root.clone()),
         is_git,
-        paths: FleetPaths::discover(&resolved_root),
+        paths: FleetPaths::discover_with_env(&resolved_root, parl_dir),
         target_dir,
     })
+}
+
+/// The ambient `$PARL_DIR` value, passed into the injectable variants by the
+/// production wrappers. Tests pass `None` instead, so nothing in a test run
+/// resolves the environment and lands in an unrelated fleet.
+pub(crate) fn ambient_parl_dir() -> Option<String> {
+    std::env::var(env_var("DIR")).ok()
 }
 
 #[cfg(test)]
@@ -149,7 +167,7 @@ mod tests {
                     continue;
                 }
             };
-            match resolve_fleet_dir(Some(&sub)).await {
+            match resolve_fleet_dir_with_env(Some(&sub), None).await {
                 Ok(resolved)
                     if resolved.is_git
                         && resolved
@@ -185,7 +203,9 @@ mod tests {
         );
 
         let plain = tmp_dir("parl-ops-plain-");
-        let standalone = resolve_fleet_dir(Some(&plain)).await.unwrap();
+        let standalone = resolve_fleet_dir_with_env(Some(&plain), None)
+            .await
+            .unwrap();
         assert!(!standalone.is_git);
         assert_eq!(standalone.repo_root, None);
         assert_eq!(
@@ -193,8 +213,23 @@ mod tests {
             plain.canonicalize().unwrap().join(".parl")
         );
 
-        let missing = resolve_fleet_dir(Some(&plain.join("nope"))).await;
+        let missing = resolve_fleet_dir_with_env(Some(&plain.join("nope")), None).await;
         let err = missing.unwrap_err().to_string();
         assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_fleet_dir_with_env_pins_or_falls_back() {
+        let plain = tmp_dir("parl-ops-override-");
+        // An injected value wins over the cwd fallback, like `$PARL_DIR` does.
+        let pinned = resolve_fleet_dir_with_env(Some(&plain), Some("/elsewhere/fleet"))
+            .await
+            .unwrap();
+        assert_eq!(pinned.paths.root(), Path::new("/elsewhere/fleet"));
+        // A blank value is the variable set-but-empty: the fallback applies.
+        let blank = resolve_fleet_dir_with_env(Some(&plain), Some("  "))
+            .await
+            .unwrap();
+        assert_eq!(blank.paths.root(), blank.target_dir.join(".parl"));
     }
 }

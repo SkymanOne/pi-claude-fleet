@@ -14,7 +14,7 @@ use crate::paths::FleetPaths;
 use crate::util::{run_id_for, sanitize_name};
 use crate::worker::models::{check_model, pi_bin_spec};
 
-use super::{CommandResult, fail, ok, print_result, resolve_fleet_dir};
+use super::{CommandResult, fail, ok, print_result, resolve_fleet_dir_with_env};
 
 /// Everything `spawn` needs to know; constructed verbatim by `main.rs` from
 /// the parsed CLI, so the field set is a frozen contract.
@@ -68,6 +68,14 @@ pub async fn spawn_run(request: SpawnRequest) -> anyhow::Result<ExitCode> {
 /// so a wrong name costs a second. The unknown-model refusal is a `fail`,
 /// not an error, and keeps the TypeScript exit code (`2`).
 pub async fn spawn_core(request: SpawnRequest) -> anyhow::Result<CommandResult<SpawnData>> {
+    spawn_core_with_env(request, super::ambient_parl_dir().as_deref()).await
+}
+
+/// [`spawn_core`] with the `$PARL_DIR` value injected (tests pass `None`).
+pub(crate) async fn spawn_core_with_env(
+    request: SpawnRequest,
+    parl_dir: Option<&str>,
+) -> anyhow::Result<CommandResult<SpawnData>> {
     if request.brief.trim().is_empty() {
         anyhow::bail!("spawn: task brief required after \"--\"");
     }
@@ -75,7 +83,7 @@ pub async fn spawn_core(request: SpawnRequest) -> anyhow::Result<CommandResult<S
     if let Some(bad) = check_model(&pi_bin, request.model.as_deref()).await? {
         return Ok(fail(ExitCode::NoReport, vec![format!("spawn: {bad}")]));
     }
-    let created = create_run(&request).await?;
+    let created = create_run_with_env(&request, parl_dir).await?;
     let mut err: Vec<String> = Vec::new();
     if !created.state.is_git && request.worktree {
         err.push("warning: target is not a git repo — running in place without a worktree".into());
@@ -109,11 +117,19 @@ pub async fn spawn_core(request: SpawnRequest) -> anyhow::Result<CommandResult<S
 /// Create the run: sanitise the name, stamp the run id, cut the worktree on
 /// its own branch from `--base` (or HEAD), and write the initial `run.json`.
 pub async fn create_run(request: &SpawnRequest) -> anyhow::Result<CreatedRun> {
+    create_run_with_env(request, super::ambient_parl_dir().as_deref()).await
+}
+
+/// [`create_run`] with the `$PARL_DIR` value injected (tests pass `None`).
+async fn create_run_with_env(
+    request: &SpawnRequest,
+    parl_dir: Option<&str>,
+) -> anyhow::Result<CreatedRun> {
     let name = sanitize_name(&request.name);
     if name.is_empty() {
         anyhow::bail!("spawn: <name> required");
     }
-    let fleet = resolve_fleet_dir(request.cwd.as_deref()).await?;
+    let fleet = resolve_fleet_dir_with_env(request.cwd.as_deref(), parl_dir).await?;
     // The fixed layout plus the gitignore entry; idempotent.
     fleet.paths.ensure()?;
     let run_id = run_id_for(&name);
@@ -233,7 +249,7 @@ mod tests {
         // Operation-level, so a longer bound than the per-spawn helper's.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            match create_run(request).await {
+            match create_run_with_env(request, None).await {
                 Ok(created) => return Ok(created),
                 Err(err) => {
                     if Instant::now() >= deadline {
@@ -369,7 +385,7 @@ mod tests {
     #[tokio::test]
     async fn empty_names_and_briefs_are_refused() {
         let dir = tmp_dir("parl-spawn-bad-");
-        let err = create_run(&request("!!!", "b", &dir, false))
+        let err = create_run_with_env(&request("!!!", "b", &dir, false), None)
             .await
             .unwrap_err()
             .to_string();

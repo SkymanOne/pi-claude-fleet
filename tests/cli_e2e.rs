@@ -38,6 +38,9 @@ fn serial() -> MutexGuard<'static, ()> {
 fn parl() -> assert_cmd::Command {
     let mut command = assert_cmd::Command::new(assert_cmd::cargo_bin!("parl"));
     command
+        // No child inherits an ambient PARL_DIR; the helpers that know the
+        // test's own fleet dir pin it explicitly below.
+        .env_remove("PARL_DIR")
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
@@ -84,7 +87,19 @@ fn plain_dir() -> (tempfile::TempDir, PathBuf) {
 
 /// Run a subcommand and return (exit code, stdout, stderr).
 fn run(root: &Path, args: &[&str]) -> (i32, String, String) {
-    let output = parl().args(args).current_dir(root).output().unwrap();
+    let output = parl()
+        .args(args)
+        .current_dir(root)
+        // The fleet dir this root resolves to — canonicalized, like the
+        // product's own resolution, so path assertions read the same strings.
+        .env(
+            "PARL_DIR",
+            root.canonicalize()
+                .unwrap()
+                .join(parl::paths::STATE_DIR_NAME),
+        )
+        .output()
+        .unwrap();
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -137,6 +152,12 @@ fn spawn_ok(
         .args(flags)
         .args(["--", brief])
         .current_dir(root)
+        .env(
+            "PARL_DIR",
+            root.canonicalize()
+                .unwrap()
+                .join(parl::paths::STATE_DIR_NAME),
+        )
         .env("PARL_PI_BIN", pi_spec(pi))
         .envs(extra_env.iter().copied())
         .output()
@@ -162,6 +183,12 @@ fn status_json(root: &Path, name: &str) -> Value {
     let output = parl()
         .args(["status", name, "--json"])
         .current_dir(root)
+        .env(
+            "PARL_DIR",
+            root.canonicalize()
+                .unwrap()
+                .join(parl::paths::STATE_DIR_NAME),
+        )
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "status {name} failed");
@@ -206,6 +233,12 @@ fn wait_code(root: &Path, name: &str, timeout_secs: u64) -> i32 {
     parl()
         .args(["wait", name, "--timeout", &timeout_secs.to_string()])
         .current_dir(root)
+        .env(
+            "PARL_DIR",
+            root.canonicalize()
+                .unwrap()
+                .join(parl::paths::STATE_DIR_NAME),
+        )
         .output()
         .unwrap()
         .status
@@ -437,6 +470,7 @@ fn the_hidden_orchestrator_monitor_reaches_its_implementation() {
     let output = StdCommand::new(assert_cmd::cargo_bin!("parl"))
         .args(["orchestrator-monitor", "--fleet-dir"])
         .arg(&fleet_dir)
+        .env("PARL_DIR", &fleet_dir)
         .env("PARL_CLAUDE_BIN", "definitely-not-a-real-claude")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -465,6 +499,12 @@ fn mcp_serves_the_fleet_tools_over_stdio() {
     let mut child = StdCommand::new(assert_cmd::cargo_bin!("parl"))
         .arg("mcp")
         .current_dir(&root)
+        .env(
+            "PARL_DIR",
+            root.canonicalize()
+                .unwrap()
+                .join(parl::paths::STATE_DIR_NAME),
+        )
         .env("PARL_PI_BIN", pi_spec(&fake_pi()))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -531,6 +571,68 @@ fn mcp_serves_the_fleet_tools_over_stdio() {
         std::thread::sleep(POLL);
     };
     assert_eq!(code, Some(0));
+}
+
+/// A spawned `parl` writes only into the fleet dir it was given: `PARL_DIR`
+/// is pinned to one temp dir (the fleet) while the canary stays completely
+/// empty. The canary is also the child's cwd, so it traps both failure modes
+/// this suite once suffered: an inherited ambient `PARL_DIR` and a
+/// `<cwd>/.parl` fallback.
+#[test]
+fn spawn_writes_only_to_the_fleet_dir_it_was_given() {
+    let _serial = serial();
+    let fleet = tempfile::tempdir().unwrap();
+    let canary = tempfile::tempdir().unwrap();
+
+    let output = parl()
+        .args(["spawn", "isolated", "--no-worktree", "--", "b"])
+        .current_dir(canary.path())
+        .env("PARL_DIR", fleet.path())
+        .env("PARL_PI_BIN", pi_spec(&fake_pi()))
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "spawn failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let run_id = stdout
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Spawned ")
+        .unwrap_or_else(|| panic!("unexpected spawn output: {stdout}"))
+        .to_string();
+
+    // The given fleet dir received the run's state.
+    let run_json = fleet.path().join("runs").join(&run_id).join("run.json");
+    assert!(run_json.is_file(), "run.json in the given dir: {stdout}");
+
+    // The canary is still completely empty.
+    assert_eq!(
+        std::fs::read_dir(canary.path()).unwrap().count(),
+        0,
+        "the canary must stay empty"
+    );
+
+    // The detached monitor (and its fake pi) ran against the given fleet
+    // dir; wait for it to be gone before the temp tree drops.
+    let deadline = std::time::Instant::now() + MONITOR_EXIT;
+    loop {
+        let Some(pid) = monitor_pid(&run_json) else {
+            break;
+        };
+        if !parl::fleet::run::is_alive(Some(pid)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the detached monitor never exited"
+        );
+        std::thread::sleep(POLL);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +929,7 @@ fn the_orchestrator_side_writes_the_documented_fleet_layout() {
     let mut monitor = StdCommand::new(assert_cmd::cargo_bin!("parl"))
         .args(["orchestrator-monitor", "--fleet-dir"])
         .arg(&fleet_dir)
+        .env("PARL_DIR", &fleet_dir)
         .env("PARL_CLAUDE_BIN", pi_spec(&fake_claude()))
         .env("FAKE_CLAUDE_SESSION_ID", "sess-e2e-12345678")
         .stdin(Stdio::null())

@@ -91,7 +91,12 @@ impl McpClient {
         let mut command = Command::new(assert_cmd::cargo_bin!("parl"));
         command.args(["mcp"]);
         if let Some(root) = root {
-            command.arg("--cwd").arg(root);
+            // The child must never inherit an ambient PARL_DIR: its fleet is
+            // the one this test created, resolved from `--cwd`.
+            command
+                .arg("--cwd")
+                .arg(root)
+                .env("PARL_DIR", root.join(parl::paths::STATE_DIR_NAME));
         }
         command
             .env("PARL_PI_BIN", format!("node {}", fake_pi().display()))

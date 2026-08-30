@@ -16,7 +16,7 @@ use crate::cli::ExitCode;
 use crate::fleet::run::{self, RunStatus};
 use crate::util::{first_line, format_age, now_ms, parse_ts_ms, read_jsonl_tail, tail_text};
 
-use super::steer::resolve_run;
+use super::steer::resolve_run_with_env;
 use super::{CommandResult, fail, ok, print_result};
 
 /// Poll interval for `wait`.
@@ -134,7 +134,18 @@ pub async fn status_core(
     json: bool,
     all: bool,
 ) -> anyhow::Result<CommandResult<StatusData>> {
-    let fleet = super::resolve_fleet_dir(cwd).await?;
+    status_core_with_env(name, cwd, json, all, super::ambient_parl_dir().as_deref()).await
+}
+
+/// [`status_core`] with the `$PARL_DIR` value injected (tests pass `None`).
+pub(crate) async fn status_core_with_env(
+    name: Option<&str>,
+    cwd: Option<&Path>,
+    json: bool,
+    all: bool,
+    parl_dir: Option<&str>,
+) -> anyhow::Result<CommandResult<StatusData>> {
+    let fleet = super::resolve_fleet_dir_with_env(cwd, parl_dir).await?;
     let fleet_dir = fleet.paths.root().to_path_buf();
     if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
         let target = run::find_run(&fleet_dir, name)?;
@@ -228,7 +239,23 @@ pub async fn wait_core(
     cwd: Option<&Path>,
     timeout_secs: u64,
 ) -> anyhow::Result<CommandResult<WaitData>> {
-    let (_paths, target) = resolve_run(name, cwd).await?;
+    wait_core_with_env(
+        name,
+        cwd,
+        timeout_secs,
+        super::ambient_parl_dir().as_deref(),
+    )
+    .await
+}
+
+/// [`wait_core`] with the `$PARL_DIR` value injected (tests pass `None`).
+pub(crate) async fn wait_core_with_env(
+    name: &str,
+    cwd: Option<&Path>,
+    timeout_secs: u64,
+    parl_dir: Option<&str>,
+) -> anyhow::Result<CommandResult<WaitData>> {
+    let (_paths, target) = resolve_run_with_env(name, cwd, parl_dir).await?;
     let timeout = if timeout_secs > 0 { timeout_secs } else { 600 };
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
     loop {
@@ -271,7 +298,17 @@ pub async fn output_core(
     cwd: Option<&Path>,
     tail: Option<usize>,
 ) -> anyhow::Result<CommandResult<TextData>> {
-    let (paths, target) = resolve_run(name, cwd).await?;
+    output_core_with_env(name, cwd, tail, super::ambient_parl_dir().as_deref()).await
+}
+
+/// [`output_core`] with the `$PARL_DIR` value injected (tests pass `None`).
+pub(crate) async fn output_core_with_env(
+    name: &str,
+    cwd: Option<&Path>,
+    tail: Option<usize>,
+    parl_dir: Option<&str>,
+) -> anyhow::Result<CommandResult<TextData>> {
+    let (paths, target) = resolve_run_with_env(name, cwd, parl_dir).await?;
     let Some(n) = tail.filter(|&n| n > 0) else {
         let text = target
             .state
@@ -313,7 +350,17 @@ pub async fn logs_core(
     cwd: Option<&Path>,
     tail: Option<usize>,
 ) -> anyhow::Result<CommandResult<TextData>> {
-    let (paths, target) = resolve_run(name, cwd).await?;
+    logs_core_with_env(name, cwd, tail, super::ambient_parl_dir().as_deref()).await
+}
+
+/// [`logs_core`] with the `$PARL_DIR` value injected (tests pass `None`).
+pub(crate) async fn logs_core_with_env(
+    name: &str,
+    cwd: Option<&Path>,
+    tail: Option<usize>,
+    parl_dir: Option<&str>,
+) -> anyhow::Result<CommandResult<TextData>> {
+    let (paths, target) = resolve_run_with_env(name, cwd, parl_dir).await?;
     let n = tail.filter(|&n| n > 0).unwrap_or(50);
     let text = tail_text(&paths.pi_log(&target.run_id), n);
     if text.trim().is_empty() {
@@ -328,7 +375,16 @@ pub async fn report_core(
     name: &str,
     cwd: Option<&Path>,
 ) -> anyhow::Result<CommandResult<ReportData>> {
-    let (paths, target) = resolve_run(name, cwd).await?;
+    report_core_with_env(name, cwd, super::ambient_parl_dir().as_deref()).await
+}
+
+/// [`report_core`] with the `$PARL_DIR` value injected (tests pass `None`).
+pub(crate) async fn report_core_with_env(
+    name: &str,
+    cwd: Option<&Path>,
+    parl_dir: Option<&str>,
+) -> anyhow::Result<CommandResult<ReportData>> {
+    let (paths, target) = resolve_run_with_env(name, cwd, parl_dir).await?;
     let result = crate::fleet::report::read_report(paths.root(), &target.state);
     let Some(text) = result.text().map(str::to_string) else {
         return Ok(fail(
@@ -365,7 +421,17 @@ pub async fn attach_core(
     cwd: Option<&Path>,
     tail: Option<usize>,
 ) -> anyhow::Result<CommandResult<Vec<String>>> {
-    let (paths, target) = resolve_run(name, cwd).await?;
+    attach_core_with_env(name, cwd, tail, super::ambient_parl_dir().as_deref()).await
+}
+
+/// [`attach_core`] with the `$PARL_DIR` value injected (tests pass `None`).
+async fn attach_core_with_env(
+    name: &str,
+    cwd: Option<&Path>,
+    tail: Option<usize>,
+    parl_dir: Option<&str>,
+) -> anyhow::Result<CommandResult<Vec<String>>> {
+    let (paths, target) = resolve_run_with_env(name, cwd, parl_dir).await?;
     let n = tail.filter(|&n| n > 0).unwrap_or(40);
     let lines = transcript_tail(&paths.run_events(&target.run_id), n);
     if lines.is_empty() {
@@ -601,7 +667,9 @@ mod tests {
     #[tokio::test]
     async fn status_on_an_empty_fleet_says_so_without_printing() {
         let dir = tmp_dir("parl-query-");
-        let result = status_core(None, Some(&dir), false, false).await.unwrap();
+        let result = status_core_with_env(None, Some(&dir), false, false, None)
+            .await
+            .unwrap();
         assert_eq!(result.code, ExitCode::Ok);
         assert_eq!(result.out, vec!["(no runs)"]);
         assert!(result.data.runs.is_empty());
@@ -624,7 +692,7 @@ mod tests {
         });
         run::save_state(&paths.run_dir(&run_id), &state).unwrap();
 
-        let result = status_core(Some("auth"), Some(&dir), false, false)
+        let result = status_core_with_env(Some("auth"), Some(&dir), false, false, None)
             .await
             .unwrap();
         assert_eq!(result.code, ExitCode::Ok);
@@ -669,7 +737,9 @@ mod tests {
         old.status = RunStatus::Archived;
         run::save_state(&old_dir, &old).unwrap();
 
-        let table = status_core(None, Some(&dir), false, false).await.unwrap();
+        let table = status_core_with_env(None, Some(&dir), false, false, None)
+            .await
+            .unwrap();
         assert_eq!(table.code, ExitCode::Ok);
         let header = &table.out[0];
         assert!(
@@ -690,7 +760,9 @@ mod tests {
             table.out
         );
 
-        let all = status_core(None, Some(&dir), false, true).await.unwrap();
+        let all = status_core_with_env(None, Some(&dir), false, true, None)
+            .await
+            .unwrap();
         assert!(
             all.out
                 .iter()
@@ -699,14 +771,16 @@ mod tests {
             all.out
         );
 
-        let json = status_core(None, Some(&dir), true, false).await.unwrap();
+        let json = status_core_with_env(None, Some(&dir), true, false, None)
+            .await
+            .unwrap();
         let parsed: Value = serde_json::from_str(&json.out[0]).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 1);
         assert_eq!(parsed[0]["status"], "settled");
 
         // An empty fleet in json mode is an empty array.
         let empty_dir = tmp_dir("parl-query-empty-");
-        let empty = status_core(None, Some(&empty_dir), true, false)
+        let empty = status_core_with_env(None, Some(&empty_dir), true, false, None)
             .await
             .unwrap();
         assert_eq!(empty.out, vec!["[]"]);
@@ -724,14 +798,20 @@ mod tests {
         )
         .unwrap();
 
-        let text = output_core("auth", Some(&dir), None).await.unwrap();
+        let text = output_core_with_env("auth", Some(&dir), None, None)
+            .await
+            .unwrap();
         assert_eq!(text.out, vec!["Working: wrote hello.txt"]);
-        let trail = output_core("auth", Some(&dir), Some(5)).await.unwrap();
+        let trail = output_core_with_env("auth", Some(&dir), Some(5), None)
+            .await
+            .unwrap();
         assert_eq!(trail.out, vec!["bash: hi"]);
 
         // No events at all: the placeholder, not an error.
         let (dir2, _p2, _r2) = fleet_with_run("parl-query-out2-", RunStatus::Running, Some(1));
-        let trail2 = output_core("auth", Some(&dir2), Some(5)).await.unwrap();
+        let trail2 = output_core_with_env("auth", Some(&dir2), Some(5), None)
+            .await
+            .unwrap();
         assert_eq!(trail2.out, vec!["(no tool activity yet)"]);
     }
 
@@ -742,19 +822,25 @@ mod tests {
         for i in 0..10 {
             crate::util::append_text(&log, &format!("line {i}\n")).unwrap();
         }
-        let result = logs_core("auth", Some(&dir), Some(3)).await.unwrap();
+        let result = logs_core_with_env("auth", Some(&dir), Some(3), None)
+            .await
+            .unwrap();
         assert_eq!(result.code, ExitCode::Ok);
         assert_eq!(result.out, vec!["line 7\nline 8\nline 9"]);
 
         let (dir2, _p2, _r2) = fleet_with_run("parl-query-logs2-", RunStatus::Running, Some(1));
-        let none = logs_core("auth", Some(&dir2), None).await.unwrap();
+        let none = logs_core_with_env("auth", Some(&dir2), None, None)
+            .await
+            .unwrap();
         assert_eq!(none.out, vec!["(no pi.log yet)"]);
     }
 
     #[tokio::test]
     async fn report_exit_2_without_anything_and_appendix_when_steered() {
         let (dir, _paths, _run_id) = fleet_with_run("parl-query-rep1-", RunStatus::Settled, None);
-        let missing = report_core("auth", Some(&dir)).await.unwrap();
+        let missing = report_core_with_env("auth", Some(&dir), None)
+            .await
+            .unwrap();
         assert_eq!(missing.code, ExitCode::NoReport);
         assert!(missing.err[0].contains("no report file and no captured output for auth"));
 
@@ -768,7 +854,9 @@ mod tests {
         let mut state = run::load_state(&paths.run_dir(&run_id)).unwrap();
         crate::fleet::run::record_steering(&mut state, "console", "t1", "try again");
         run::save_state(&paths.run_dir(&run_id), &state).unwrap();
-        let result = report_core("auth", Some(&dir)).await.unwrap();
+        let result = report_core_with_env("auth", Some(&dir), None)
+            .await
+            .unwrap();
         assert_eq!(result.code, ExitCode::Ok);
         assert_eq!(result.out[0], "# Fleet Report\n\nDone.\n");
         assert!(result.out[1].contains("## Steering log"));
@@ -779,7 +867,9 @@ mod tests {
         let mut state = run::load_state(&paths.run_dir(&run_id)).unwrap();
         state.last_assistant_text = Some("some final text".into());
         run::save_state(&paths.run_dir(&run_id), &state).unwrap();
-        let fallback = report_core("auth", Some(&dir)).await.unwrap();
+        let fallback = report_core_with_env("auth", Some(&dir), None)
+            .await
+            .unwrap();
         assert_eq!(fallback.data.kind, "fallback");
         assert!(fallback.out[0].contains("falling back to last assistant text"));
     }
@@ -801,7 +891,9 @@ mod tests {
                 run::save_state(&late, &s).unwrap();
             }
         });
-        let settled = wait_core("auth", Some(&dir), 10).await.unwrap();
+        let settled = wait_core_with_env("auth", Some(&dir), 10, None)
+            .await
+            .unwrap();
         assert_eq!(settled.code, ExitCode::Ok);
         assert_eq!(settled.out, vec!["auth settled"]);
         assert_eq!(settled.data.status.as_deref(), Some("settled"));
@@ -811,7 +903,9 @@ mod tests {
         let mut state = run::load_state(&paths2.run_dir(&run2)).unwrap();
         state.pid = Some(std::process::id() as i32);
         run::save_state(&paths2.run_dir(&run2), &state).unwrap();
-        let timed_out = wait_core("auth", Some(&dir2), 1).await.unwrap();
+        let timed_out = wait_core_with_env("auth", Some(&dir2), 1, None)
+            .await
+            .unwrap();
         assert_eq!(timed_out.code, ExitCode::WaitTimeout);
         assert!(
             timed_out.err[0].contains("timed out after 1s"),
@@ -822,7 +916,9 @@ mod tests {
 
         // Stopped run: exit 4.
         let (dir3, _p3, _r3) = fleet_with_run("parl-query-wait3-", RunStatus::Stopped, None);
-        let stopped = wait_core("auth", Some(&dir3), 5).await.unwrap();
+        let stopped = wait_core_with_env("auth", Some(&dir3), 5, None)
+            .await
+            .unwrap();
         assert_eq!(stopped.code, ExitCode::RunEndedBadly);
         assert_eq!(stopped.out, vec!["auth stopped"]);
 
@@ -831,7 +927,9 @@ mod tests {
         let mut state = run::load_state(&paths4.run_dir(&run4)).unwrap();
         state.pid = Some(i32::MAX - 1); // not our pid, not alive
         run::save_state(&paths4.run_dir(&run4), &state).unwrap();
-        let dead = wait_core("auth", Some(&dir4), 5).await.unwrap();
+        let dead = wait_core_with_env("auth", Some(&dir4), 5, None)
+            .await
+            .unwrap();
         assert_eq!(dead.code, ExitCode::RunEndedBadly);
         assert_eq!(dead.out, vec!["auth dead"]);
     }
@@ -849,7 +947,9 @@ mod tests {
         for line in lines {
             crate::util::append_text(&paths.run_events(&run_id), &format!("{line}\n")).unwrap();
         }
-        let result = attach_core("auth", Some(&dir), None).await.unwrap();
+        let result = attach_core_with_env("auth", Some(&dir), None, None)
+            .await
+            .unwrap();
         assert_eq!(result.code, ExitCode::Ok);
         let text = result.out.join("\n");
         assert!(text.contains("▶ task: make the thing"), "{text}");
@@ -863,12 +963,16 @@ mod tests {
             result.err[0]
         );
         // --tail 1 keeps exactly one line.
-        let short = attach_core("auth", Some(&dir), Some(1)).await.unwrap();
+        let short = attach_core_with_env("auth", Some(&dir), Some(1), None)
+            .await
+            .unwrap();
         assert_eq!(short.out.len(), 1);
 
         // No events at all: the placeholder note.
         let (dir2, _p2, _r2) = fleet_with_run("parl-query-attach2-", RunStatus::Starting, None);
-        let none = attach_core("auth", Some(&dir2), None).await.unwrap();
+        let none = attach_core_with_env("auth", Some(&dir2), None, None)
+            .await
+            .unwrap();
         assert_eq!(none.out, vec!["(no events captured yet)"]);
     }
 
