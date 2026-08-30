@@ -15,6 +15,7 @@
 //! permission request waiting for an answer, say.
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -39,6 +40,10 @@ const FLUSH_MS: u64 = 200;
 const CONTROL_POLL_MS: u64 = 200;
 /// Token deltas are coalesced into one record per tick, so the file stays small.
 const STREAM_FLUSH_MS: u64 = 150;
+/// Consecutive polls with the fleet directory missing before the monitor
+/// accepts that it was deleted or moved out from under it: a single
+/// transient `NotFound` under load is not a deletion.
+const MISSING_DIR_POLLS: u32 = 2;
 
 /// Run the orchestrator monitor for the fleet rooted at `fleet_dir`.
 pub async fn run_orchestrator_monitor(fleet_dir: &Path) -> anyhow::Result<ExitCode> {
@@ -101,6 +106,12 @@ struct Shared {
     process: Option<Arc<OrchestratorProcess>>,
     /// Byte offset into `inbox.jsonl` already consumed.
     control_offset: u64,
+    /// Consecutive polls that found the fleet directory missing.
+    dir_missing_polls: u32,
+    /// Set once the fleet directory loss (or an answering stop) ends the
+    /// session; blocks a flag-change restart from respawning a child into a
+    /// directory that no longer exists.
+    shutting_down: bool,
 }
 
 /// The monitor for one fleet's orchestrator.
@@ -185,6 +196,8 @@ impl Monitor {
                 restart: None,
                 process: None,
                 control_offset: 0,
+                dir_missing_polls: 0,
+                shutting_down: false,
             }),
         });
         // The pid is discoverable the moment the monitor boots, like the
@@ -301,9 +314,13 @@ impl Monitor {
                     }
                     // A flag change, not the end of the session: the same
                     // conversation is resumed in a new child and the console
-                    // sees no exit at all.
+                    // sees no exit at all. Once the fleet directory loss (or
+                    // an answering stop) has ended the session, there is
+                    // nothing to resume into.
                     let restart = { self.shared().restart.take() };
-                    if let Some(restart) = restart {
+                    if let Some(restart) = restart
+                        && !self.shared().shutting_down
+                    {
                         rx = self.restart_child(restart);
                         continue;
                     }
@@ -529,9 +546,63 @@ impl Monitor {
                 if owner.shared().finished {
                     break;
                 }
+                // The inbox poll doubles as the watch on the fleet directory:
+                // once it has been gone for consecutive polls, no console can
+                // ever reach this orchestrator again, and polling on would
+                // just add another orphaned monitor holding a claude child.
+                if owner.fleet_dir_gone() {
+                    owner.shutdown_for_missing_dir().await;
+                    break;
+                }
                 owner.poll_inbox().await;
             }
         });
+    }
+
+    /// The poll tick's liveness check on the fleet directory: true only once
+    /// it (or the monitor's own `orchestrator/` inside it) has been missing
+    /// for [`MISSING_DIR_POLLS`] consecutive polls. A present directory
+    /// resets the count, so a transient `NotFound` under load never trips it.
+    fn fleet_dir_gone(&self) -> bool {
+        let missing =
+            dir_is_missing(&self.fleet_dir) || dir_is_missing(&self.paths.orchestrator_dir());
+        let mut sh = self.shared();
+        if missing {
+            sh.dir_missing_polls += 1;
+        } else {
+            sh.dir_missing_polls = 0;
+        }
+        missing && sh.dir_missing_polls >= MISSING_DIR_POLLS
+    }
+
+    /// The fleet directory vanished: end the claude child exactly as a `stop`
+    /// command would, leave the reason behind, and let the run loop wind down
+    /// through the same exit path a stop takes.
+    async fn shutdown_for_missing_dir(&self) {
+        {
+            let mut sh = self.shared();
+            sh.shutting_down = true;
+            sh.restart = None;
+        }
+        let proc = { self.shared().process.clone() };
+        self.write_notice(
+            "· the fleet directory is gone; shutting down".into(),
+            Some(true),
+        );
+        // The spawners point this monitor's stderr at `orchestrator/
+        // claude.log`, and that open handle survives the directory's removal
+        // — so this line is the reason in that log, where the transcript and
+        // the state file cannot go: they live under what was deleted.
+        let mut stderr = std::io::stderr();
+        let _ = writeln!(
+            stderr,
+            "[{}] [monitor] the fleet directory {} is gone; stopping claude and exiting",
+            now_iso(),
+            self.fleet_dir.display()
+        );
+        if let Some(proc) = proc {
+            proc.stop().await;
+        }
     }
 
     fn spawn_signal_handlers(self: &Arc<Self>) {
@@ -782,6 +853,16 @@ impl Monitor {
     }
 }
 
+/// A metadata miss with `NotFound` is the only thing that counts as the
+/// directory being gone; any other error (a permission blip, say) reads as
+/// present, so an unrelated IO hiccup never kills a live session.
+fn dir_is_missing(path: &Path) -> bool {
+    matches!(
+        std::fs::metadata(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// How a console answered, as the transcript's `how` field spells it.
 fn decision_how(decision: &PermissionDecisionRecord) -> &'static str {
     match decision {
@@ -847,6 +928,39 @@ mod tests {
         // The boot wrote the durable files a console reads back.
         assert!(fleet.join("orchestrator/prompt.md").is_file());
         assert!(load_orchestrator_state(&fleet).is_some());
+    }
+
+    /// The directory check tolerates a transient miss: only consecutive
+    /// polls without the fleet read as a deletion, and a directory that
+    /// comes back resets the count.
+    #[test]
+    fn a_missing_fleet_directory_trips_only_after_consecutive_polls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = tmp.path().join(".parl");
+        std::fs::create_dir_all(&fleet).unwrap();
+        let monitor = Monitor::boot(&fleet).unwrap();
+        assert!(!monitor.fleet_dir_gone(), "a present fleet is not gone");
+
+        std::fs::remove_dir_all(&fleet).unwrap();
+        assert!(!monitor.fleet_dir_gone(), "one missing poll is tolerated");
+        assert!(monitor.fleet_dir_gone(), "the second consecutive one trips");
+
+        // restored (or moved back): the count starts over
+        std::fs::create_dir_all(fleet.join("orchestrator")).unwrap();
+        assert!(!monitor.fleet_dir_gone());
+    }
+
+    /// Losing just the monitor's own `orchestrator/` inside the fleet counts
+    /// as gone: its log, transcript and state all lived there.
+    #[test]
+    fn losing_the_orchestrator_directory_alone_trips_the_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = tmp.path().join(".parl");
+        std::fs::create_dir_all(&fleet).unwrap();
+        let monitor = Monitor::boot(&fleet).unwrap();
+        std::fs::remove_dir_all(fleet.join("orchestrator")).unwrap();
+        assert!(!monitor.fleet_dir_gone(), "one missing poll is tolerated");
+        assert!(monitor.fleet_dir_gone());
     }
 
     #[test]
