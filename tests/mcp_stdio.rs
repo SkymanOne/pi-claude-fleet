@@ -11,6 +11,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 
 use parl::fleet::run::{self, RunState};
 use parl::paths::FleetPaths;
@@ -18,6 +19,16 @@ use serde_json::{Value, json};
 
 /// The fake pi settles this long after its work turn.
 const FAKE_PI_DELAY_MS: &str = "200";
+
+/// Each test here boots the real binary plus a node fake pi and a detached
+/// monitor. Running them concurrently spikes the CPU enough to trip the
+/// timing-sensitive monitor suite that shares the `cargo test` run, so they
+/// go one at a time; nothing else in these tests is order-dependent.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn fake_pi() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-pi-parl.mjs")
@@ -229,6 +240,7 @@ fn text_of(result: &Value) -> String {
 /// `parl mcp` speaks MCP over stdio and stdout carries protocol only.
 #[test]
 fn speaks_mcp_over_stdio_with_a_clean_stdout() {
+    let _serial = serial();
     let root = plain_dir();
     let mut client = McpClient::spawn(Some(&root), &[]);
     let tools = client.list_tools();
@@ -251,6 +263,7 @@ fn speaks_mcp_over_stdio_with_a_clean_stdout() {
 /// narrow environment claude actually spawns the server with.
 #[test]
 fn derives_the_fleet_from_parl_dir_when_cwd_is_absent() {
+    let _serial = serial();
     let root = plain_dir();
     let paths = FleetPaths::new(root.join(parl::paths::STATE_DIR_NAME));
     let run_id = "w-20260828141530";
@@ -293,6 +306,7 @@ fn derives_the_fleet_from_parl_dir_when_cwd_is_absent() {
 /// guard, which rmcp implements: unparsable input is skipped silently).
 #[test]
 fn malformed_input_does_not_kill_the_server() {
+    let _serial = serial();
     let root = plain_dir();
     let mut client = McpClient::spawn(Some(&root), &[]);
     // Garbage before and between well-formed requests.
@@ -314,6 +328,7 @@ fn malformed_input_does_not_kill_the_server() {
 /// the fake pi, through the real binary.
 #[test]
 fn spawn_wait_report_status_and_cleanup_over_fake_pi() {
+    let _serial = serial();
     let root = plain_dir();
     let mut client = McpClient::spawn(Some(&root), &[]);
 
@@ -425,6 +440,7 @@ fn spawn_wait_report_status_and_cleanup_over_fake_pi() {
 /// left clean, and rebase guidance for the worker.
 #[test]
 fn fleet_merge_aborts_on_conflict_and_leaves_the_checkout_clean() {
+    let _serial = serial();
     let root = init_repo();
     let mut client = McpClient::spawn(Some(&root), &[("FAKE_PI_WRITE_HELLO", "1")]);
 
