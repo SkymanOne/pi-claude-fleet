@@ -200,7 +200,7 @@ fn permission(
             body.push(Line::raw(line));
         }
         body.push(Line::default());
-        let option_count = current.options.as_ref().map_or(0, |o| o.len());
+        let option_count = current.options.as_ref().map_or(0, Vec::len);
         for (i, option) in current.options.iter().flatten().enumerate() {
             body.push(option_row(option, state.selected == i, pal));
         }
@@ -422,8 +422,7 @@ fn search(frame: &mut Frame, area: Rect, state: &SearchState, pal: &Palette) {
     let count = state.matches.len();
     let current = state
         .current
-        .map(|c| format!("{}", c + 1))
-        .unwrap_or_else(|| "·".to_string());
+        .map_or_else(|| "·".to_string(), |c| (c + 1).to_string());
     let lines = vec![
         Line::from(vec![
             Span::styled("/ ".to_string(), pal.accent()),

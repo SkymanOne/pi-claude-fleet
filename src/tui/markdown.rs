@@ -20,7 +20,16 @@ use crate::tui::theme::Palette;
 /// the columns off the pane.
 const MAX_CELL: usize = 40;
 
+/// Below this per-cell width a table layout is not readable; the rows render
+/// as plain wrapped lines instead of shredding cells into fragments.
+const MIN_CELL: usize = 8;
+
 /// Render markdown into styled lines no wider than `width`.
+///
+/// # Errors
+///
+/// Never fails today; the `Result` keeps the door open for a hard failure in
+/// a future block kind without changing the API.
 pub fn render(markdown: &str, width: usize, pal: &Palette) -> anyhow::Result<Vec<Line<'static>>> {
     let width = width.max(8);
     let mut r = Renderer::new(pal, width);
@@ -58,7 +67,7 @@ struct TableState {
 }
 
 impl TableState {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             rows: Vec::new(),
             row: Vec::new(),
@@ -86,11 +95,10 @@ struct Renderer<'a> {
     list_stack: Vec<Option<u64>>,
     table: TableState,
     in_html: bool,
-    in_cell: bool,
 }
 
 impl<'a> Renderer<'a> {
-    fn new(pal: &'a Palette, width: usize) -> Self {
+    const fn new(pal: &'a Palette, width: usize) -> Self {
         Self {
             pal,
             width,
@@ -109,13 +117,12 @@ impl<'a> Renderer<'a> {
             list_stack: Vec::new(),
             table: TableState::new(),
             in_html: false,
-            in_cell: false,
         }
     }
 
     fn event(&mut self, event: Event<'_>) {
         match event {
-            Event::Start(tag) => self.start(tag),
+            Event::Start(tag) => self.start(&tag),
             Event::End(end) => self.end(end),
             Event::Text(text) => {
                 if self.in_code {
@@ -140,13 +147,17 @@ impl<'a> Renderer<'a> {
                 let mark = if done { "[x] " } else { "[ ] " };
                 self.para.push(Span::styled(mark.to_string(), style));
             }
-            // html passes through unpainted: it is chrome, not content
-            Event::Html(_) | Event::InlineHtml(_) => {}
-            Event::FootnoteReference(_) | Event::InlineMath(_) | Event::DisplayMath(_) => {}
+            // html and the rarely-seen reference/math kinds pass through
+            // unpainted: they are chrome, not content
+            Event::Html(_)
+            | Event::InlineHtml(_)
+            | Event::FootnoteReference(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_) => {}
         }
     }
 
-    fn start(&mut self, tag: Tag<'_>) {
+    fn start(&mut self, tag: &Tag<'_>) {
         match tag {
             Tag::Paragraph => {
                 self.flush_para();
@@ -168,7 +179,7 @@ impl<'a> Renderer<'a> {
             }
             Tag::List(start) => {
                 self.flush_para();
-                self.list_stack.push(start);
+                self.list_stack.push(*start);
             }
             Tag::Item => {
                 self.flush_para();
@@ -202,13 +213,11 @@ impl<'a> Renderer<'a> {
                 // cell content flows through the same inline machinery; the
                 // cell boundary just claims what accumulated
                 self.flush_para();
-                self.in_cell = true;
             }
             Tag::Emphasis => self.italic += 1,
             Tag::Strong => self.bold += 1,
             Tag::Strikethrough => self.strike += 1,
-            Tag::Link { .. } => self.link += 1,
-            Tag::Image { .. } => self.link += 1,
+            Tag::Link { .. } | Tag::Image { .. } => self.link += 1,
             Tag::HtmlBlock => self.in_html = true,
             _ => {}
         }
@@ -216,7 +225,7 @@ impl<'a> Renderer<'a> {
 
     fn end(&mut self, end: TagEnd) {
         match end {
-            TagEnd::Paragraph => self.flush_para(),
+            TagEnd::Paragraph | TagEnd::Item => self.flush_para(),
             TagEnd::Heading(_) => {
                 self.flush_para();
                 self.heading = false;
@@ -232,7 +241,6 @@ impl<'a> Renderer<'a> {
             TagEnd::List(_) => {
                 self.list_stack.pop();
             }
-            TagEnd::Item => self.flush_para(),
             TagEnd::Table => {
                 let rows = std::mem::take(&mut self.table.rows);
                 let header = self.table.saw_header;
@@ -253,7 +261,6 @@ impl<'a> Renderer<'a> {
                 self.table.rows.push(row);
             }
             TagEnd::TableCell => {
-                self.in_cell = false;
                 let mut cell = std::mem::take(&mut self.para);
                 if self.table.in_head {
                     for span in &mut cell {
@@ -371,17 +378,14 @@ fn words_of(text: &str) -> Vec<String> {
     let mut in_word = false;
     for ch in text.chars() {
         if ch.is_whitespace() {
-            if in_word {
-                in_word = false;
-            }
-            current.push(ch);
+            in_word = false;
         } else {
             if !in_word && !current.is_empty() {
                 words.push(std::mem::take(&mut current));
             }
             in_word = true;
-            current.push(ch);
         }
+        current.push(ch);
     }
     if !current.is_empty() {
         words.push(current);
@@ -396,6 +400,11 @@ fn width_of(text: &str) -> usize {
 /// Break a styled span run into lines of at most `width` printed columns, on
 /// word boundaries; one word longer than the line is broken rather than lost.
 pub fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<Vec<Span<'static>>> {
+    // A zero-column line can hold nothing; return before the long-word
+    // breaker below fails to advance and loops forever pushing empty pieces.
+    if width == 0 {
+        return Vec::new();
+    }
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     let mut line: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
@@ -484,11 +493,80 @@ fn printed(spans: &[Span<'_>]) -> usize {
     spans.iter().map(|s| width_of(&s.content)).sum()
 }
 
+/// Fold a row that carries more cells than the table's agreed column count
+/// (a stray `|` inside inline code or a regex splits cells at the block
+/// level) into the last column: nothing is lost, and the phantom columns
+/// never reach the layout. Table cells are always owned (built from the
+/// parse into `String`s), so this works on `'static` spans.
+fn normalize_row(row: &[Vec<Span<'static>>], columns: usize) -> Vec<Vec<Span<'static>>> {
+    if row.len() <= columns {
+        return row.to_vec();
+    }
+    let mut cells: Vec<Vec<Span<'static>>> = row[..columns - 1].to_vec();
+    let mut last = row[columns - 1].clone();
+    for extra in &row[columns..] {
+        last.extend(extra.iter().cloned());
+    }
+    cells.push(last);
+    cells
+}
+
+/// The table's real column count: the width most rows actually carry. The
+/// header row declares the author's intent, so a tie goes to it; a single
+/// over-split row must never inflate the whole table's layout.
+fn table_columns(rows: &[Vec<Vec<Span>>], header: bool) -> usize {
+    let mut widths: Vec<usize> = rows.iter().map(Vec::len).collect();
+    widths.sort_unstable();
+    let mut best = widths[0];
+    let mut best_n = 1usize;
+    let mut i = 0;
+    while i < widths.len() {
+        let width = widths[i];
+        let mut n = 0;
+        while i < widths.len() && widths[i] == width {
+            n += 1;
+            i += 1;
+        }
+        if n > best_n || (n == best_n && header && width == rows[0].len()) {
+            best = width;
+            best_n = n;
+        }
+    }
+    best.max(1)
+}
+
+/// A table with more columns than the pane can show readably, rendered as
+/// plain wrapped rows: cells joined by the separator, wrapped at the full
+/// width. The header keeps its bold; there is no column rule.
+fn render_table_plain(
+    rows: &[Vec<Vec<Span<'static>>>],
+    width: usize,
+    pal: &Palette,
+) -> Vec<Line<'static>> {
+    let separator = Span::styled(" │ ".to_string(), pal.dim());
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for row in rows {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (c, cell) in row.iter().enumerate() {
+            spans.extend(cell.iter().cloned());
+            if c + 1 < row.len() {
+                spans.push(separator.clone());
+            }
+        }
+        for line in wrap_spans(&spans, width) {
+            out.push(Line::from(line));
+        }
+    }
+    out
+}
+
 /// A markdown table as aligned rows: cells keep their inline styling, wrap
 /// onto as many lines as they need (nothing is cut), columns pad to the
-/// widest printed line, and the header gets a rule under it.
+/// widest printed line, and the header gets a rule under it. When the pane
+/// is too narrow for the columns at a readable width, the rows fall back to
+/// plain wrapped lines instead.
 fn render_table(
-    rows: &[Vec<Vec<Span>>],
+    rows: &[Vec<Vec<Span<'static>>>],
     header: bool,
     width: usize,
     pal: &Palette,
@@ -496,20 +574,18 @@ fn render_table(
     if rows.is_empty() {
         return Vec::new();
     }
-    let columns = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    let columns = table_columns(rows, header);
+    let rows: Vec<Vec<Vec<Span>>> = rows.iter().map(|row| normalize_row(row, columns)).collect();
     // keep the whole table near the pane when it can, cap a wide cell at MAX_CELL
-    let col_cap = ((width.saturating_sub(2) / columns).saturating_sub(3)).clamp(4, MAX_CELL);
+    let col_cap = (width.saturating_sub(2) / columns).saturating_sub(3);
+    if col_cap < MIN_CELL {
+        return render_table_plain(&rows, width, pal);
+    }
+    let col_cap = col_cap.min(MAX_CELL);
     let dim = pal.dim();
     let cells: Vec<Vec<Vec<Vec<Span>>>> = rows
         .iter()
-        .map(|row| {
-            (0..columns)
-                .map(|c| match row.get(c) {
-                    Some(cell) => wrap_spans(cell, col_cap),
-                    None => vec![vec![Span::raw(String::new())]],
-                })
-                .collect()
-        })
+        .map(|row| row.iter().map(|cell| wrap_spans(cell, col_cap)).collect())
         .collect();
     let widths: Vec<usize> = (0..columns)
         .map(|c| {
@@ -640,11 +716,7 @@ mod tests {
         assert_eq!(text_of(&lines[0]), "fn main() {");
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::Green));
         // the long line was hard-wrapped, not lost
-        let joined: String = lines
-            .iter()
-            .map(|l| text_of(l))
-            .collect::<Vec<_>>()
-            .join("");
+        let joined: String = lines.iter().map(text_of).collect();
         assert!(joined.contains("so long a line"));
         assert!(joined.contains("somewhere"));
         assert!(lines.iter().any(|l| text_of(l) == "}"));
@@ -777,6 +849,75 @@ mod tests {
                 .style
                 .add_modifier
                 .contains(Modifier::CROSSED_OUT)
+        );
+    }
+
+    #[test]
+    fn a_table_wider_than_the_pane_falls_back_to_plain_rows() {
+        // Ten columns cannot fit a 30-column pane at a readable width: the
+        // rows render as plain wrapped lines, never 4-character fragments.
+        let lines = plain(
+            "| a | b | c | d | e | f | g | h | i | j |\n\
+             |---|---|---|---|---|---|---|---|---|---|\n\
+             | elephant | elephant | elephant | elephant | elephant | elephant | elephant | elephant | elephant | elephant |",
+            30,
+        );
+        let texts: Vec<String> = lines.iter().map(text_of).collect();
+        let joined = texts.join("\n");
+        assert!(joined.contains("elephant"), "{joined}");
+        for line in &lines {
+            assert!(width_of(&text_of(line)) <= 30, "{}", text_of(line));
+        }
+    }
+
+    #[test]
+    fn a_pipe_inside_inline_code_does_not_shred_the_table() {
+        // A `|` inside inline code on the header line inflates pulldown's
+        // column count for the whole table; cells must still render whole
+        // words, not 4-character tails.
+        let lines = plain(
+            "| `pat|tern` | watch |\n|---|---|---|\n| matching | pattern |",
+            24,
+        );
+        let texts: Vec<String> = lines.iter().map(text_of).collect();
+        let joined = texts.join("\n");
+        assert!(joined.contains("pattern"), "{joined}");
+        assert!(joined.contains("matching"), "{joined}");
+        assert!(joined.contains("watch"), "{joined}");
+    }
+
+    #[test]
+    fn an_over_split_row_merges_instead_of_inflating_the_table() {
+        // A body row split by a stray `|` (inside a regex, say) yields more
+        // cells than the header; the overflow folds into the last column and
+        // the other rows keep their shape.
+        fn cell(text: &str) -> Vec<Span<'static>> {
+            vec![Span::raw(text.to_string())]
+        }
+        let rows = vec![
+            vec![cell("name"), cell("value")],
+            vec![cell("alpha"), cell("beta")],
+            // `grep -E 'a|b'` inside a cell splits into: grep -E 'a | b' | done
+            vec![cell("grep -E 'a"), cell("b'"), cell("done")],
+            vec![cell("matching"), cell("pattern")],
+        ];
+        let lines = render_table(&rows, true, 30, &Palette::plain());
+        let joined: String = lines.iter().map(text_of).collect();
+        assert!(joined.contains("alpha"), "{joined}");
+        assert!(joined.contains("matching"), "{joined}");
+        assert!(joined.contains("pattern"), "{joined}");
+        assert!(joined.contains("done"), "{joined}");
+    }
+
+    #[test]
+    fn wrap_spans_does_not_hang_on_a_zero_width() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(wrap_spans(&[Span::raw("word")], 0));
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(Vec::new())
         );
     }
 

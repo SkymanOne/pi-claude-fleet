@@ -64,10 +64,10 @@ pub fn draw(frame: &mut Frame, area: Rect, console: &Console, feeds: &Feeds<'_>,
             part(&mut spans, model.to_string(), pal.dim());
             part(
                 &mut spans,
-                transcript
-                    .session_id()
-                    .map(|id| id.chars().take(8).collect::<String>())
-                    .unwrap_or_else(|| "no session".to_string()) as String,
+                transcript.session_id().map_or_else(
+                    || "no session".to_string(),
+                    |id| id.chars().take(8).collect(),
+                ),
                 pal.dim(),
             );
             part(

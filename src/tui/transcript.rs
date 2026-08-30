@@ -108,21 +108,20 @@ impl Transcript {
     #[must_use]
     pub fn partial(&self) -> Option<String> {
         if !self.open.is_empty() {
-            let joined = self.open.values().cloned().collect::<Vec<_>>().join("");
-            return Some(joined);
+            return Some(self.open.values().cloned().collect());
         }
         (!self.partial.is_empty()).then(|| self.partial.clone())
     }
 
     /// What the orchestrator is doing right now, or none between turns.
     #[must_use]
-    pub fn activity(&self) -> Option<&Activity> {
+    pub const fn activity(&self) -> Option<&Activity> {
         self.activity.as_ref()
     }
 
     /// Is a turn in flight?
     #[must_use]
-    pub fn turn_active(&self) -> bool {
+    pub const fn turn_active(&self) -> bool {
         self.turn_active
     }
 
@@ -140,19 +139,19 @@ impl Transcript {
 
     /// Running spend, from the last result message.
     #[must_use]
-    pub fn cost_usd(&self) -> f64 {
+    pub const fn cost_usd(&self) -> f64 {
         self.cost_usd
     }
 
     /// Completed turns, from the last result message.
     #[must_use]
-    pub fn num_turns(&self) -> u32 {
+    pub const fn num_turns(&self) -> u32 {
         self.num_turns
     }
 
     /// The claude child is gone.
     #[must_use]
-    pub fn exited(&self) -> bool {
+    pub const fn exited(&self) -> bool {
         self.exited
     }
 
@@ -269,14 +268,15 @@ impl Transcript {
                 .get("session_id")
                 .and_then(Value::as_str)
                 .map(str::to_string)
-                .or(self.session_id.clone());
+                .or_else(|| self.session_id.clone());
             if let Some(model) = msg.get("model").and_then(Value::as_str) {
                 self.model = Some(model.to_string());
             }
+            // claude's init message carries servers and, separately, tools
             let servers: Vec<(String, String)> = msg
                 .get("mcp_servers")
                 .and_then(Value::as_array)
-                .map(|list| {
+                .map_or_else(Vec::new, |list| {
                     list.iter()
                         .filter_map(|s| {
                             Some((
@@ -288,10 +288,6 @@ impl Transcript {
                             ))
                         })
                         .collect()
-                })
-                .unwrap_or_else(|| {
-                    // claude's init message carries tools separately
-                    Vec::new()
                 });
             self.orchestrator_tools = msg
                 .get("tools")
@@ -446,7 +442,7 @@ impl Transcript {
                 self.cost_usd = cost;
             }
             if let Some(turns) = msg.get("num_turns").and_then(Value::as_u64) {
-                self.num_turns = turns as u32;
+                self.num_turns = u32::try_from(turns).unwrap_or(u32::MAX);
             }
             if msg
                 .get("is_error")
@@ -624,7 +620,11 @@ impl Transcript {
                     .get("ev")
                     .or_else(|| event.get("assistantMessageEvent"));
                 let Some(a) = a else { return };
-                let index = a.get("contentIndex").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let index: usize = a
+                    .get("contentIndex")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| usize::try_from(v).ok())
+                    .unwrap_or(0);
                 match a.get("type").and_then(Value::as_str) {
                     Some("text_start") => {
                         self.open.insert(index, String::new());
@@ -1167,7 +1167,7 @@ mod tests {
             "total_cost_usd": 0.12, "num_turns": 3, "is_error": false,
         });
         t.apply_claude_message(&result);
-        assert_eq!(t.cost_usd(), 0.12);
+        assert!((t.cost_usd() - 0.12).abs() < 1e-9);
         assert_eq!(t.num_turns(), 3);
         assert!(!t.turn_active());
         assert_eq!(t.activity(), None);

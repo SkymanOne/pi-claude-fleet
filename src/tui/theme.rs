@@ -20,22 +20,19 @@ impl Palette {
     /// (the NO_COLOR convention), colored otherwise.
     #[must_use]
     pub fn detect() -> Self {
-        let color = match std::env::var("NO_COLOR") {
-            Ok(value) => value.is_empty(),
-            Err(_) => true,
-        };
+        let color = std::env::var("NO_COLOR").map_or(true, |value| value.is_empty());
         Self { color }
     }
 
     /// A monochrome palette (tests, and callers outside a terminal).
     #[must_use]
-    pub fn plain() -> Self {
+    pub const fn plain() -> Self {
         Self { color: false }
     }
 
     /// A full-color palette, ignoring the environment (tests).
     #[must_use]
-    pub fn colored() -> Self {
+    pub const fn colored() -> Self {
         Self { color: true }
     }
 
@@ -45,10 +42,7 @@ impl Palette {
 
     fn with(&self, color: Color, modifier: Modifier) -> Style {
         let style = Style::default().add_modifier(modifier);
-        match self.paint(color) {
-            Some(color) => style.fg(color),
-            None => style,
-        }
+        self.paint(color).map_or(style, |c| style.fg(c))
     }
 
     /// The color for a transcript block kind — the colour language the old
@@ -69,10 +63,10 @@ impl Palette {
     }
 
     fn plain_fg(&self, color: Color) -> Style {
-        match self.paint(color) {
-            Some(color) => Style::default().fg(color),
-            None => Style::default().add_modifier(Modifier::DIM),
-        }
+        self.paint(color).map_or_else(
+            || Style::default().add_modifier(Modifier::DIM),
+            |c| Style::default().fg(c),
+        )
     }
 
     /// Dim secondary text (hints, details, counts of what was left out).
@@ -103,28 +97,28 @@ impl Palette {
     /// The row the selection is on: a quiet band, not a flash.
     #[must_use]
     pub fn selected(&self) -> Style {
-        match self.paint(Color::DarkGray) {
-            Some(bg) => Style::default().bg(bg),
-            None => Style::default().add_modifier(Modifier::REVERSED),
-        }
+        self.paint(Color::DarkGray).map_or_else(
+            || Style::default().add_modifier(Modifier::REVERSED),
+            |bg| Style::default().bg(bg),
+        )
     }
 
     /// A search match under the caret sits on plain matches.
     #[must_use]
     pub fn current_match(&self) -> Style {
-        match self.paint(Color::Yellow) {
-            Some(bg) => Style::default().fg(Color::Black).bg(bg),
-            None => Style::default().add_modifier(Modifier::REVERSED),
-        }
+        self.paint(Color::Yellow).map_or_else(
+            || Style::default().add_modifier(Modifier::REVERSED),
+            |bg| Style::default().fg(Color::Black).bg(bg),
+        )
     }
 
     /// Every other search match.
     #[must_use]
     pub fn other_match(&self) -> Style {
-        match self.paint(Color::DarkGray) {
-            Some(bg) => Style::default().bg(bg),
-            None => Style::default().add_modifier(Modifier::UNDERLINED),
-        }
+        self.paint(Color::DarkGray).map_or_else(
+            || Style::default().add_modifier(Modifier::UNDERLINED),
+            |bg| Style::default().bg(bg),
+        )
     }
 
     /// Markdown styling, by what the span is.

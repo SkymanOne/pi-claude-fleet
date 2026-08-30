@@ -80,7 +80,7 @@ mod tests {
 
     /// A pid that is alive no matter what.
     fn alive_pid() -> i32 {
-        std::process::id() as i32
+        i32::try_from(std::process::id()).unwrap()
     }
 
     fn run_state(name: &str, run_id: &str) -> RunState {

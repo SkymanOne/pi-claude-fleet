@@ -174,17 +174,16 @@ fn continues(prev: &Block, cur: &Block) -> bool {
     }
     let indented = cur.text.starts_with(' ');
     match (prev.kind, cur.kind) {
-        // one assistant message: its lines render as one markdown block
-        (BlockKind::Text, BlockKind::Text) => true,
-        // the result sits beneath its call, unmisted by a blank line
-        (BlockKind::Tool, BlockKind::ToolResult) => true,
-        (BlockKind::Tool, BlockKind::Tool) => indented,
+        // one assistant message: its lines render as one markdown block,
+        // and the result sits beneath its call, unmisted by a blank line
+        (BlockKind::Text, BlockKind::Text)
+        | (BlockKind::User, BlockKind::User)
+        | (BlockKind::Fleet, BlockKind::Fleet)
+        | (BlockKind::Tool, BlockKind::ToolResult) => true,
+        (BlockKind::Tool, BlockKind::Tool)
+        | (BlockKind::Thinking, BlockKind::Thinking)
+        | (BlockKind::Error, BlockKind::Error) => indented,
         (BlockKind::ToolResult, BlockKind::ToolResult) => indented && !cur.text.starts_with("  ↳ "),
-        (BlockKind::Thinking, BlockKind::Thinking) => indented,
-        (BlockKind::Error, BlockKind::Error) => indented,
-        // a prompt with newlines is one prompt
-        (BlockKind::User, BlockKind::User) => true,
-        (BlockKind::Fleet, BlockKind::Fleet) => true,
         _ => false,
     }
 }
@@ -264,41 +263,38 @@ fn render_rows(
 
     let mut rows: Vec<(usize, Line<'static>)> = Vec::new();
     let mut more_below = false;
-    match scroll {
-        Some(block) => {
-            // the unit containing the pinned block
-            let start = units.partition_point(|u| u.end <= block);
-            let mut consumed = 0;
-            for unit in units[start..].iter() {
-                let unit_rows = render(unit);
-                push_separated(&mut rows, unit_rows, unit.start);
-                consumed += 1;
-                if rows.len() >= height {
-                    break;
-                }
-            }
-            more_below = start + consumed < total_units;
-            if !more_below {
-                rows.extend(partial_rows(partial, width, pal, blocks.len()));
+    if let Some(block) = scroll {
+        // the unit containing the pinned block
+        let start = units.partition_point(|u| u.end <= block);
+        let mut consumed = 0;
+        for unit in &units[start..] {
+            let unit_rows = render(unit);
+            push_separated(&mut rows, unit_rows, unit.start);
+            consumed += 1;
+            if rows.len() >= height {
+                break;
             }
         }
-        None => {
-            // the partial is the tail's last word, so it renders first
+        more_below = start + consumed < total_units;
+        if !more_below {
             rows.extend(partial_rows(partial, width, pal, blocks.len()));
-            for unit in units.iter().rev() {
-                let mut unit_rows = render(unit);
-                // prepending: the seam is between this unit's last row and
-                // whatever currently sits at the top
-                if !rows.is_empty()
-                    && rows.first().is_some_and(|(_, l)| !is_blank_line(l))
-                    && unit_rows.last().is_some_and(|(_, l)| !is_blank_line(l))
-                {
-                    unit_rows.push((unit.start, Line::from(Span::raw(String::new()))));
-                }
-                rows.splice(0..0, unit_rows.drain(..));
-                if rows.len() >= height {
-                    break;
-                }
+        }
+    } else {
+        // the partial is the tail's last word, so it renders first
+        rows.extend(partial_rows(partial, width, pal, blocks.len()));
+        for unit in units.iter().rev() {
+            let mut unit_rows = render(unit);
+            // prepending: the seam is between this unit's last row and
+            // whatever currently sits at the top
+            if !rows.is_empty()
+                && rows.first().is_some_and(|(_, l)| !is_blank_line(l))
+                && unit_rows.last().is_some_and(|(_, l)| !is_blank_line(l))
+            {
+                unit_rows.push((unit.start, Line::from(Span::raw(String::new()))));
+            }
+            rows.splice(0..0, unit_rows.into_iter());
+            if rows.len() >= height {
+                break;
             }
         }
     }
@@ -309,14 +305,13 @@ fn render_rows(
         .saturating_sub(usize::from(will_hide))
         .saturating_sub(usize::from(more_below))
         .max(1);
-    match scroll {
+    if scroll.is_some() {
         // pinned: the window opens at the pinned block, extra falls below
-        Some(_) => rows.truncate(budget),
+        rows.truncate(budget);
+    } else {
         // tail: the newest rows are the point, extra falls above
-        None => {
-            let skip = rows.len().saturating_sub(budget);
-            rows.drain(0..skip);
-        }
+        let skip = rows.len().saturating_sub(budget);
+        rows.drain(0..skip);
     }
     let hidden = rows.first().map_or(0, |(block, _)| *block);
 
