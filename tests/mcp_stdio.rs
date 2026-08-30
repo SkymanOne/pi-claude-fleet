@@ -349,7 +349,7 @@ fn spawn_wait_report_status_and_cleanup_over_fake_pi() {
         .unwrap()
         .to_owned();
     assert!(
-        regex::Regex::new(r"^hello-\d{14}$")
+        regex::Regex::new(r"^hello-[0-9a-f]{7}$")
             .unwrap()
             .is_match(&run_id),
         "{run_id}"

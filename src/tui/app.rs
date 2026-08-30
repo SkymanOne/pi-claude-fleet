@@ -22,7 +22,7 @@ use crate::fleet::run::{DerivedView, RunState, THINKING_LEVELS, derive_view};
 use crate::orch::args::{PERMISSION_MODES, describe_permission_mode};
 use crate::orch::protocol::PermissionRequest;
 use crate::orch::records::{OrchestratorCommand, OrchestratorState, PermissionDecisionRecord};
-use crate::paths::FleetPaths;
+use crate::paths::{FleetPaths, SessionKey};
 use crate::tui::completions::{
     AgentCommandOption, CompletionState, CompletionTarget, apply_suggestion, completions_for,
     resolve_command,
@@ -348,6 +348,10 @@ pub fn questions_of(request_input: &Value) -> Vec<AskQuestion> {
 /// The console's whole state, minus the terminal.
 pub struct Console {
     fleet: FleetPaths,
+    /// The orchestrator session this console renders: its transcript,
+    /// inbox and prompt all live under `orchestrators/<key>/`. The runtime
+    /// sets it before the first draw.
+    pub(crate) orch_key: SessionKey,
     mode: Mode,
     view: View,
     selected: usize,
@@ -390,6 +394,9 @@ impl Console {
         };
         Self {
             fleet,
+            // The session this console renders; the runtime replaces the
+            // default with the fleet's current session before the first draw.
+            orch_key: SessionKey::default(),
             mode: Mode::Normal,
             view: View::Dashboard,
             selected: 0,
@@ -672,6 +679,15 @@ impl Console {
             .iter()
             .find(|r| r.run_id == run_id)
             .map(|r| &r.state)
+    }
+
+    /// The worker party of `run_id`: its recorded uuid, or the stable legacy
+    /// encoding while its state is not loaded (or predates run uuids).
+    fn worker_party(&self, run_id: &str) -> Party {
+        self.run_state(run_id).map_or_else(
+            || Party::Worker(crate::fleet::envelope::legacy_worker_uuid(run_id)),
+            |state| Party::Worker(state.uuid),
+        )
     }
 
     /// What the selected session is doing, for the line above the composer.
@@ -1140,7 +1156,7 @@ impl Console {
 
     /// `b`: pop the selected session's full brief; the composer keeps its
     /// message. A worker's is its `taskBrief`; the orchestrator's is the
-    /// rendered `orchestrator/prompt.md`, or a dimmed placeholder when the
+    /// rendered session `prompt.md`, or a dimmed placeholder when the
     /// monitor has not written it yet.
     fn open_brief(&mut self) -> Vec<Effect> {
         let (text, placeholder) = match self.selected_target() {
@@ -1154,7 +1170,7 @@ impl Console {
                 }
             },
             SessionTarget::Orchestrator => {
-                match std::fs::read_to_string(self.fleet.orchestrator_dir().join("prompt.md")) {
+                match std::fs::read_to_string(self.fleet.orchestrator_prompt(&self.orch_key)) {
                     Ok(text) if !text.trim().is_empty() => (text, false),
                     _ => (
                         "(no orchestrator prompt yet — the monitor writes prompt.md at boot)"
@@ -2455,7 +2471,7 @@ impl Console {
                 Effect::WorkerThinking { run_id, level } => {
                     append_envelope(
                         &self.fleet.run_inbox(&run_id),
-                        &Envelope::thinking(Party::Console, Party::worker(&run_id), level),
+                        &Envelope::thinking(Party::Console, self.worker_party(&run_id), level),
                     )?;
                 }
                 Effect::WorkerModel {
@@ -2467,7 +2483,7 @@ impl Console {
                         &self.fleet.run_inbox(&run_id),
                         &Envelope::model(
                             Party::Console,
-                            Party::worker(&run_id),
+                            self.worker_party(&run_id),
                             model_id,
                             provider,
                         ),
@@ -2476,7 +2492,7 @@ impl Console {
                 Effect::WorkerCommand { run_id, message } => {
                     append_envelope(
                         &self.fleet.run_inbox(&run_id),
-                        &Envelope::command(Party::Console, Party::worker(&run_id), message),
+                        &Envelope::command(Party::Console, self.worker_party(&run_id), message),
                     )?;
                 }
                 Effect::RemoveWorker { run_id, force } => {
@@ -2495,7 +2511,7 @@ impl Console {
 
     fn append_orchestrator(&self, command: &OrchestratorCommand) -> std::io::Result<()> {
         let envelope = command.to_envelope(Party::Console);
-        append_envelope(&self.fleet.orchestrator_inbox(), &envelope)
+        append_envelope(&self.fleet.orchestrator_inbox(&self.orch_key), &envelope)
     }
 }
 
@@ -2622,7 +2638,8 @@ pub async fn run_app(options: TuiOptions) -> anyhow::Result<crate::cli::ExitCode
 
     let code = result?;
     // what is left running decides the goodbye
-    let orchestrator_exited = std::fs::read_to_string(fleet.orchestrator_state())
+    let orch_key = crate::tui::runtime::resolve_console_key(&fleet);
+    let orchestrator_exited = std::fs::read_to_string(fleet.orchestrator_state(&orch_key))
         .ok()
         .and_then(|raw| serde_json::from_str::<OrchestratorState>(&raw).ok())
         .and_then(|state| state.exited)
@@ -3429,9 +3446,9 @@ mod tests {
         assert!(c.overlay().is_none());
 
         // with a rendered prompt on disk, the orchestrator shows it
-        std::fs::create_dir_all(c.fleet.orchestrator_dir()).unwrap();
+        std::fs::create_dir_all(c.fleet.orchestrator_dir(&c.orch_key)).unwrap();
         std::fs::write(
-            c.fleet.orchestrator_dir().join("prompt.md"),
+            c.fleet.orchestrator_prompt(&c.orch_key),
             "You are the orchestrator.",
         )
         .unwrap();

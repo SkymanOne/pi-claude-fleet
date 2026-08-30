@@ -6,6 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
+use uuid::Uuid;
+
+use crate::util::short_uuid;
+
 /// The fleet's state directory, created under the repository root.
 pub const STATE_DIR_NAME: &str = ".parl";
 /// Prefix for every environment variable this tool reads (`PARL_DIR`, …).
@@ -17,6 +21,47 @@ pub const BIN_NAME: &str = "parl";
 #[must_use]
 pub fn env_var(suffix: &str) -> String {
     format!("{ENV_PREFIX}_{suffix}")
+}
+
+/// The key naming one orchestrator session's directory under
+/// `orchestrators/`: `<alias|-default>-<short-uuid>`. A session's alias is
+/// optional (a later stage derives it from the session's first prompt), so
+/// the directory falls back to `default` — the name must stay readable in
+/// `ls` either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionKey {
+    pub alias: Option<String>,
+    pub uuid: Uuid,
+}
+
+impl SessionKey {
+    /// A key for a session with `alias` (may be `None`) and `uuid`.
+    #[must_use]
+    pub fn new(alias: Option<String>, uuid: Uuid) -> Self {
+        Self { alias, uuid }
+    }
+
+    /// `orchestrators/<alias>-<short-uuid>`: the sanitized alias (or
+    /// `default`) plus the last 7 hex chars of the uuid.
+    #[must_use]
+    pub fn dir_name(&self) -> String {
+        let alias = self
+            .alias
+            .as_deref()
+            .map(crate::util::sanitize_name)
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| "default".to_string());
+        format!("{alias}-{}", short_uuid(&self.uuid))
+    }
+}
+
+impl Default for SessionKey {
+    fn default() -> Self {
+        Self {
+            alias: None,
+            uuid: crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION,
+        }
+    }
 }
 
 /// Resolved `.parl` layout for one fleet.
@@ -66,31 +111,42 @@ impl FleetPaths {
         self.root.join("console.lock")
     }
 
-    /// `orchestrator/`.
-    pub fn orchestrator_dir(&self) -> PathBuf {
-        self.root.join("orchestrator")
+    /// `orchestrators/` — the per-session parent.
+    pub fn orchestrators_dir(&self) -> PathBuf {
+        self.root.join("orchestrators")
     }
 
-    /// `orchestrator/state.json` — monitor pid, session id, model, commands,
-    /// cost, turns, activity, pending permission.
-    pub fn orchestrator_state(&self) -> PathBuf {
-        self.orchestrator_dir().join("state.json")
+    /// `orchestrators/<alias>-<short-uuid>/` — one session's whole state:
+    /// `state.json`, `events.jsonl`, `inbox.jsonl`, `claude.log`, `prompt.md`.
+    pub fn orchestrator_dir(&self, key: &SessionKey) -> PathBuf {
+        self.orchestrators_dir().join(key.dir_name())
     }
 
-    /// `orchestrator/events.jsonl` — the orchestrator transcript.
-    pub fn orchestrator_events(&self) -> PathBuf {
-        self.orchestrator_dir().join("events.jsonl")
+    /// `orchestrators/<key>/state.json` — monitor pid, session id, model,
+    /// commands, cost, turns, activity, pending permission.
+    pub fn orchestrator_state(&self, key: &SessionKey) -> PathBuf {
+        self.orchestrator_dir(key).join("state.json")
     }
 
-    /// `orchestrator/inbox.jsonl` — console -> monitor.
-    pub fn orchestrator_inbox(&self) -> PathBuf {
-        self.orchestrator_dir().join("inbox.jsonl")
+    /// `orchestrators/<key>/events.jsonl` — the orchestrator transcript.
+    pub fn orchestrator_events(&self, key: &SessionKey) -> PathBuf {
+        self.orchestrator_dir(key).join("events.jsonl")
     }
 
-    /// `orchestrator/claude.log` — raw protocol both directions, plus the
-    /// monitor's own diagnostics.
-    pub fn claude_log(&self) -> PathBuf {
-        self.orchestrator_dir().join("claude.log")
+    /// `orchestrators/<key>/inbox.jsonl` — console -> monitor.
+    pub fn orchestrator_inbox(&self, key: &SessionKey) -> PathBuf {
+        self.orchestrator_dir(key).join("inbox.jsonl")
+    }
+
+    /// `orchestrators/<key>/claude.log` — raw protocol both directions, plus
+    /// the monitor's own diagnostics.
+    pub fn claude_log(&self, key: &SessionKey) -> PathBuf {
+        self.orchestrator_dir(key).join("claude.log")
+    }
+
+    /// `orchestrators/<key>/prompt.md` — the rendered orchestrator prompt.
+    pub fn orchestrator_prompt(&self, key: &SessionKey) -> PathBuf {
+        self.orchestrator_dir(key).join("prompt.md")
     }
 
     /// `runs/`.
@@ -162,8 +218,10 @@ impl FleetPaths {
     /// Create the layout and make sure git ignores it.
     ///
     /// Returns whether the `.gitignore` gained an entry. Subdirectories
-    /// (`runs/`, `orchestrator/`) are created here too: they are part of the
-    /// fixed layout and callers otherwise race to make them.
+    /// (`runs/`, `orchestrators/`) are created here too: they are part of the
+    /// fixed layout and callers otherwise race to make them. Per-session
+    /// directories under `orchestrators/` are created lazily, once a session
+    /// exists.
     ///
     /// # Errors
     ///
@@ -172,7 +230,7 @@ impl FleetPaths {
     pub fn ensure(&self) -> std::io::Result<bool> {
         std::fs::create_dir_all(&self.root)?;
         std::fs::create_dir_all(self.runs_dir())?;
-        std::fs::create_dir_all(self.orchestrator_dir())?;
+        std::fs::create_dir_all(self.orchestrators_dir())?;
         ensure_gitignore_entry(&git_root_of(&self.root), &format!("{STATE_DIR_NAME}/"))
     }
 }
@@ -371,6 +429,9 @@ mod tests {
     #[test]
     fn layout_paths_are_derived_from_the_root() {
         let paths = FleetPaths::new("/repo/x/.parl");
+        let uuid = uuid::Uuid::parse_str("9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c").unwrap();
+        let key = SessionKey::new(Some("s0".into()), uuid);
+        let default_key = SessionKey::default();
         assert_eq!(paths.root(), Path::new("/repo/x/.parl"));
         assert_eq!(
             paths.fleet_json(),
@@ -381,32 +442,55 @@ mod tests {
             PathBuf::from("/repo/x/.parl/console.lock")
         );
         assert_eq!(
-            paths.orchestrator_state(),
-            PathBuf::from("/repo/x/.parl/orchestrator/state.json")
+            paths.orchestrators_dir(),
+            PathBuf::from("/repo/x/.parl/orchestrators")
+        );
+        // A session's whole state sits in its own alias-prefixed directory.
+        assert_eq!(key.dir_name(), "s0-f7a8b9c");
+        assert_eq!(
+            paths.orchestrator_dir(&key),
+            PathBuf::from("/repo/x/.parl/orchestrators/s0-f7a8b9c")
         );
         assert_eq!(
-            paths.orchestrator_inbox(),
-            PathBuf::from("/repo/x/.parl/orchestrator/inbox.jsonl")
+            paths.orchestrator_state(&key),
+            PathBuf::from("/repo/x/.parl/orchestrators/s0-f7a8b9c/state.json")
         );
         assert_eq!(
-            paths.claude_log(),
-            PathBuf::from("/repo/x/.parl/orchestrator/claude.log")
+            paths.orchestrator_events(&key),
+            PathBuf::from("/repo/x/.parl/orchestrators/s0-f7a8b9c/events.jsonl")
         );
         assert_eq!(
-            paths.run_json("a-20260828141530"),
-            PathBuf::from("/repo/x/.parl/runs/a-20260828141530/run.json")
+            paths.orchestrator_inbox(&key),
+            PathBuf::from("/repo/x/.parl/orchestrators/s0-f7a8b9c/inbox.jsonl")
         );
         assert_eq!(
-            paths.run_report("a-20260828141530"),
-            PathBuf::from("/repo/x/.parl/runs/a-20260828141530/report.md")
+            paths.claude_log(&key),
+            PathBuf::from("/repo/x/.parl/orchestrators/s0-f7a8b9c/claude.log")
         );
         assert_eq!(
-            paths.pi_log("a-20260828141530"),
-            PathBuf::from("/repo/x/.parl/runs/a-20260828141530/pi.log")
+            paths.orchestrator_prompt(&key),
+            PathBuf::from("/repo/x/.parl/orchestrators/s0-f7a8b9c/prompt.md")
+        );
+        // An alias-less session dirs as `default-<short-uuid>`; the alias is
+        // sanitized before it reaches the filesystem.
+        assert_eq!(default_key.dir_name(), "default-0000000");
+        let noisy = SessionKey::new(Some("My Session!".into()), uuid);
+        assert_eq!(noisy.dir_name(), "my-session-f7a8b9c");
+        assert_eq!(
+            paths.run_json("a-1f2e3d4"),
+            PathBuf::from("/repo/x/.parl/runs/a-1f2e3d4/run.json")
         );
         assert_eq!(
-            paths.run_session_dir("a-20260828141530"),
-            PathBuf::from("/repo/x/.parl/runs/a-20260828141530/session")
+            paths.run_report("a-1f2e3d4"),
+            PathBuf::from("/repo/x/.parl/runs/a-1f2e3d4/report.md")
+        );
+        assert_eq!(
+            paths.pi_log("a-1f2e3d4"),
+            PathBuf::from("/repo/x/.parl/runs/a-1f2e3d4/pi.log")
+        );
+        assert_eq!(
+            paths.run_session_dir("a-1f2e3d4"),
+            PathBuf::from("/repo/x/.parl/runs/a-1f2e3d4/session")
         );
         assert_eq!(
             paths.pi_extension(),
@@ -564,7 +648,14 @@ mod tests {
         assert!(ensure_with_retry(&paths).unwrap());
         assert!(paths.root().is_dir());
         assert!(paths.runs_dir().is_dir());
-        assert!(paths.orchestrator_dir().is_dir());
+        assert!(paths.orchestrators_dir().is_dir());
+        // Per-session directories are created lazily, by whoever owns a key.
+        assert!(
+            paths
+                .orchestrator_dir(&SessionKey::default())
+                .parent()
+                .is_some()
+        );
         let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert!(gitignore.contains("# parl\n.parl/"), "{gitignore}");
         // Second run: already covered, no change.

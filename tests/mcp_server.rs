@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use parl::cli::ExitCode;
-use parl::fleet::envelope::{Decoded, Envelope, Party};
+use parl::fleet::envelope::{DEFAULT_ORCHESTRATOR_SESSION, Decoded, Envelope, Party};
 use parl::fleet::run::{self, PendingDialog, PendingQuestion, RunState, RunStatus};
 use parl::mcp::server::{FLEET_TOOL_NAMES, FleetServer};
 use parl::paths::FleetPaths;
@@ -487,7 +487,11 @@ async fn answer_resolves_the_pending_question_with_orchestrator_provenance() {
     );
     let envelopes = fleet.inbox();
     assert_eq!(envelopes.len(), 1);
-    assert_eq!(envelopes[0].from, Party::Orchestrator, "honest provenance");
+    assert_eq!(
+        envelopes[0].from,
+        Party::Orchestrator(DEFAULT_ORCHESTRATOR_SESSION),
+        "honest provenance"
+    );
     assert_eq!(
         envelopes[0].decode(),
         Some(Decoded::Answer {

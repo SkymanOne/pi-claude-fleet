@@ -40,6 +40,13 @@ use crate::ops::steer::{
 };
 use crate::ops::{CommandResult, resolve_fleet_dir_with_env};
 
+/// The party steering runs under while session wiring is pending: the
+/// default orchestrator session, whose on-wire spelling is the bare
+/// `"orchestrator"` the tools have always written.
+fn tool_party() -> Party {
+    Party::Orchestrator(crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION)
+}
+
 /// The 13 fleet tools, in the order the orchestrator's prompt lists them.
 pub const FLEET_TOOL_NAMES: [&str; 13] = [
     "fleet_spawn",
@@ -233,7 +240,7 @@ impl FleetServer {
             &name,
             self.cwd(),
             &message,
-            Party::Orchestrator,
+            tool_party(),
             self.parl_dir().as_deref(),
         )
         .await
@@ -250,7 +257,7 @@ impl FleetServer {
             &name,
             self.cwd(),
             &message,
-            Party::Orchestrator,
+            tool_party(),
             self.parl_dir().as_deref(),
         )
         .await
@@ -269,7 +276,7 @@ impl FleetServer {
             self.cwd(),
             question_id.as_deref(),
             &answer,
-            Party::Orchestrator,
+            tool_party(),
             self.parl_dir().as_deref(),
         )
         .await
@@ -281,13 +288,7 @@ impl FleetServer {
 
     async fn fleet_stop(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let name = req_str(args, "name")?;
-        match stop_core_with_env(
-            &name,
-            self.cwd(),
-            Party::Orchestrator,
-            self.parl_dir().as_deref(),
-        )
-        .await
+        match stop_core_with_env(&name, self.cwd(), tool_party(), self.parl_dir().as_deref()).await
         {
             Ok(r) => Ok(render_result(&r, None)),
             Err(err) => Ok(render_error(&err)),

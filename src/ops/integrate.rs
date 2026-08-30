@@ -542,7 +542,10 @@ async fn abort_and_wait(target: &RunRef) -> bool {
     let paths = run::fleet_paths_of(&target.state);
     append_envelope(
         &paths.run_inbox(&target.run_id),
-        &Envelope::abort(Party::Orchestrator, Party::worker(&target.run_id)),
+        &Envelope::abort(
+            Party::Orchestrator(crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION),
+            target.worker_party(),
+        ),
     )
     .ok();
     let start = std::time::Instant::now();

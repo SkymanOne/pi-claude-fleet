@@ -9,7 +9,9 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
+use crate::fleet::envelope::{Party, legacy_worker_uuid};
 use crate::paths::FleetPaths;
 use crate::util::{atomic_write_json, now_iso, parse_ts_ms, sanitize_name};
 
@@ -176,6 +178,18 @@ pub struct WorkerModel {
 pub struct RunState {
     pub id: String,
     pub name: String,
+    /// The run's UUID identity — what `Party::Worker` addresses and what
+    /// `orchestratorId` ownership references. `Uuid::nil()` only in state
+    /// files written before the field existed (legacy runs; they keep
+    /// resolving through their id and alias). Explicitly nil, never
+    /// `Uuid::default()`: under the v4 feature that is a *random* uuid, so
+    /// a legacy file would read as a fresh identity every load.
+    #[serde(default = "crate::util::nil_uuid")]
+    pub uuid: Uuid,
+    /// The owning orchestrator session; `None` in state files written before
+    /// the field existed (legacy/unowned runs).
+    #[serde(default)]
+    pub orchestrator_id: Option<Uuid>,
     pub status: RunStatus,
     pub cwd: String,
     #[serde(default)]
@@ -286,6 +300,10 @@ impl RunState {
         Self {
             id: run_id.to_string(),
             name: name.to_string(),
+            // A fresh identity; the caller deriving the directory name from
+            // a specific uuid overwrites it right after construction.
+            uuid: Uuid::new_v4(),
+            orchestrator_id: None,
             status: RunStatus::Starting,
             cwd: cwd.to_string(),
             worktree,
@@ -459,6 +477,19 @@ pub struct RunRef {
     pub state: RunState,
 }
 
+impl RunRef {
+    /// The run's worker party: its uuid, or the stable derived uuid of its
+    /// (legacy) run id when the state file predates run uuids.
+    #[must_use]
+    pub fn worker_party(&self) -> Party {
+        if self.state.uuid.is_nil() {
+            Party::Worker(legacy_worker_uuid(&self.run_id))
+        } else {
+            Party::Worker(self.state.uuid)
+        }
+    }
+}
+
 /// One entry of [`list_runs`]: a directory under `runs/` with a readable
 /// `run.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,45 +522,121 @@ pub fn list_runs(fleet_dir: &Path) -> Vec<RunSummary> {
     out
 }
 
-/// Resolve `<name>` (newest non-archived run of exactly that name) or a full
-/// run id. A name matches only `<name>-<14-digit stamp>`, so `api` never
-/// resolves to `api-tests-…`.
+/// The non-archived run directories under `<fleet>/runs` whose `run.json`
+/// records an owner: newest id first. The unfiltered [`list_runs`] stays for
+/// cleanup and diagnostics; this is what a session sees as its own.
+#[must_use]
+pub fn list_runs_for_owner(fleet_dir: &Path, owner: Uuid) -> Vec<RunSummary> {
+    list_runs(fleet_dir)
+        .into_iter()
+        .filter(|r| {
+            load_state(&r.run_dir)
+                .ok()
+                .and_then(|state| state.orchestrator_id)
+                == Some(owner)
+        })
+        .collect()
+}
+
+/// Resolve `<name>` or an id to one run, in strict order:
+/// 1. the exact run id (a directory name);
+/// 2. the exact run uuid (`state.uuid`);
+/// 3. the alias (the run's `name` field) — several live runs sharing an
+///    alias is an error naming the candidates, never a silent pick;
+/// 4. the legacy `<name>-<14-digit>` directory form, for runs already on
+///    disk (state files that predate the uuid scheme).
+///
+/// Steps 3 and 4 match a sanitized name, so casing and punctuation are
+/// ignored; archived runs resolve only when nothing live matches. A name
+/// never prefix-matches: `api` never resolves to `api-tests-…`.
 ///
 /// # Errors
 ///
-/// Returns `anyhow::Error` when no run matches `name_or_id` (the regex is
-/// derived from an escaped literal, so its construction cannot fail).
+/// Returns `anyhow::Error` when no run matches `name_or_id` or when several
+/// live runs share the alias (the candidates are named).
 pub fn find_run(fleet_dir: &Path, name_or_id: &str) -> anyhow::Result<RunRef> {
-    let key = sanitize_name(name_or_id.trim());
-    let of_name = format!("^{0}-\\d{{14}}$", regex::escape(&key));
-    let of_name = regex::Regex::new(&of_name).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut candidates: Vec<RunRef> = Vec::new();
-    for r in list_runs(fleet_dir) {
-        if r.run_id != key && !of_name.is_match(&r.run_id) {
-            continue;
-        }
-        if let Ok(state) = load_state(&r.run_dir) {
-            candidates.push(RunRef {
+    let raw = name_or_id.trim();
+    let key = sanitize_name(raw);
+    let runs: Vec<RunRef> = list_runs(fleet_dir)
+        .into_iter()
+        .filter_map(|r| {
+            load_state(&r.run_dir).ok().map(|state| RunRef {
                 run_id: r.run_id,
                 run_dir: r.run_dir,
                 state,
-            });
-        }
-        // Unreadable run.json: not a usable run.
+            })
+        })
+        .collect();
+    let preferred = |candidates: &[RunRef]| {
+        candidates
+            .iter()
+            .find(|c| c.state.status != RunStatus::Archived)
+            .or_else(|| candidates.first())
+            .cloned()
+    };
+
+    // 1. The exact run id (a directory name), sanitized like the rest.
+    if let Some(chosen) = preferred(
+        &runs
+            .iter()
+            .filter(|r| r.run_id == key)
+            .cloned()
+            .collect::<Vec<_>>(),
+    ) {
+        return Ok(chosen);
     }
-    let chosen = candidates
+    // 2. The exact run uuid, from the raw input (a uuid is not sanitized:
+    //    hyphens are part of its syntax).
+    if let Ok(uuid) = Uuid::parse_str(raw)
+        && let Some(chosen) = preferred(
+            &runs
+                .iter()
+                .filter(|r| r.state.uuid == uuid)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    {
+        return Ok(chosen);
+    }
+    // 3. The alias: runs whose `name` field is the key. Several live (not
+    //    archived) ones are ambiguous — name them instead of picking.
+    let aliased: Vec<RunRef> = runs
         .iter()
-        .find(|c| c.state.status != RunStatus::Archived)
-        .or_else(|| candidates.first());
-    chosen.map_or_else(
-        || {
-            Err(anyhow::anyhow!(
-                "No run found matching \"{name_or_id}\" in {}",
-                fleet_dir.join("runs").display()
-            ))
-        },
-        |c| Ok(c.clone()),
-    )
+        .filter(|r| r.state.name == key)
+        .cloned()
+        .collect();
+    let live = aliased
+        .iter()
+        .filter(|r| r.state.status != RunStatus::Archived)
+        .collect::<Vec<_>>();
+    if live.len() > 1 {
+        let names = live
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "run name \"{key}\" is ambiguous — {} live runs share it: {names}",
+            live.len()
+        );
+    }
+    if let Some(chosen) = preferred(&aliased) {
+        return Ok(chosen);
+    }
+    // 4. The legacy `<name>-<14-digit stamp>` form, for runs already on disk.
+    let of_name = format!("^{0}-\\d{{14}}$", regex::escape(&key));
+    let of_name = regex::Regex::new(&of_name).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let legacy: Vec<RunRef> = runs
+        .into_iter()
+        .filter(|r| of_name.is_match(&r.run_id))
+        .collect();
+    if let Some(chosen) = preferred(&legacy) {
+        return Ok(chosen);
+    }
+    Err(anyhow::anyhow!(
+        "No run found matching \"{name_or_id}\" in {}",
+        fleet_dir.join("runs").display()
+    ))
 }
 
 /// Newest pi session file under `<run_dir>/session`, for `--session` resume
@@ -578,9 +685,8 @@ pub fn fleet_paths_of(state: &RunState) -> FleetPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::run_id_for_at;
-    use time::OffsetDateTime;
-    use time::format_description::well_known::Rfc3339;
+    use crate::util::{run_id_for, short_uuid};
+    use uuid::Uuid;
 
     fn fleet_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -590,10 +696,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    fn at(ts: &str) -> OffsetDateTime {
-        OffsetDateTime::parse(ts, &Rfc3339).unwrap()
     }
 
     fn base_state(fleet: &Path, run_id: &str) -> RunState {
@@ -886,15 +988,23 @@ mod tests {
     }
 
     #[test]
-    fn find_run_prefers_the_newest_and_skips_archived() {
+    fn find_run_errors_on_ambiguous_aliases_and_resolves_specific_ids() {
         let fleet = fleet_dir("parl-run-");
         write_run(&fleet, "auth-20260828141530", "auth", RunStatus::Running);
         write_run(&fleet, "auth-20260828161530", "auth", RunStatus::Running);
+        // Two live runs share the alias: an error naming both candidates,
+        // never a silent pick.
+        let err = find_run(&fleet, "auth").unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("auth-20260828161530"), "{err}");
+        assert!(err.contains("auth-20260828141530"), "{err}");
+        // The exact ids resolve regardless.
         assert_eq!(
-            find_run(&fleet, "auth").unwrap().run_id,
+            find_run(&fleet, "auth-20260828161530").unwrap().run_id,
             "auth-20260828161530"
         );
-        // Archive the newest; the older one wins again.
+        // Archive the newest: the alias is unambiguous again, and the
+        // remaining live one wins.
         let newest = find_run(&fleet, "auth-20260828161530").unwrap();
         let mut state = newest.state.clone();
         state.status = RunStatus::Archived;
@@ -903,7 +1013,7 @@ mod tests {
             find_run(&fleet, "auth").unwrap().run_id,
             "auth-20260828141530"
         );
-        // All archived: still resolvable, explicitly.
+        // All archived: still resolvable, explicitly, without ambiguity.
         let older = find_run(&fleet, "auth-20260828141530").unwrap();
         let mut state = older.state.clone();
         state.status = RunStatus::Archived;
@@ -915,10 +1025,129 @@ mod tests {
     }
 
     #[test]
-    fn run_id_stamps_are_14_utc_digits() {
-        let id = run_id_for_at("auth", at("2026-08-28T14:15:30Z"));
-        assert_eq!(id, "auth-20260828141530");
-        assert!(regex::Regex::new(r"^\w+-\d{14}$").unwrap().is_match(&id));
+    fn find_run_resolves_uuids_self_named_dirs_and_ownerless_legacy_runs() {
+        let fleet = fleet_dir("parl-run-");
+        // A run under the new scheme: `<alias>-<short-uuid>`, a recorded
+        // uuid, an owner, and state.name as the alias.
+        let uuid = Uuid::parse_str("9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c").unwrap();
+        let run_id = run_id_for("auth", &uuid);
+        assert_eq!(run_id, "auth-f7a8b9c");
+        // The id is the alias plus the short uuid; the branch rule shortens
+        // the same suffix, so branch names stay valid under the scheme.
+        assert_eq!(short_uuid(&uuid), "f7a8b9c");
+        assert_eq!(crate::util::short7(&run_id), "f7a8b9c");
+        assert_eq!(
+            crate::util::branch_for("auth", &run_id),
+            "parl/auth-f7a8b9c"
+        );
+        let mut state = write_run(&fleet, &run_id, "auth", RunStatus::Running);
+        state.uuid = uuid;
+        state.orchestrator_id =
+            Some(Uuid::parse_str("6e1c9a86-3b7d-4f5a-9e2c-1b8d4a7f0c3e").unwrap());
+        save_state(&fleet.join("runs").join(&run_id), &state).unwrap();
+        // The exact run id (the directory name) resolves.
+        assert_eq!(find_run(&fleet, "auth-f7a8b9c").unwrap().run_id, run_id);
+        // The exact uuid resolves.
+        assert_eq!(
+            find_run(&fleet, "9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c")
+                .unwrap()
+                .run_id,
+            run_id
+        );
+        // The alias resolves through the name field.
+        assert_eq!(find_run(&fleet, "auth").unwrap().run_id, run_id);
+        assert_eq!(
+            find_run(&fleet, "AUTH").unwrap().run_id,
+            run_id,
+            "casing is sanitized away"
+        );
+        // A uuid that matches nothing is a plain miss.
+        assert!(find_run(&fleet, "11111111-1111-4111-8111-111111111111").is_err());
+        // A legacy run whose state predates the name field still resolves
+        // through its directory form.
+        let legacy_dir = fleet.join("runs/db-20260828141530");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let mut legacy = RunState::new(
+            fleet.to_string_lossy().as_ref(),
+            "db-20260828141530",
+            "",
+            "/tmp/x",
+            "b",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        legacy.uuid = Uuid::nil();
+        legacy.status = RunStatus::Running;
+        save_state(&legacy_dir, &legacy).unwrap();
+        assert_eq!(
+            find_run(&fleet, "db").unwrap().run_id,
+            "db-20260828141530",
+            "the legacy directory form still resolves"
+        );
+    }
+
+    #[test]
+    fn worker_party_is_the_run_uuid_or_the_stable_legacy_encoding() {
+        let fleet = fleet_dir("parl-run-");
+        let uuid = Uuid::parse_str("9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c").unwrap();
+        let run_id = run_id_for("auth", &uuid);
+        let mut state = write_run(&fleet, &run_id, "auth", RunStatus::Running);
+        state.uuid = uuid;
+        save_state(&fleet.join("runs").join(&run_id), &state).unwrap();
+        let run = find_run(&fleet, "auth").unwrap();
+        assert_eq!(run.worker_party(), Party::Worker(uuid));
+        assert_eq!(run.worker_party().to_string(), format!("worker:{uuid}"));
+        // A state predating run uuids gets the stable legacy encoding of its
+        // run id — the same party parsing `worker:<run_id>` yields.
+        let mut legacy = write_run(&fleet, "old-20260828141530", "old", RunStatus::Running);
+        legacy.uuid = Uuid::nil();
+        save_state(&fleet.join("runs/old-20260828141530"), &legacy).unwrap();
+        let run = find_run(&fleet, "old").unwrap();
+        assert_eq!(
+            run.worker_party(),
+            Party::Worker(crate::fleet::envelope::legacy_worker_uuid(&run.run_id))
+        );
+        assert_eq!(
+            run.worker_party(),
+            format!(
+                "worker:{}",
+                crate::fleet::envelope::legacy_worker_uuid(&run.run_id)
+            )
+            .parse()
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn list_runs_for_owner_sees_only_owned_runs() {
+        let fleet = fleet_dir("parl-run-");
+        let owner = Uuid::parse_str("6e1c9a86-3b7d-4f5a-9e2c-1b8d4a7f0c3e").unwrap();
+        let other = Uuid::parse_str("9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c").unwrap();
+        let mut mine = write_run(&fleet, "mine-60828141530", "mine", RunStatus::Running);
+        mine.uuid = other;
+        mine.orchestrator_id = Some(owner);
+        save_state(&fleet.join("runs/mine-60828141530"), &mine).unwrap();
+        let mut theirs = write_run(&fleet, "theirs-60828141531", "theirs", RunStatus::Running);
+        theirs.orchestrator_id = Some(other);
+        save_state(&fleet.join("runs/theirs-60828141531"), &theirs).unwrap();
+        // A legacy run without an owner is nobody's.
+        write_run(&fleet, "unowned-60828141532", "unowned", RunStatus::Running);
+        let owned: Vec<String> = list_runs_for_owner(&fleet, owner)
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        assert_eq!(owned, vec!["mine-60828141530"]);
+        // The unfiltered path still lists everything.
+        assert_eq!(list_runs(&fleet).len(), 3);
     }
 
     #[test]

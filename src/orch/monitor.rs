@@ -33,7 +33,7 @@ use crate::orch::records::{
     Transcript, decode_command, new_orchestrator_state, request_value,
 };
 use crate::orch::session;
-use crate::paths::FleetPaths;
+use crate::paths::{FleetPaths, SessionKey};
 use crate::util::{atomic_write_json, now_iso, read_new_lines};
 
 const FLUSH_MS: u64 = 200;
@@ -57,34 +57,44 @@ pub async fn run_orchestrator_monitor(fleet_dir: &Path) -> anyhow::Result<ExitCo
     Ok(ExitCode::Ok)
 }
 
-/// Read `orchestrator/state.json`, or none when there is none yet.
+/// Read `<fleet>/orchestrators/<key>/state.json`, or none when there is none
+/// yet.
 #[must_use]
-pub fn load_orchestrator_state(fleet_dir: &Path) -> Option<OrchestratorState> {
-    let path = FleetPaths::new(fleet_dir).orchestrator_state();
+pub fn load_orchestrator_state(fleet_dir: &Path, key: &SessionKey) -> Option<OrchestratorState> {
+    let path = FleetPaths::new(fleet_dir).orchestrator_state(key);
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
-/// Append one command to the orchestrator's inbox (the console's side of the
+/// Append one command to the session's inbox (the console's side of the
 /// mailbox); the monitor picks it up within its poll interval.
 ///
 /// # Errors
 ///
 /// Returns an I/O error when the inbox cannot be created or written.
-pub fn append_command(fleet_dir: &Path, command: &OrchestratorCommand) -> std::io::Result<()> {
+pub fn append_command(
+    fleet_dir: &Path,
+    key: &SessionKey,
+    command: &OrchestratorCommand,
+) -> std::io::Result<()> {
     append_envelope(
         fleet_dir,
+        key,
         &command.to_envelope(crate::fleet::envelope::Party::Console),
     )
 }
 
-/// Append a pre-built envelope to the orchestrator's inbox.
+/// Append a pre-built envelope to the session's inbox.
 ///
 /// # Errors
 ///
 /// Returns an I/O error when the inbox cannot be created or written.
-pub fn append_envelope(fleet_dir: &Path, envelope: &Envelope) -> std::io::Result<()> {
-    let path = FleetPaths::new(fleet_dir).orchestrator_inbox();
+pub fn append_envelope(
+    fleet_dir: &Path,
+    key: &SessionKey,
+    envelope: &Envelope,
+) -> std::io::Result<()> {
+    let path = FleetPaths::new(fleet_dir).orchestrator_inbox(key);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -103,7 +113,12 @@ struct Restart {
 /// the guard across an await: every mutation and write here is synchronous.
 struct Shared {
     state: OrchestratorState,
+    /// The working copy of this monitor's session record; [`Monitor::save_record`]
+    /// upserts it into [`Self::sessions`] and persists the store, so the two
+    /// only ever differ between a mutation and the next flush.
     record: session::OrchestratorSession,
+    /// The whole session store, kept so a save never has to reload the map.
+    sessions: session::FleetSessions,
     transcript: Transcript,
     /// Permission requests still waiting, by request id; `state.json` holds
     /// the sorted view.
@@ -127,6 +142,9 @@ struct Shared {
 pub struct Monitor {
     fleet_dir: PathBuf,
     cwd: PathBuf,
+    /// The session this monitor serves and its layout key; every
+    /// `orchestrators/` path derives from it.
+    key: SessionKey,
     /// The prompt document claude reads via --append-system-prompt-file.
     prompt_file: String,
     /// The `--mcp-config` document pointing claude at this binary's MCP server.
@@ -143,10 +161,12 @@ impl Monitor {
     /// Load the session record and prepare the state, without a child yet.
     fn boot(fleet_dir: &Path) -> anyhow::Result<Arc<Self>> {
         let paths = FleetPaths::new(fleet_dir);
-        std::fs::create_dir_all(paths.orchestrator_dir())?;
+        // The session this monitor serves: the most recently used one, until
+        // multi-session wiring names a session explicitly.
+        let sessions = session::load(fleet_dir).unwrap_or_default();
+        let stored = sessions.last_used().cloned();
         // The console records the repo it opened; without a session record
         // that is the directory holding the fleet.
-        let stored = session::load(fleet_dir);
         let cwd_string = stored
             .as_ref()
             .map(|s| s.cwd.clone())
@@ -160,6 +180,8 @@ impl Monitor {
             });
         let cwd = PathBuf::from(&cwd_string);
         let mut record = stored.unwrap_or_else(|| session::OrchestratorSession::new(&cwd_string));
+        let key = record.key();
+        std::fs::create_dir_all(paths.orchestrator_dir(&key))?;
         if record.launch.fresh.unwrap_or(false) {
             // only --fresh throws the conversation away
             record.session_id = None;
@@ -168,7 +190,7 @@ impl Monitor {
 
         // The prompt is read by the claude child, so it lives beside it;
         // render the current override (or the embedded template) fresh.
-        let prompt_file = crate::orch::prompt::write_prompt(fleet_dir, &cwd)
+        let prompt_file = crate::orch::prompt::write_prompt(fleet_dir, &cwd, &key)
             .map_err(|e| anyhow::anyhow!("cannot write the orchestrator prompt: {e:#}"))?;
         let mcp_config_json = crate::orch::mcp_config::fleet_mcp_config(
             &crate::orch::mcp_config::parl_binary()?,
@@ -184,11 +206,12 @@ impl Monitor {
             .clone()
             .unwrap_or_else(|| "default".to_string());
         state.remote_control = launch.remote_control.clone();
-        let events_path = paths.orchestrator_events();
+        let events_path = paths.orchestrator_events(&key);
 
         let monitor = Arc::new(Self {
             fleet_dir: fleet_dir.to_path_buf(),
             cwd,
+            key,
             prompt_file: prompt_file.to_string_lossy().into_owned(),
             mcp_config_json,
             pid: i32::try_from(std::process::id()).unwrap_or(1),
@@ -198,6 +221,7 @@ impl Monitor {
             shared: Mutex::new(Shared {
                 state,
                 record,
+                sessions,
                 transcript: records::Transcript::new(events_path),
                 pending: HashMap::new(),
                 dirty: false,
@@ -210,7 +234,10 @@ impl Monitor {
             }),
         });
         // The pid is discoverable the moment the monitor boots, like the
-        // TypeScript monitor's writeState() before the child starts.
+        // TypeScript monitor's writeState() before the child starts. The
+        // session row itself is not saved until there is something to save
+        // (init): a console that wrote the row keeps it, and a monitor booted
+        // alone leaves no half-written record behind.
         monitor.flush_state();
         Ok(monitor)
     }
@@ -247,7 +274,7 @@ impl Monitor {
             self.prompt_file.clone(),
             self.mcp_config_json.clone(),
         );
-        options.log_path = Some(self.paths.claude_log());
+        options.log_path = Some(self.paths.claude_log(&self.key));
         options.args.model = self.launch_model.clone();
         // after a restart this is the session the previous child was running
         options.args.resume_session_id = resume_id;
@@ -578,8 +605,8 @@ impl Monitor {
     /// for [`MISSING_DIR_POLLS`] consecutive polls. A present directory
     /// resets the count, so a transient `NotFound` under load never trips it.
     fn fleet_dir_gone(&self) -> bool {
-        let missing =
-            dir_is_missing(&self.fleet_dir) || dir_is_missing(&self.paths.orchestrator_dir());
+        let missing = dir_is_missing(&self.fleet_dir)
+            || dir_is_missing(&self.paths.orchestrator_dir(&self.key));
         let mut sh = self.shared();
         if missing {
             sh.dir_missing_polls += 1;
@@ -647,7 +674,7 @@ impl Monitor {
         let lines = {
             let mut sh = self.shared();
             let (lines, offset) =
-                read_new_lines(&self.paths.orchestrator_inbox(), sh.control_offset);
+                read_new_lines(&self.paths.orchestrator_inbox(&self.key), sh.control_offset);
             sh.control_offset = offset;
             lines
         };
@@ -855,15 +882,18 @@ impl Monitor {
         let mut sh = self.shared();
         sh.dirty = false;
         sh.state.pending_requests = records::sorted_pending(&sh.pending);
-        if atomic_write_json(&self.paths.orchestrator_state(), &sh.state).is_err() {
+        if atomic_write_json(&self.paths.orchestrator_state(&self.key), &sh.state).is_err() {
             sh.dirty = true; // the periodic flush will try again
         }
     }
 
-    /// Persist the session record (id, pid, model, launch flags).
+    /// Persist the session record (id, pid, model, launch flags): upsert the
+    /// working copy into the store and write `fleet.json`.
     fn save_record(&self) {
         let mut sh = self.shared();
-        let _ = session::save(&self.fleet_dir, &mut sh.record);
+        let record = sh.record.clone();
+        sh.sessions.upsert(record);
+        let _ = session::save(&self.fleet_dir, &mut sh.sessions);
     }
 }
 
@@ -919,6 +949,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fleet = tmp.path().join(".parl");
         std::fs::create_dir_all(&fleet).unwrap();
+        let mut store = session::FleetSessions::new();
         let mut record = session::OrchestratorSession::new("/repo");
         record.session_id = Some("sess-boot123".into());
         record.launch = session::LaunchOptions {
@@ -928,11 +959,14 @@ mod tests {
             remote_control: Some(String::new()),
             fresh: Some(true),
         };
-        session::save(&fleet, &mut record).unwrap();
+        let key = record.key();
+        store.upsert(record);
+        session::save(&fleet, &mut store).unwrap();
 
         let monitor = Monitor::boot(&fleet).unwrap();
         let sh = monitor.shared();
         assert_eq!(sh.record.session_id, None, "--fresh drops the session id");
+        assert_eq!(sh.record.uuid, key.uuid, "the monitor serves the session");
         assert_eq!(sh.state.permission_mode, "acceptEdits");
         assert_eq!(sh.state.remote_control, Some(String::new()));
         assert_eq!(monitor.launch_model.as_deref(), Some("fable"));
@@ -940,9 +974,10 @@ mod tests {
         assert_eq!(sh.state.pid, Some(monitor.pid));
         assert_eq!(sh.state.pending_requests, Vec::new());
         drop(sh);
-        // The boot wrote the durable files a console reads back.
-        assert!(fleet.join("orchestrator/prompt.md").is_file());
-        assert!(load_orchestrator_state(&fleet).is_some());
+        // The boot wrote the durable files a console reads back, in the
+        // session's own directory.
+        assert!(monitor.paths.orchestrator_prompt(&monitor.key).is_file());
+        assert!(load_orchestrator_state(&fleet, &key).is_some());
     }
 
     /// The directory check tolerates a transient miss: only consecutive
@@ -961,19 +996,19 @@ mod tests {
         assert!(monitor.fleet_dir_gone(), "the second consecutive one trips");
 
         // restored (or moved back): the count starts over
-        std::fs::create_dir_all(fleet.join("orchestrator")).unwrap();
+        std::fs::create_dir_all(monitor.paths.orchestrator_dir(&monitor.key)).unwrap();
         assert!(!monitor.fleet_dir_gone());
     }
 
-    /// Losing just the monitor's own `orchestrator/` inside the fleet counts
-    /// as gone: its log, transcript and state all lived there.
+    /// Losing just the monitor's own session directory inside the fleet
+    /// counts as gone: its log, transcript and state all lived there.
     #[test]
     fn losing_the_orchestrator_directory_alone_trips_the_check() {
         let tmp = tempfile::tempdir().unwrap();
         let fleet = tmp.path().join(".parl");
         std::fs::create_dir_all(&fleet).unwrap();
         let monitor = Monitor::boot(&fleet).unwrap();
-        std::fs::remove_dir_all(fleet.join("orchestrator")).unwrap();
+        std::fs::remove_dir_all(monitor.paths.orchestrator_dir(&monitor.key)).unwrap();
         assert!(!monitor.fleet_dir_gone(), "one missing poll is tolerated");
         assert!(monitor.fleet_dir_gone());
     }

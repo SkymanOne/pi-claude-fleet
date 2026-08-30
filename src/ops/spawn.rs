@@ -8,6 +8,7 @@ use std::process::Stdio;
 use serde::Serialize;
 
 use crate::cli::ExitCode;
+use crate::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION;
 use crate::fleet::run::{self, RunRef, RunState, RunStatus};
 use crate::git;
 use crate::paths::FleetPaths;
@@ -186,7 +187,11 @@ async fn create_run_with_env(
     let fleet = resolve_fleet_dir_with_env(request.cwd.as_deref(), parl_dir).await?;
     // The fixed layout plus the gitignore entry; idempotent.
     fleet.paths.ensure()?;
-    let run_id = run_id_for(&name);
+    // The run's identity is its uuid; the id and directory name derive from
+    // it (`<alias>-<short-uuid>`), and the same uuid is recorded in state so
+    // ownership and addressing refer to the run itself.
+    let uuid = uuid::Uuid::new_v4();
+    let run_id = run_id_for(&name, &uuid);
     let run_dir = fleet.paths.run_dir(&run_id);
     if run_dir.exists() {
         anyhow::bail!(
@@ -264,6 +269,10 @@ one live run; stop or clean it first, or use another name.",
         .map(|p| p.to_string_lossy().into_owned());
     state.is_git = fleet.is_git;
     state.base_commit = base_commit;
+    // The recorded identity is the one the directory and branch were cut
+    // from; ownership is the default session until sessions wire through.
+    state.uuid = uuid;
+    state.orchestrator_id = Some(DEFAULT_ORCHESTRATOR_SESSION);
     crate::fleet::run::save_state(&run_dir, &state)?;
     Ok(CreatedRun {
         run_id,
@@ -274,9 +283,10 @@ one live run; stop or clean it first, or use another name.",
     })
 }
 
-/// The non-archived runs sharing `name` — exact id or `<name>-<14-digit
-/// stamp>`, the same resolution set [`run::find_run`] picks from — newest
-/// first. Unreadable `run.json` files are skipped, like everywhere else.
+/// The non-archived runs sharing `name` — by exact id, by the legacy
+/// `<name>-<14-digit stamp>` id form, or by the `name` field (the alias) —
+/// the same resolution set [`run::find_run`] picks from — newest first.
+/// Unreadable `run.json` files are skipped, like everywhere else.
 fn live_namesakes(fleet_dir: &Path, name: &str) -> Vec<RunRef> {
     let key = sanitize_name(name);
     let Ok(of_name) = regex::Regex::new(&format!("^{}-\\d{{14}}$", regex::escape(&key))) else {
@@ -284,7 +294,13 @@ fn live_namesakes(fleet_dir: &Path, name: &str) -> Vec<RunRef> {
     };
     run::list_runs(fleet_dir)
         .into_iter()
-        .filter(|r| r.run_id == key || of_name.is_match(&r.run_id))
+        .filter(|r| {
+            r.run_id == key
+                || of_name.is_match(&r.run_id)
+                || run::load_state(&r.run_dir)
+                    .map(|state| state.name == key)
+                    .unwrap_or(false)
+        })
         .filter_map(|r| {
             run::load_state(&r.run_dir).ok().map(|state| RunRef {
                 run_id: r.run_id,
@@ -396,9 +412,23 @@ mod tests {
                 .await
                 .unwrap();
         assert!(
-            regex::Regex::new(r"^auth-worker-\d{14}$")
+            regex::Regex::new(r"^auth-worker-[0-9a-f]{7}$")
                 .unwrap()
                 .is_match(&created.run_id)
+        );
+        // The id is the alias plus the short uuid, and the state records the
+        // same uuid plus the owning (default) session.
+        assert!(!created.state.uuid.is_nil());
+        assert_eq!(
+            created.run_id,
+            format!(
+                "auth-worker-{}",
+                crate::util::short_uuid(&created.state.uuid)
+            )
+        );
+        assert_eq!(
+            created.state.orchestrator_id,
+            Some(DEFAULT_ORCHESTRATOR_SESSION)
         );
         assert!(created.paths.run_json(&created.run_id).is_file());
         let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();

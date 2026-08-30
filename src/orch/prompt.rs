@@ -182,14 +182,18 @@ pub fn render_prompt(fleet_dir: &Path, repo_root: &Path) -> anyhow::Result<Strin
     ))
 }
 
-/// Render and write to `<fleetDir>/orchestrator/prompt.md` (what
+/// Render and write to `<fleetDir>/orchestrators/<key>/prompt.md` (what
 /// `--append-system-prompt-file` reads); returns the path.
 ///
 /// # Errors
 ///
 /// Returns an error when the prompt cannot be rendered or the file written.
-pub fn write_prompt(fleet_dir: &Path, repo_root: &Path) -> anyhow::Result<PathBuf> {
-    let target = prompt_path(fleet_dir);
+pub fn write_prompt(
+    fleet_dir: &Path,
+    repo_root: &Path,
+    key: &crate::paths::SessionKey,
+) -> anyhow::Result<PathBuf> {
+    let target = prompt_path(fleet_dir, key);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -299,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn write_prompt_lands_under_the_orchestrator_dir() {
+    fn write_prompt_lands_under_the_session_dir() {
         let root = std::env::temp_dir().join(format!(
             "parl-prompt-{}-{}",
             std::process::id(),
@@ -307,8 +311,14 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let fleet_dir = root.join(STATE_DIR_NAME);
-        let path = write_prompt(&fleet_dir, &root).unwrap();
-        assert_eq!(path, prompt_path(&fleet_dir));
+        let key = crate::paths::SessionKey::default();
+        let path = write_prompt(&fleet_dir, &root, &key).unwrap();
+        assert_eq!(path, prompt_path(&fleet_dir, &key));
+        assert!(
+            path.starts_with(fleet_dir.join("orchestrators")),
+            "{}",
+            path.display()
+        );
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("# Fleet orchestrator"), "{text}");
     }

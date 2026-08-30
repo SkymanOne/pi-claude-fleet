@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
+use uuid::Uuid;
 
 /// Worker branches are cut as `<prefix>/<name>-<last 7 of the run id>`.
 pub const BRANCH_PREFIX: &str = "parl";
@@ -158,23 +159,32 @@ pub fn parse_ts_ms(ts: &str) -> Option<i64> {
         .map(|dt| (dt.unix_timestamp_nanos() / 1_000_000) as i64)
 }
 
-/// `YYYYMMDDHHMMSS` in UTC — the 14-digit run stamp.
-fn stamp(at: OffsetDateTime) -> String {
-    let fmt = format_description!("[year][month][day][hour][minute][second]");
-    at.format(&fmt).unwrap_or_default()
+/// The nil uuid, as the serde default for identity fields: a state file
+/// written before the field existed must read as the same degenerate
+/// identity every time. (`Uuid::default()` is a *random* v4 under the v4
+/// feature — the wrong default for persistence.)
+#[must_use]
+pub fn nil_uuid() -> Uuid {
+    Uuid::nil()
 }
 
-/// Run id for a worker started now: `<name>-<14-digit UTC stamp>`.
-pub fn run_id_for(name: &str) -> String {
-    run_id_for_at(name, OffsetDateTime::now_utc())
+/// Run id for a worker started now: `<name>-<last 7 hex chars of the uuid>`.
+/// The uuid is the run's identity; the dir and branch names stay human
+/// readable (`ls` shows the alias, not hex soup).
+pub fn run_id_for(name: &str, uuid: &Uuid) -> String {
+    format!("{name}-{}", short_uuid(uuid))
 }
 
-/// [`run_id_for`] at a fixed instant.
-pub fn run_id_for_at(name: &str, at: OffsetDateTime) -> String {
-    format!("{name}-{}", stamp(at))
+/// The last 7 hex characters of a uuid — the suffix of run ids, session
+/// dirs and branch names.
+pub fn short_uuid(uuid: &Uuid) -> String {
+    let simple = uuid.simple().to_string();
+    simple[simple.len().saturating_sub(7)..].to_string()
 }
 
-/// Last 7 characters of a run id, as used in branch names.
+/// Last 7 characters of a run id, as used in branch names. Under the uuid
+/// scheme a run id is `<name>-<short_uuid>`, so this is the short uuid
+/// itself; legacy `<name>-<14-digit>` ids keep working here too.
 pub fn short7(run_id: &str) -> &str {
     let start = run_id.len().saturating_sub(7);
     &run_id[start..]
@@ -366,11 +376,17 @@ mod tests {
 
     #[test]
     fn run_id_and_branch_formats_are_utc() {
-        let at = OffsetDateTime::parse("2026-08-28T14:15:30Z", &Rfc3339).unwrap();
-        let id = run_id_for_at("auth-worker", at);
-        assert_eq!(id, "auth-worker-20260828141530");
-        assert_eq!(short7(&id), "8141530");
-        assert_eq!(branch_for("auth-worker", &id), "parl/auth-worker-8141530");
+        let uuid = Uuid::parse_str("9ff7d0c4-4f2a-4b1e-8a3c-2d5e6f7a8b9c").unwrap();
+        let id = run_id_for("auth-worker", &uuid);
+        assert_eq!(id, "auth-worker-f7a8b9c");
+        assert_eq!(short7(&id), "f7a8b9c");
+        assert_eq!(short_uuid(&uuid), "f7a8b9c");
+        assert_eq!(branch_for("auth-worker", &id), "parl/auth-worker-f7a8b9c");
+        // A legacy 14-digit run id still shortens to seven characters, so
+        // the branch rule needs no special case for what is on disk.
+        let legacy = "auth-20260828141530";
+        assert_eq!(short7(legacy), "8141530");
+        assert_eq!(branch_for("auth", legacy), "parl/auth-8141530");
         assert_eq!(first_line("a\nb"), "a");
         assert_eq!(first_line("solo"), "solo");
     }

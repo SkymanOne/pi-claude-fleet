@@ -94,6 +94,16 @@ impl Fleet {
         run::load_state(&self.run_dir).unwrap()
     }
 
+    /// The worker party this run is addressed as: its recorded uuid.
+    fn worker_party(&self) -> Party {
+        Party::Worker(run::load_state(&self.run_dir).unwrap().uuid)
+    }
+
+    /// The default orchestrator party, as CLI/MCP steering writes it.
+    fn orch_party(&self) -> Party {
+        Party::Orchestrator(parl::fleet::envelope::DEFAULT_ORCHESTRATOR_SESSION)
+    }
+
     /// Poll `run.json` until `check` holds or the timeout lapses.
     fn wait_state(&self, timeout: Duration, check: impl Fn(&RunState) -> bool) -> RunState {
         let deadline = Instant::now() + timeout;
@@ -292,7 +302,7 @@ fn records_commands_and_forwards_a_command_as_a_prompt() {
 
     fleet.append_inbox(&Envelope::command(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "/session-name mine",
     ));
     // The `command_delivered` event is written before the steering record is
@@ -310,10 +320,7 @@ fn records_commands_and_forwards_a_command_as_a_prompt() {
         "a command_delivered event was written"
     );
 
-    fleet.append_inbox(&Envelope::abort(
-        Party::Console,
-        Party::worker(&fleet.run_id),
-    ));
+    fleet.append_inbox(&Envelope::abort(Party::Console, fleet.worker_party()));
     settled_or(&fleet, Duration::from_secs(20));
     assert_eq!(fleet.wait_monitor_exit(Duration::from_secs(15)), Some(0));
 }
@@ -367,7 +374,7 @@ fn reports_and_changes_the_thinking_level() {
 
     fleet.append_inbox(&Envelope::thinking(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "xhigh",
     ));
     let state = fleet.wait_state(Duration::from_secs(20), |state| {
@@ -381,7 +388,7 @@ fn reports_and_changes_the_thinking_level() {
 
     fleet.append_inbox(&Envelope::thinking(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "ludicrous",
     ));
     fleet.wait_event(Duration::from_secs(20), |ev| {
@@ -394,10 +401,7 @@ fn reports_and_changes_the_thinking_level() {
         "a rejected level does not stick"
     );
 
-    fleet.append_inbox(&Envelope::abort(
-        Party::Console,
-        Party::worker(&fleet.run_id),
-    ));
+    fleet.append_inbox(&Envelope::abort(Party::Console, fleet.worker_party()));
     settled_or(&fleet, Duration::from_secs(20));
     assert_eq!(fleet.wait_monitor_exit(Duration::from_secs(15)), Some(0));
 }
@@ -495,12 +499,12 @@ fn console_steering_mid_run_is_delivered_logged_and_reflected_in_the_report() {
     let fleet = spawn_slow("pf-steer-", &[("FAKE_PI_DELAY_MS", "4000")]);
     fleet.append_inbox(&Envelope::steer(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "use tabs not spaces",
     ));
     fleet.append_inbox(&Envelope::follow_up(
-        Party::Orchestrator,
-        Party::worker(&fleet.run_id),
+        fleet.orch_party(),
+        fleet.worker_party(),
         "then summarize",
     ));
     let state = settled_or(&fleet, Duration::from_secs(30));
@@ -535,10 +539,7 @@ fn console_steering_mid_run_is_delivered_logged_and_reflected_in_the_report() {
 #[test]
 fn abort_via_the_inbox_stops_the_run() {
     let fleet = spawn_slow("pf-abort-", &[("FAKE_PI_DELAY_MS", "4000")]);
-    fleet.append_inbox(&Envelope::abort(
-        Party::Orchestrator,
-        Party::worker(&fleet.run_id),
-    ));
+    fleet.append_inbox(&Envelope::abort(fleet.orch_party(), fleet.worker_party()));
     let state = settled_or(&fleet, Duration::from_secs(30));
     assert_eq!(state.status, RunStatus::Stopped);
     assert!(state.settled_at.is_some(), "the stop was recorded");
@@ -558,7 +559,7 @@ fn steering_after_settle_is_dropped_not_forwarded() {
     assert_eq!(state.status, RunStatus::Settled);
     fleet.append_inbox(&Envelope::steer(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "too late",
     ));
     let dropped = fleet.wait_event(Duration::from_secs(10), |ev| {
@@ -576,8 +577,8 @@ fn a_steer_sent_before_the_monitor_boots_is_still_delivered() {
     fleet.write_state();
     // Written before the monitor starts; the inbox is read from byte 0.
     fleet.append_inbox(&Envelope::steer(
-        Party::Orchestrator,
-        Party::worker(&fleet.run_id),
+        fleet.orch_party(),
+        fleet.worker_party(),
         "early bird",
     ));
     fleet.spawn_monitor(&[("FAKE_PI_DELAY_MS", "3000")]);
@@ -640,8 +641,8 @@ fn outbox_questions_and_progress_mirror_into_state_and_events_and_answers_resolv
     );
 
     fleet.append_inbox(&Envelope::answer(
-        Party::Orchestrator,
-        Party::worker(&fleet.run_id),
+        fleet.orch_party(),
+        fleet.worker_party(),
         "argon2",
         Some(pending.id.clone()),
     ));
@@ -797,7 +798,7 @@ fn the_model_envelope_switches_the_worker_model() {
     });
     fleet.append_inbox(&Envelope::model(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "glm-5.3-flash",
         Some("fakeprovider".into()),
     ));
@@ -808,10 +809,7 @@ fn the_model_envelope_switches_the_worker_model() {
         state.active_model.as_deref() == Some("glm-5.3-flash")
     });
     assert_eq!(state.active_provider.as_deref(), Some("fakeprovider"));
-    fleet.append_inbox(&Envelope::abort(
-        Party::Console,
-        Party::worker(&fleet.run_id),
-    ));
+    fleet.append_inbox(&Envelope::abort(Party::Console, fleet.worker_party()));
     settled_or(&fleet, Duration::from_secs(20));
     assert_eq!(fleet.wait_monitor_exit(Duration::from_secs(15)), Some(0));
 }
@@ -830,7 +828,7 @@ fn the_model_envelope_resolves_a_null_provider_from_pis_model_list() {
     });
     fleet.append_inbox(&Envelope::model(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "glm-5.3-flash",
         None,
     ));
@@ -839,10 +837,7 @@ fn the_model_envelope_resolves_a_null_provider_from_pis_model_list() {
     });
     // The provider came from the cached list, not from the envelope.
     assert_eq!(state.active_provider.as_deref(), Some("fakeprovider"));
-    fleet.append_inbox(&Envelope::abort(
-        Party::Console,
-        Party::worker(&fleet.run_id),
-    ));
+    fleet.append_inbox(&Envelope::abort(Party::Console, fleet.worker_party()));
     settled_or(&fleet, Duration::from_secs(20));
 }
 
@@ -860,7 +855,7 @@ fn an_unresolvable_model_is_reported_not_guessed() {
     });
     fleet.append_inbox(&Envelope::model(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "ghost-model",
         None,
     ));
@@ -880,10 +875,7 @@ fn an_unresolvable_model_is_reported_not_guessed() {
         !fleet.has_event(|ev| ev["type"] == "model_rejected"),
         "pi was never told to switch"
     );
-    fleet.append_inbox(&Envelope::abort(
-        Party::Console,
-        Party::worker(&fleet.run_id),
-    ));
+    fleet.append_inbox(&Envelope::abort(Party::Console, fleet.worker_party()));
     settled_or(&fleet, Duration::from_secs(20));
 }
 
@@ -909,8 +901,8 @@ fn a_dialog_request_is_recorded_and_an_answer_reaches_pi() {
     assert_eq!(request["questionId"], "dlg_fake_1");
 
     fleet.append_inbox(&Envelope::answer(
-        Party::Orchestrator,
-        Party::worker(&fleet.run_id),
+        fleet.orch_party(),
+        fleet.worker_party(),
         "b",
         Some("dlg_fake_1".into()),
     ));
@@ -999,7 +991,7 @@ fn a_confirm_dialog_answer_maps_to_confirmed() {
     });
     fleet.append_inbox(&Envelope::answer(
         Party::Console,
-        Party::worker(&fleet.run_id),
+        fleet.worker_party(),
         "yes",
         Some("dlg_fake_1".into()),
     ));
