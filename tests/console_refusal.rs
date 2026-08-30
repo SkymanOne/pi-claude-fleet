@@ -11,6 +11,9 @@ fn the_console_refuses_a_non_interactive_terminal_with_guidance() {
     // terminal by construction, whatever the test harness itself has
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_parl"))
         .arg("tui")
+        // Deliberately exercises the `<cwd>/.parl` fallback below, so the
+        // ambient variable is removed rather than pinned.
+        .env_remove("PARL_DIR")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

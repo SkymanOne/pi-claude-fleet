@@ -65,6 +65,12 @@ impl Fixture {
             "PARL_CLAUDE_BIN".to_string(),
             format!("node {}", fake_claude().display()),
         );
+        // The monitor must never inherit an ambient PARL_DIR: its fleet is
+        // the one this fixture created (also passed as --fleet-dir).
+        env.insert(
+            "PARL_DIR".to_string(),
+            self.fleet_dir.to_string_lossy().into_owned(),
+        );
         env.insert(
             "FAKE_CLAUDE_ARGV_FILE".to_string(),
             self.cwd.join("argv.json").to_string_lossy().into_owned(),

@@ -29,11 +29,16 @@ use serde_json::{Map, Value};
 
 use crate::cli::ExitCode;
 use crate::fleet::envelope::Party;
-use crate::ops::integrate::{cleanup_runs, diff_core, merge_core};
-use crate::ops::query::{logs_core, output_core, report_core, status_core, wait_core};
-use crate::ops::spawn::{SpawnRequest, spawn_core};
-use crate::ops::steer::{answer_core, followup_core, send_core, stop_core};
-use crate::ops::{CommandResult, resolve_fleet_dir};
+use crate::ops::integrate::{cleanup_runs, diff_core_with_env, merge_core_with_env};
+use crate::ops::query::{
+    logs_core_with_env, output_core_with_env, report_core_with_env, status_core_with_env,
+    wait_core_with_env,
+};
+use crate::ops::spawn::{SpawnRequest, spawn_core_with_env};
+use crate::ops::steer::{
+    answer_core_with_env, followup_core_with_env, send_core_with_env, stop_core_with_env,
+};
+use crate::ops::{CommandResult, resolve_fleet_dir_with_env};
 
 /// The 13 fleet tools, in the order the orchestrator's prompt lists them.
 pub const FLEET_TOOL_NAMES: [&str; 13] = [
@@ -54,7 +59,6 @@ pub const FLEET_TOOL_NAMES: [&str; 13] = [
 
 /// The MCP server name; claude prefixes every tool with `mcp__<name>__`.
 pub const SERVER_NAME: &str = "fleet";
-
 /// Serve the fleet tools over stdio until the client disconnects. A client
 /// that closes stdin without initializing has disconnected, not failed.
 pub async fn serve_stdio(cwd: Option<&Path>) -> anyhow::Result<ExitCode> {
@@ -80,16 +84,44 @@ pub struct FleetServer {
     /// process's working directory. Provenance for steering is always
     /// [`Party::Orchestrator`]: the agent driving these tools.
     cwd: Option<PathBuf>,
+    /// A pinned `$PARL_DIR` value for the per-call resolution. Production
+    /// leaves this unset so every call re-reads the environment; the
+    /// in-process tests pin their own fleet dir instead.
+    pinned_parl_dir: Option<String>,
 }
 
 impl FleetServer {
     /// A server for `cwd` (the repo being orchestrated).
     pub fn new(cwd: Option<PathBuf>) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            pinned_parl_dir: None,
+        }
+    }
+
+    /// [`FleetServer::new`] with the `$PARL_DIR` value pinned for every
+    /// per-call resolution instead of re-read from the environment. Tests
+    /// pin their own fleet dir so an ambient variable cannot redirect the
+    /// tools to an unrelated fleet.
+    #[doc(hidden)]
+    pub fn with_parl_dir(cwd: Option<PathBuf>, parl_dir: Option<String>) -> Self {
+        Self {
+            cwd,
+            pinned_parl_dir: parl_dir,
+        }
     }
 
     fn cwd(&self) -> Option<&Path> {
         self.cwd.as_deref()
+    }
+
+    /// The `$PARL_DIR` value for one tool call: the pinned value when the
+    /// server was built with one (tests), else the ambient environment,
+    /// re-read per call so a changed `PARL_DIR` is picked up.
+    fn parl_dir(&self) -> Option<String> {
+        self.pinned_parl_dir
+            .clone()
+            .or_else(crate::ops::ambient_parl_dir)
     }
 
     /// Route one `tools/call` to its ops core. Argument problems and unknown
@@ -133,7 +165,7 @@ impl FleetServer {
             tools: opt_str(args, "tools")?,
             exclude_tools: opt_str(args, "excludeTools")?,
         };
-        match spawn_core(request).await {
+        match spawn_core_with_env(request, self.parl_dir().as_deref()).await {
             Ok(r) => {
                 let structured = structured_data(&r);
                 Ok(render_result(&r, structured))
@@ -145,7 +177,15 @@ impl FleetServer {
     async fn fleet_status(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let name = opt_str(args, "name")?;
         let all = opt_bool(args, "all")?.unwrap_or(false);
-        match status_core(name.as_deref(), self.cwd(), false, all).await {
+        match status_core_with_env(
+            name.as_deref(),
+            self.cwd(),
+            false,
+            all,
+            self.parl_dir().as_deref(),
+        )
+        .await
+        {
             Ok(r) => {
                 let structured = structured_data(&r);
                 Ok(render_result(&r, structured))
@@ -157,7 +197,7 @@ impl FleetServer {
     async fn fleet_wait(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let name = req_str(args, "name")?;
         let timeout = opt_u64(args, "timeoutSec", 1, Some(600))?.unwrap_or(120);
-        match wait_core(&name, self.cwd(), timeout).await {
+        match wait_core_with_env(&name, self.cwd(), timeout, self.parl_dir().as_deref()).await {
             Ok(r) => Ok(render_result(&r, None)),
             Err(err) => Ok(render_error(err)),
         }
@@ -166,7 +206,7 @@ impl FleetServer {
     async fn fleet_output(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let name = req_str(args, "name")?;
         let tail = opt_u64(args, "tail", 1, None)?.map(|n| n as usize);
-        match output_core(&name, self.cwd(), tail).await {
+        match output_core_with_env(&name, self.cwd(), tail, self.parl_dir().as_deref()).await {
             Ok(r) => Ok(render_result(&r, None)),
             Err(err) => Ok(render_error(err)),
         }
@@ -175,7 +215,7 @@ impl FleetServer {
     async fn fleet_logs(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let name = req_str(args, "name")?;
         let tail = opt_u64(args, "tail", 1, None)?.map(|n| n as usize);
-        match logs_core(&name, self.cwd(), tail).await {
+        match logs_core_with_env(&name, self.cwd(), tail, self.parl_dir().as_deref()).await {
             Ok(r) => Ok(render_result(&r, None)),
             Err(err) => Ok(render_error(err)),
         }
@@ -184,7 +224,15 @@ impl FleetServer {
     async fn fleet_send(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let name = req_str(args, "name")?;
         let message = req_str(args, "message")?;
-        match send_core(&name, self.cwd(), &message, Party::Orchestrator).await {
+        match send_core_with_env(
+            &name,
+            self.cwd(),
+            &message,
+            Party::Orchestrator,
+            self.parl_dir().as_deref(),
+        )
+        .await
+        {
             Ok(r) => Ok(render_result(&r, None)),
             Err(err) => Ok(render_error(err)),
         }
@@ -193,7 +241,15 @@ impl FleetServer {
     async fn fleet_followup(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let name = req_str(args, "name")?;
         let message = req_str(args, "message")?;
-        match followup_core(&name, self.cwd(), &message, Party::Orchestrator).await {
+        match followup_core_with_env(
+            &name,
+            self.cwd(),
+            &message,
+            Party::Orchestrator,
+            self.parl_dir().as_deref(),
+        )
+        .await
+        {
             Ok(r) => Ok(render_result(&r, None)),
             Err(err) => Ok(render_error(err)),
         }
@@ -203,12 +259,13 @@ impl FleetServer {
         let name = req_str(args, "name")?;
         let answer = req_str(args, "answer")?;
         let question_id = opt_str(args, "questionId")?;
-        match answer_core(
+        match answer_core_with_env(
             &name,
             self.cwd(),
             question_id.as_deref(),
             &answer,
             Party::Orchestrator,
+            self.parl_dir().as_deref(),
         )
         .await
         {
@@ -219,7 +276,14 @@ impl FleetServer {
 
     async fn fleet_stop(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let name = req_str(args, "name")?;
-        match stop_core(&name, self.cwd(), Party::Orchestrator).await {
+        match stop_core_with_env(
+            &name,
+            self.cwd(),
+            Party::Orchestrator,
+            self.parl_dir().as_deref(),
+        )
+        .await
+        {
             Ok(r) => Ok(render_result(&r, None)),
             Err(err) => Ok(render_error(err)),
         }
@@ -227,7 +291,7 @@ impl FleetServer {
 
     async fn fleet_report(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let name = req_str(args, "name")?;
-        match report_core(&name, self.cwd()).await {
+        match report_core_with_env(&name, self.cwd(), self.parl_dir().as_deref()).await {
             Ok(r) => Ok(render_result(&r, None)),
             Err(err) => Ok(render_error(err)),
         }
@@ -236,7 +300,7 @@ impl FleetServer {
     async fn fleet_diff(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let name = req_str(args, "name")?;
         let name_only = opt_bool(args, "nameOnly")?.unwrap_or(false);
-        match diff_core(&name, self.cwd(), name_only).await {
+        match diff_core_with_env(&name, self.cwd(), name_only, self.parl_dir().as_deref()).await {
             Ok(r) => Ok(render_result(&r, None)),
             Err(err) => Ok(render_error(err)),
         }
@@ -245,7 +309,7 @@ impl FleetServer {
     async fn fleet_merge(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let name = req_str(args, "name")?;
         let no_commit = opt_bool(args, "noCommit")?.unwrap_or(false);
-        match merge_core(&name, self.cwd(), no_commit).await {
+        match merge_core_with_env(&name, self.cwd(), no_commit, self.parl_dir().as_deref()).await {
             Ok(r) => Ok(render_result(&r, None)),
             Err(err) => Ok(render_error(err)),
         }
@@ -254,7 +318,7 @@ impl FleetServer {
     async fn fleet_cleanup(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let target = req_str(args, "target")?;
         let force = opt_bool(args, "force")?.unwrap_or(false);
-        let fleet = match resolve_fleet_dir(self.cwd()).await {
+        let fleet = match resolve_fleet_dir_with_env(self.cwd(), self.parl_dir().as_deref()).await {
             Ok(fleet) => fleet,
             Err(err) => return Ok(render_error(err)),
         };

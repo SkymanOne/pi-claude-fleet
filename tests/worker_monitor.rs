@@ -162,6 +162,9 @@ impl Fleet {
             .arg(&self.fleet_dir)
             .args(["--run", &self.run_id])
             .env("PARL_PI_BIN", format!("node {}", fake_pi().display()))
+            // The child must never inherit an ambient PARL_DIR: this
+            // monitor's fleet is the one this test created.
+            .env("PARL_DIR", &self.fleet_dir)
             .stdin(Stdio::null());
         for (key, value) in extra_env {
             command.env(key, value);
@@ -428,6 +431,7 @@ fn child_exit_without_settling_is_an_error_with_the_stderr_tail() {
         .arg(&fleet.fleet_dir)
         .args(["--run", &fleet.run_id])
         .env("PARL_PI_BIN", format!("node {}", fail_pi.display()))
+        .env("PARL_DIR", &fleet.fleet_dir)
         .stdin(Stdio::null());
     fleet.monitor = Some(command.spawn().unwrap());
     let state = settled_or(&fleet, Duration::from_secs(30));
@@ -458,6 +462,7 @@ fn missing_pi_binary_is_a_spawn_error() {
         .arg(&fleet.fleet_dir)
         .args(["--run", &fleet.run_id])
         .env("PARL_PI_BIN", "/nonexistent/pi-binary")
+        .env("PARL_DIR", &fleet.fleet_dir)
         .stdin(Stdio::null());
     fleet.monitor = Some(command.spawn().unwrap());
     let state = settled_or(&fleet, Duration::from_secs(30));
@@ -966,6 +971,7 @@ fn spawn_failures_are_diagnosed_in_pi_log() {
         .arg(&fleet.fleet_dir)
         .args(["--run", &fleet.run_id])
         .env("PARL_PI_BIN", "/nonexistent/pi-binary")
+        .env("PARL_DIR", &fleet.fleet_dir)
         .stdin(Stdio::null());
     fleet.monitor = Some(command.spawn().unwrap());
     settled_or(&fleet, Duration::from_secs(30));

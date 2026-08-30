@@ -295,14 +295,18 @@ impl Poll {
         }
         self.diff_at = now;
         let repo_root = repo_cwd(&self.fleet);
+        // Diff against THIS console's anchored fleet, pinned: a changed
+        // ambient PARL_DIR must not divert the stat to another fleet.
+        let fleet_dir = self.fleet.root().to_string_lossy().into_owned();
         for run in &self.runs {
             if run.state.status == crate::fleet::run::RunStatus::Archived {
                 continue;
             }
-            let stat = match crate::ops::integrate::diff_core(
+            let stat = match crate::ops::integrate::diff_core_with_env(
                 &run.run_id,
                 Some(repo_root.as_ref()),
                 false,
+                Some(fleet_dir.as_str()),
             )
             .await
             {

@@ -18,7 +18,7 @@ use crate::fleet::run::{self, RunRef, RunStatus};
 use crate::git::{self, MergeOutcome};
 use crate::util::now_ms;
 
-use super::steer::resolve_run;
+use super::steer::resolve_run_with_env;
 use super::{CommandResult, fail, ok, print_result, resolve_fleet_dir};
 
 /// How long `cleanup --force` waits for an aborted run to be terminal *and*
@@ -95,7 +95,18 @@ pub async fn diff_core(
     cwd: Option<&Path>,
     name_only: bool,
 ) -> anyhow::Result<CommandResult<DiffData>> {
-    let (_paths, target) = resolve_run(name, cwd).await?;
+    diff_core_with_env(name, cwd, name_only, super::ambient_parl_dir().as_deref()).await
+}
+
+/// [`diff_core`] with the `$PARL_DIR` value injected (tests pass `None`);
+/// the dashboard's poller pins its own anchored fleet dir instead.
+pub(crate) async fn diff_core_with_env(
+    name: &str,
+    cwd: Option<&Path>,
+    name_only: bool,
+    parl_dir: Option<&str>,
+) -> anyhow::Result<CommandResult<DiffData>> {
+    let (_paths, target) = resolve_run_with_env(name, cwd, parl_dir).await?;
     let state = &target.state;
     let worktree = state
         .worktree
@@ -164,7 +175,17 @@ pub async fn merge_core(
     cwd: Option<&Path>,
     no_commit: bool,
 ) -> anyhow::Result<CommandResult<MergeData>> {
-    let (_paths, target) = resolve_run(name, cwd).await?;
+    merge_core_with_env(name, cwd, no_commit, super::ambient_parl_dir().as_deref()).await
+}
+
+/// [`merge_core`] with the `$PARL_DIR` value injected (tests pass `None`).
+pub(crate) async fn merge_core_with_env(
+    name: &str,
+    cwd: Option<&Path>,
+    no_commit: bool,
+    parl_dir: Option<&str>,
+) -> anyhow::Result<CommandResult<MergeData>> {
+    let (_paths, target) = resolve_run_with_env(name, cwd, parl_dir).await?;
     let state = &target.state;
     let derived = run::derive_status(state, run::is_alive, now_ms());
     if derived != RunStatus::Settled {
@@ -417,6 +438,7 @@ async fn abort_and_wait(target: &RunRef) -> bool {
 mod tests {
     use super::*;
     use crate::fleet::run::RunState;
+    use crate::ops::resolve_fleet_dir_with_env;
     use crate::util::new_id;
     use std::path::PathBuf;
 
@@ -462,7 +484,7 @@ mod tests {
     /// A run created the way spawn does (worktree cut by the real git
     /// helper), without booting a monitor: state on disk, base pinned.
     async fn make_run(root: &Path, name: &str, with_worktree: bool) -> (PathBuf, RunRef) {
-        let fleet = resolve_fleet_dir(Some(root)).await.unwrap();
+        let fleet = resolve_fleet_dir_with_env(Some(root), None).await.unwrap();
         fleet.paths.ensure().unwrap();
         let run_id = format!("{name}-20260828141530");
         let run_dir = fleet.paths.run_dir(&run_id);
@@ -529,7 +551,9 @@ mod tests {
     async fn diff_on_a_run_without_a_worktree_is_not_applicable() {
         let dir = tmp_dir("parl-int-flat-");
         make_run(&dir, "flat", false).await;
-        let result = diff_core("flat", Some(&dir), false).await.unwrap();
+        let result = diff_core_with_env("flat", Some(&dir), false, None)
+            .await
+            .unwrap();
         assert_eq!(result.code, ExitCode::Ok);
         assert_eq!(
             result.out,
@@ -546,14 +570,18 @@ mod tests {
         let worktree = PathBuf::from(target.state.worktree.clone().unwrap());
         commit_worktree_file(&worktree, "hello.txt", "hi\n");
 
-        let stat = diff_core("worker", Some(&dir), false).await.unwrap();
+        let stat = diff_core_with_env("worker", Some(&dir), false, None)
+            .await
+            .unwrap();
         assert_eq!(stat.code, ExitCode::Ok);
         assert!(stat.out[0].contains("hello.txt"), "{}", stat.out[0]);
         assert!(stat.err.is_empty(), "{:?}", stat.err);
 
         // An uncommitted change is invisible to diff but warned about.
         std::fs::write(worktree.join("forgot.txt"), "u\n").unwrap();
-        let dirty = diff_core("worker", Some(&dir), true).await.unwrap();
+        let dirty = diff_core_with_env("worker", Some(&dir), true, None)
+            .await
+            .unwrap();
         assert_eq!(dirty.out[0], "hello.txt");
         assert_eq!(dirty.data.dirty, vec!["?? forgot.txt".to_string()]);
         assert!(
@@ -571,7 +599,9 @@ mod tests {
         commit_worktree_file(&worktree, "hello.txt", "hi\n");
         settle(&target.run_dir);
 
-        let result = merge_core("worker", Some(&dir), false).await.unwrap();
+        let result = merge_core_with_env("worker", Some(&dir), false, None)
+            .await
+            .unwrap();
         assert_eq!(result.code, ExitCode::Ok, "{:?}", result.err);
         assert_eq!(result.data.branch, "parl/worker-8141530");
         assert!(result.data.committed);
@@ -590,7 +620,9 @@ mod tests {
     async fn merge_refuses_unsettled_runs_and_missing_branches() {
         let dir = init_repo("parl-int-mergegates-");
         let (_fleet, target) = make_run(&dir, "flat", false).await;
-        let result = merge_core("flat", Some(&dir), false).await.unwrap();
+        let result = merge_core_with_env("flat", Some(&dir), false, None)
+            .await
+            .unwrap();
         assert_eq!(result.code, ExitCode::Error);
         assert!(
             result.err[0].contains("is starting — only settled runs can be merged"),
@@ -602,7 +634,9 @@ mod tests {
         state.status = RunStatus::Settled;
         state.settled_at = Some(crate::util::now_iso());
         run::save_state(&target.run_dir, &state).unwrap();
-        let result = merge_core("flat", Some(&dir), false).await.unwrap();
+        let result = merge_core_with_env("flat", Some(&dir), false, None)
+            .await
+            .unwrap();
         assert_eq!(result.code, ExitCode::Error);
         assert!(result.err[0].contains("has no branch"), "{}", result.err[0]);
     }
@@ -620,7 +654,9 @@ mod tests {
         git_sync(&dir, &["commit", "-qam", "parent version"]);
         settle(&target.run_dir);
 
-        let result = merge_core("worker", Some(&dir), false).await.unwrap();
+        let result = merge_core_with_env("worker", Some(&dir), false, None)
+            .await
+            .unwrap();
         assert_eq!(result.code, ExitCode::MergeConflict);
         assert_eq!(result.out, Vec::<String>::new());
         let err = result.err.join("\n");
@@ -650,7 +686,9 @@ mod tests {
         commit_worktree_file(&worktree, "feat.txt", "f\n");
         settle(&target.run_dir);
 
-        let result = merge_core("worker", Some(&dir), true).await.unwrap();
+        let result = merge_core_with_env("worker", Some(&dir), true, None)
+            .await
+            .unwrap();
         assert_eq!(result.code, ExitCode::Ok);
         assert!(
             result.out[0].contains("(staged, not committed)"),
@@ -702,7 +740,9 @@ mod tests {
             vec![format!("{} is already archived", target.run_id)]
         );
         // diff on an archived (worktree gone) run is not applicable.
-        let diffed = diff_core("worker", Some(&dir), false).await.unwrap();
+        let diffed = diff_core_with_env("worker", Some(&dir), false, None)
+            .await
+            .unwrap();
         assert_eq!(
             diffed.out,
             vec!["not applicable (run has no isolated worktree)"]
