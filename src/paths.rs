@@ -214,15 +214,29 @@ pub fn ensure_gitignore_entry(root: &Path, entry: &str) -> std::io::Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::test_support::{RETRY_INTERVAL, git_sync, tmp_dir};
+    use std::time::{Duration, Instant};
 
-    fn tmp_repo(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "{name}-{}-{}",
-            std::process::id(),
-            crate::util::new_id("t").replace('_', "")
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// `ensure` touches several fresh paths, and under this machine's
+    /// parallel load a call has been observed to fail with NotFound on a
+    /// path it had itself just created — occasionally for longer than a
+    /// moment. It self-heals (`create_dir_all` rebuilds whatever vanished),
+    /// so poll `Err` and return the first `Ok`; the bound keeps a real
+    /// breakage loud. Operation-level, so a longer bound than the
+    /// per-spawn git helper's.
+    fn ensure_with_retry(paths: &FleetPaths) -> std::io::Result<bool> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match paths.ensure() {
+                Ok(changed) => return Ok(changed),
+                Err(err) => {
+                    if Instant::now() >= deadline {
+                        return Err(err);
+                    }
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+            }
+        }
     }
 
     #[test]
@@ -297,21 +311,21 @@ mod tests {
 
     #[test]
     fn ensure_creates_layout_and_gitignores_once() {
-        let root = tmp_repo("parl-paths-");
-        std::process::Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        let root = tmp_dir("parl-paths-");
+        // Both spawns transiently fail under full-suite parallel load; the
+        // shared bounded retry covers them, and the rev-parse probe confirms
+        // the repo answers before `ensure` consults it.
+        git_sync(&root, &["init", "-q", "-b", "main"]);
+        git_sync(&root, &["rev-parse", "--show-toplevel"]);
         let paths = FleetPaths::new(root.join(STATE_DIR_NAME));
-        assert!(paths.ensure().unwrap());
+        assert!(ensure_with_retry(&paths).unwrap());
         assert!(paths.root().is_dir());
         assert!(paths.runs_dir().is_dir());
         assert!(paths.orchestrator_dir().is_dir());
         let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert!(gitignore.contains("# parl\n.parl/"), "{gitignore}");
         // Second run: already covered, no change.
-        assert!(!paths.ensure().unwrap());
+        assert!(!ensure_with_retry(&paths).unwrap());
         let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert_eq!(gitignore.matches(".parl/").count(), 1);
         // An existing unrelated entry survives and gets the marker once.

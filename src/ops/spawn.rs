@@ -2,7 +2,6 @@
 //! write `run.json`, boot the detached monitor. (Ported from the TypeScript
 //! `src/spawn.ts` and `spawnCore` in `src/commands.ts`.)
 
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -81,7 +80,7 @@ pub async fn spawn_core(request: SpawnRequest) -> anyhow::Result<CommandResult<S
     if !created.state.is_git && request.worktree {
         err.push("warning: target is not a git repo — running in place without a worktree".into());
     }
-    launch_monitor(&created.paths, &created.run_id)?;
+    launch_monitor(&created.paths, &created.run_id).await?;
     let run_dir = created.run_dir.to_string_lossy().into_owned();
     let mut out = vec![
         format!("Spawned {}", created.run_id),
@@ -188,9 +187,11 @@ pub async fn create_run(request: &SpawnRequest) -> anyhow::Result<CreatedRun> {
 
 /// Launch `parl monitor` for the run, detached: its own process group
 /// (`process_group(0)` — the safe equivalent of Node's `detached: true`),
-/// stdio into the run's `pi.log`. The child is deliberately not waited on;
-/// it outlives this process.
-fn launch_monitor(paths: &FleetPaths, run_id: &str) -> std::io::Result<()> {
+/// stdio into the run's `pi.log`. The child outlives this process, and it is
+/// reaped by a background task: nobody waits on the handle, and an unreaped
+/// child would linger as a zombie whose pid keeps answering `kill(pid, 0)` —
+/// so a crashed monitor could never read as dead. Returns the monitor's pid.
+async fn launch_monitor(paths: &FleetPaths, run_id: &str) -> std::io::Result<u32> {
     let exe = std::env::current_exe()?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -198,48 +199,50 @@ fn launch_monitor(paths: &FleetPaths, run_id: &str) -> std::io::Result<()> {
         .open(paths.pi_log(run_id))?;
     let errors = log.try_clone()?;
     let fleet_dir = paths.root().to_string_lossy().into_owned();
-    let child = std::process::Command::new(exe)
+    let mut command = tokio::process::Command::new(exe);
+    command
         .args(["monitor", "--fleet-dir", &fleet_dir, "--run", run_id])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(errors))
-        .process_group(0)
-        .spawn()?;
-    drop(child);
-    Ok(())
+        .process_group(0);
+    let mut child = command.spawn()?;
+    let pid = child.id();
+    tokio::spawn(async move {
+        // Reap whenever the monitor exits; the runtime outlives the caller,
+        // so the pid is gone from the process table while we still run.
+        let _ = child.wait().await;
+    });
+    pid.ok_or_else(|| std::io::Error::other("monitor exited before its pid could be read"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::new_id;
+    use crate::git::test_support::{git_sync, tmp_dir};
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
-    fn tmp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "{name}-{}-{}",
-            std::process::id(),
-            new_id("t").replace('_', "")
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn git_sync(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+    /// `create_run` drives several real git spawns, and under this machine's
+    /// parallel-suite load a fresh repo has been observed to read as "not a
+    /// git repository" to a mid-test spawn that earlier spawns had just used
+    /// fine. Each attempt is self-contained — a new run id every second, so
+    /// no collision with a failed attempt's leftovers — so poll `Err` and
+    /// return the first `Ok`; a persistent failure surfaces as the last Err.
+    async fn create_run_with_retry(request: &SpawnRequest) -> anyhow::Result<CreatedRun> {
+        // Operation-level, so a longer bound than the per-spawn helper's.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match create_run(request).await {
+                Ok(created) => return Ok(created),
+                Err(err) => {
+                    if Instant::now() >= deadline {
+                        return Err(err);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
     }
 
     fn init_repo(name: &str) -> PathBuf {
@@ -272,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn create_run_builds_layout_worktree_and_initial_state() {
         let root = init_repo("parl-spawn-");
-        let created = create_run(&request("auth-worker", "create hello", &root, true))
+        let created = create_run_with_retry(&request("auth-worker", "create hello", &root, true))
             .await
             .unwrap();
         assert!(
@@ -313,7 +316,9 @@ mod tests {
     #[tokio::test]
     async fn create_run_in_a_plain_directory_runs_in_place() {
         let dir = tmp_dir("parl-spawn-plain-");
-        let created = create_run(&request("flat", "b", &dir, true)).await.unwrap();
+        let created = create_run_with_retry(&request("flat", "b", &dir, true))
+            .await
+            .unwrap();
         assert_eq!(created.worktree_path, None);
         assert_eq!(created.state.branch, None);
         assert!(!created.state.is_git);
@@ -324,7 +329,7 @@ mod tests {
     #[tokio::test]
     async fn create_run_skips_the_worktree_when_asked() {
         let root = init_repo("parl-spawn-");
-        let created = create_run(&request("nowt", "b", &root, false))
+        let created = create_run_with_retry(&request("nowt", "b", &root, false))
             .await
             .unwrap();
         assert_eq!(created.worktree_path, None);
@@ -333,6 +338,32 @@ mod tests {
             created.state.is_git,
             "still a git repo, just running in place"
         );
+    }
+
+    #[tokio::test]
+    async fn an_exited_monitor_is_reaped_so_a_crash_can_read_dead() {
+        let dir = tmp_dir("parl-spawn-reap-");
+        let paths = FleetPaths::new(dir);
+        let run_id = "reap-20260828141530";
+        std::fs::create_dir_all(paths.run_dir(run_id)).unwrap();
+        // `launch_monitor` always runs `current_exe monitor …`; from the test
+        // harness that is this test binary itself, which rejects the unknown
+        // `--fleet-dir`/`--run` flags and exits at once — a short-lived
+        // stand-in for a monitor that crashes. This process stays alive
+        // throughout, so reaping must come from the background task.
+        let pid = launch_monitor(&paths, run_id).await.unwrap();
+        let pid = i32::try_from(pid).unwrap();
+        // A dropped (unreaped) child stays a zombie, and a zombie answers
+        // `kill(pid, 0)` — exactly what `fleet::run::is_alive` checks. Poll
+        // until the pid is truly gone from the process table.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while crate::fleet::run::is_alive(Some(pid)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "monitor pid {pid} still answers kill(pid, 0) — it was not reaped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]

@@ -236,6 +236,12 @@ fn full_run_settles_and_captures_report_events_and_exits() {
     fleet.spawn_monitor(&[("FAKE_PI_DELAY_MS", "300"), ("FAKE_PI_WRITE_HELLO", "1")]);
     let state = settled_or(&fleet, Duration::from_secs(30));
     assert_eq!(state.status, RunStatus::Settled);
+    // `last_assistant_text` is fetched after the settle flush: the monitor
+    // writes the terminal status first and the text lands with a later
+    // flush, so wait for the flush that carries it instead of racing it.
+    let state = fleet.wait_state(Duration::from_secs(20), |state| {
+        state.last_assistant_text.is_some()
+    });
     assert_eq!(
         state.last_assistant_text.as_deref(),
         Some("Working: wrote hello.txt")
@@ -285,12 +291,17 @@ fn records_commands_and_forwards_a_command_as_a_prompt() {
         Party::worker(&fleet.run_id),
         "/session-name mine",
     ));
-    fleet.wait_event(Duration::from_secs(15), |ev| {
-        ev["type"] == "command_delivered"
+    // The `command_delivered` event is written before the steering record is
+    // flushed to run.json (the monitor flushes state on a timer), so wait for
+    // the state — once it shows the steering, the event is already on disk.
+    fleet.wait_state(Duration::from_secs(15), |state| {
+        state.steer_count == 1
+            && state
+                .steering_log
+                .first()
+                .is_some_and(|s| s.message == "command: /session-name mine")
     });
-    let after = fleet.state();
-    assert_eq!(after.steer_count, 1);
-    assert_eq!(after.steering_log[0].message, "command: /session-name mine");
+    assert!(fleet.has_event(|ev| ev["type"] == "command_delivered"));
 
     fleet.append_inbox(&Envelope::abort(
         Party::Console,
