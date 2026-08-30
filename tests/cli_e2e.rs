@@ -684,37 +684,51 @@ fn the_prompt_override_chain_resolves_in_order() {
     let (_tmp, repo) = plain_dir();
     let parl_dir = repo.join(parl::paths::STATE_DIR_NAME);
     std::fs::create_dir_all(&parl_dir).unwrap();
+    // A legacy config home plus a new `~/.parl`, both fabricated.
     let home_tmp = tempfile::tempdir().unwrap();
     let home = home_tmp.path();
+    let user_root = tempfile::tempdir().unwrap();
+    let user_dir = user_root.path().join(parl::paths::STATE_DIR_NAME);
+    std::fs::create_dir_all(&user_dir).unwrap();
 
     // Nothing anywhere: the embedded copy.
     assert_eq!(
-        resolve_prompt_source(None, &repo, Some(home)).unwrap(),
+        resolve_prompt_source(None, &repo, Some(&user_dir)).unwrap(),
         None
     );
 
-    // ~/.config/parl/orchestrator.md next.
-    let user = home.join(".config/parl/orchestrator.md");
-    std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+    // ~/.parl/orchestrator.md next, the new user location.
+    let user = user_dir.join("orchestrator.md");
     std::fs::write(&user, "user override").unwrap();
     assert_eq!(
-        resolve_prompt_source(None, &repo, Some(home)).unwrap(),
-        Some(user)
+        resolve_prompt_source(None, &repo, Some(&user_dir)).unwrap(),
+        Some(user.clone())
+    );
+
+    // The legacy ~/.config/parl location is no longer consulted at all,
+    // even when the new one is empty.
+    let legacy = home.join(".config/parl/orchestrator.md");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, "legacy override").unwrap();
+    std::fs::remove_file(&user).unwrap();
+    assert_eq!(
+        resolve_prompt_source(None, &repo, Some(&user_dir)).unwrap(),
+        None
     );
 
     // <repo>/.parl/orchestrator.md beats the user config.
     let repo_override = parl_dir.join("orchestrator.md");
     std::fs::write(&repo_override, "repo override").unwrap();
     assert_eq!(
-        resolve_prompt_source(None, &repo, Some(home)).unwrap(),
-        Some(repo_override)
+        resolve_prompt_source(None, &repo, Some(&user_dir)).unwrap(),
+        Some(repo_override.clone())
     );
 
     // $PARL_PROMPT (a path) beats everything.
     let env_file = repo.join("custom.md");
     std::fs::write(&env_file, "env override").unwrap();
     assert_eq!(
-        resolve_prompt_source(Some(env_file.to_str().unwrap()), &repo, Some(home)).unwrap(),
+        resolve_prompt_source(Some(env_file.to_str().unwrap()), &repo, Some(&user_dir)).unwrap(),
         Some(env_file)
     );
 
@@ -722,7 +736,7 @@ fn the_prompt_override_chain_resolves_in_order() {
     let err = resolve_prompt_source(
         Some(repo.join("missing.md").to_str().unwrap()),
         &repo,
-        Some(home),
+        Some(&user_dir),
     )
     .unwrap_err();
     assert!(err.to_string().contains("not a file"), "{err}");

@@ -66,6 +66,11 @@ pub struct OrchestratorClientOptions {
     /// Extra environment for the spawned monitor, on top of ours (tests point
     /// `PARL_CLAUDE_BIN` at a scripted stand-in).
     pub monitor_env: Option<HashMap<String, String>>,
+    /// The user config dir (`~/.parl`) whose `[orchestrator] model` is the
+    /// fallback for a monitor this client has to start, under the explicit
+    /// option and any persisted launch record. `None` reads the ambient user
+    /// dir; tests set it so nothing resolves a real home.
+    pub user_config_dir: Option<PathBuf>,
 }
 
 impl OrchestratorClientOptions {
@@ -83,6 +88,7 @@ impl OrchestratorClientOptions {
             poll_ms: 200,
             monitor_bin: None,
             monitor_env: None,
+            user_config_dir: None,
         }
     }
 }
@@ -463,9 +469,26 @@ impl OrchestratorClient {
             session::load(&self.options.fleet_dir)
                 .unwrap_or_else(|| OrchestratorSession::new(&cwd_string))
         };
+        // The model, most specific wins: the explicit option, then the
+        // session's persisted launch record (the project layer), then
+        // `~/.parl/config.toml`, then claude's own default. The resolved
+        // value is what the monitor's boot reads back from the launch record.
+        let ambient_user_dir = crate::paths::user_dir();
+        let user_config_dir = self
+            .options
+            .user_config_dir
+            .as_deref()
+            .or(ambient_user_dir.as_deref());
+        let config = crate::paths::load_user_config(user_config_dir)?;
+        let model = config
+            .orchestrator_model(
+                self.options.model.as_deref(),
+                session_record.launch.model.as_deref(),
+            )
+            .map(str::to_string);
         session_record.cwd = cwd_string;
         session_record.launch = LaunchOptions {
-            model: self.options.model.clone(),
+            model,
             budget_usd: self
                 .options
                 .budget
@@ -534,6 +557,7 @@ mod tests {
     use crate::util::atomic_write_json;
     use serde_json::json;
     use std::fmt::Write as _;
+    use std::path::Path;
 
     fn record(kind: &str, text: &str) -> EventRecord {
         EventRecord {
@@ -687,5 +711,68 @@ mod tests {
         let count = kept.split('\n').filter(|l| !l.is_empty()).count();
         assert_eq!(count, MAX_RESTORED_LINES);
         assert!(kept.contains(&format!("\"text\":\"{}\"", MAX_RESTORED_LINES + 9)));
+    }
+
+    /// A client whose options point at the fleet and user-config dirs a test
+    /// fabricated; `spawn_monitor` never reads the ambient environment this
+    /// way.
+    fn monitor_client(
+        fleet: &Path,
+        user_config_dir: Option<&Path>,
+        model: Option<&str>,
+    ) -> Arc<OrchestratorClient> {
+        let cwd = fleet.parent().unwrap_or(fleet).to_path_buf();
+        let options = OrchestratorClientOptions {
+            model: model.map(str::to_string),
+            user_config_dir: user_config_dir.map(Path::to_path_buf),
+            ..OrchestratorClientOptions::new(fleet.to_path_buf(), cwd)
+        };
+        OrchestratorClient::new(options)
+    }
+
+    /// `spawn_monitor` records what it will launch into the session store
+    /// before spawning a short-lived stand-in monitor (this test binary, which
+    /// exits on the unknown flags at once). The recorded launch model is the
+    /// point: it is what the real monitor's boot applies.
+    #[tokio::test]
+    async fn spawn_monitor_records_the_most_specific_orchestrator_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = tmp.path().join(".parl");
+        std::fs::create_dir_all(fleet.join("orchestrator")).unwrap();
+        let user_root = tmp.path().join("user");
+        let user_dir = user_root.join(".parl");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(
+            user_dir.join("config.toml"),
+            "[orchestrator]\nmodel = \"claude-fable-5\"\n",
+        )
+        .unwrap();
+        let user = Some(user_dir.as_path());
+
+        // A persisted launch record (the per-project layer) beats the config.
+        let mut record = crate::orch::session::OrchestratorSession::new("/repo");
+        record.launch.model = Some("sonnet".into());
+        crate::orch::session::save(&fleet, &mut record).unwrap();
+        let client = monitor_client(&fleet, user, None);
+        client.spawn_monitor().unwrap();
+        let session = crate::orch::session::load(&fleet).unwrap();
+        assert_eq!(session.launch.model.as_deref(), Some("sonnet"));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // An explicit option beats everything.
+        let client = monitor_client(&fleet, user, Some("haiku"));
+        client.spawn_monitor().unwrap();
+        let session = crate::orch::session::load(&fleet).unwrap();
+        assert_eq!(session.launch.model.as_deref(), Some("haiku"));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Nothing persisted anywhere else: the config supplies the default.
+        let fresh = tmp.path().join(".parl-2");
+        std::fs::create_dir_all(fresh.join("orchestrator")).unwrap();
+        let client = monitor_client(&fresh, user, None);
+        client.spawn_monitor().unwrap();
+        let session = crate::orch::session::load(&fresh).unwrap();
+        assert_eq!(session.launch.model.as_deref(), Some("claude-fable-5"));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }

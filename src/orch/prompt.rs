@@ -6,7 +6,10 @@
 //! the orchestrator directory for `--append-system-prompt-file`. Overrides,
 //! in order: `$PARL_PROMPT` (a path; a dangling one is an error, it is
 //! explicit user intent), then `<repo>/.parl/orchestrator.md`, then
-//! `~/.config/parl/orchestrator.md`, then the embedded copy. Unknown
+//! `~/.parl/orchestrator.md`, then the embedded copy. The legacy
+//! `~/.config/parl/orchestrator.md` is no longer read; when only that file
+//! exists, resolution warns on stderr and names both paths, so a user with an
+//! existing file is told to move it rather than silently ignored. Unknown
 //! `{{PLACEHOLDER}}`s are left untouched.
 
 use std::path::{Path, PathBuf};
@@ -83,7 +86,7 @@ fn placeholder_regex() -> Option<&'static regex::Regex> {
 /// copy. An explicit `$PARL_PROMPT` that does not exist is an error — it is
 /// user intent, and silently falling back would hide the mistake.
 ///
-/// The env value and home directory are injectable (tests).
+/// The env value and user config dir are injectable (tests).
 ///
 /// # Errors
 ///
@@ -91,7 +94,7 @@ fn placeholder_regex() -> Option<&'static regex::Regex> {
 pub fn resolve_prompt_source(
     parl_prompt: Option<&str>,
     repo_root: &Path,
-    home: Option<&Path>,
+    user_dir: Option<&Path>,
 ) -> anyhow::Result<Option<PathBuf>> {
     if let Some(path) = parl_prompt.map(str::trim).filter(|s| !s.is_empty()) {
         let path = PathBuf::from(path);
@@ -107,8 +110,8 @@ pub fn resolve_prompt_source(
     if repo_override.is_file() {
         return Ok(Some(repo_override));
     }
-    if let Some(home) = home {
-        let user_override = home.join(".config").join("parl").join("orchestrator.md");
+    if let Some(user_dir) = user_dir {
+        let user_override = user_dir.join("orchestrator.md");
         if user_override.is_file() {
             return Ok(Some(user_override));
         }
@@ -116,17 +119,46 @@ pub fn resolve_prompt_source(
     Ok(None)
 }
 
-/// [`resolve_prompt_source`] against the real environment.
+/// The legacy `~/.config/parl/orchestrator.md`, when it exists and the new
+/// `~/.parl/orchestrator.md` does not — the prompt moved, and a user who
+/// only has the old file should be told, not silently ignored.
+#[must_use]
+pub fn legacy_config_prompt(home: Option<&Path>, user_dir: Option<&Path>) -> Option<PathBuf> {
+    let legacy = home?.join(".config").join("parl").join("orchestrator.md");
+    if !legacy.is_file() {
+        return None;
+    }
+    let moved = user_dir
+        .map(|dir| dir.join("orchestrator.md"))
+        .is_some_and(|path| path.is_file());
+    (!moved).then_some(legacy)
+}
+
+/// [`resolve_prompt_source`] against the real environment; warns on stderr
+/// when only the legacy `~/.config/parl` prompt exists.
 ///
 /// # Errors
 ///
 /// Returns an error when `$PARL_PROMPT` points at something that is not a file.
 pub fn prompt_source(repo_root: &Path) -> anyhow::Result<Option<PathBuf>> {
-    resolve_prompt_source(
+    let home = dirs::home_dir();
+    let user_config_dir = crate::paths::user_dir();
+    let resolved = resolve_prompt_source(
         std::env::var(env_var("PROMPT")).ok().as_deref(),
         repo_root,
-        dirs::home_dir().as_deref(),
-    )
+        user_config_dir.as_deref(),
+    )?;
+    if let Some(legacy) = legacy_config_prompt(home.as_deref(), user_config_dir.as_deref()) {
+        let target = user_config_dir.as_ref().map_or_else(
+            || "~/.parl/orchestrator.md".to_string(),
+            |dir| dir.join("orchestrator.md").display().to_string(),
+        );
+        eprintln!(
+            "warning: the orchestrator prompt moved — {} is no longer read; move it to {target}",
+            legacy.display()
+        );
+    }
+    Ok(resolved)
 }
 
 /// Render the prompt for the fleet rooted at `fleet_dir` working in `repo_root`.
@@ -290,42 +322,89 @@ mod tests {
         ));
         let parl = repo.join(STATE_DIR_NAME);
         std::fs::create_dir_all(&parl).unwrap();
+        // The legacy config home, and the new user-level `~/.parl`.
         let home = std::env::temp_dir().join(format!(
-            "parl-prompt-home-{}-{}",
+            "parl-prompt-legacy-{}-{}",
             std::process::id(),
             crate::util::new_id("t").replace('_', "")
         ));
         std::fs::create_dir_all(home.join(".config/parl")).unwrap();
+        let user_root = std::env::temp_dir().join(format!(
+            "parl-prompt-user-{}-{}",
+            std::process::id(),
+            crate::util::new_id("t").replace('_', "")
+        ));
+        let user_dir = user_root.join(STATE_DIR_NAME);
+        std::fs::create_dir_all(&user_dir).unwrap();
 
         // nothing anywhere: embedded
         assert_eq!(
-            resolve_prompt_source(None, &repo, Some(&home)).unwrap(),
+            resolve_prompt_source(None, &repo, Some(&user_dir)).unwrap(),
             None
         );
-        // ~/.config/parl next
-        let user = home.join(".config/parl/orchestrator.md");
-        std::fs::write(&user, "user").unwrap();
+        // ~/.parl next, the new user location
+        let user_override = user_dir.join("orchestrator.md");
+        std::fs::write(&user_override, "user").unwrap();
         assert_eq!(
-            resolve_prompt_source(None, &repo, Some(&home)).unwrap(),
-            Some(user)
+            resolve_prompt_source(None, &repo, Some(&user_dir)).unwrap(),
+            Some(user_override.clone())
+        );
+        // the legacy ~/.config/parl location is no longer consulted, even
+        // when the new one is empty
+        let legacy = home.join(".config/parl/orchestrator.md");
+        std::fs::write(&legacy, "legacy").unwrap();
+        assert_eq!(
+            resolve_prompt_source(None, &repo, Some(&user_dir)).unwrap(),
+            Some(user_override)
         );
         // <repo>/.parl beats the user config
         let repo_override = parl.join("orchestrator.md");
         std::fs::write(&repo_override, "repo").unwrap();
         assert_eq!(
-            resolve_prompt_source(None, &repo, Some(&home)).unwrap(),
+            resolve_prompt_source(None, &repo, Some(&user_dir)).unwrap(),
             Some(repo_override)
         );
         // $PARL_PROMPT beats everything
         let env_file = repo.join("custom-prompt.md");
         std::fs::write(&env_file, "env").unwrap();
         assert_eq!(
-            resolve_prompt_source(env_file.to_str(), &repo, Some(&home)).unwrap(),
+            resolve_prompt_source(env_file.to_str(), &repo, Some(&user_dir)).unwrap(),
             Some(env_file)
         );
         // a dangling $PARL_PROMPT is an error, not a silent fallback
-        let err = resolve_prompt_source(repo.join("missing.md").to_str(), &repo, Some(&home))
+        let err = resolve_prompt_source(repo.join("missing.md").to_str(), &repo, Some(&user_dir))
             .expect_err("dangling override errors");
         assert!(err.to_string().contains("not a file"), "{err}");
+    }
+
+    #[test]
+    fn the_legacy_config_prompt_warns_only_when_it_is_the_only_prompt() {
+        let home = std::env::temp_dir().join(format!(
+            "parl-prompt-warn-home-{}-{}",
+            std::process::id(),
+            crate::util::new_id("t").replace('_', "")
+        ));
+        let user_root = std::env::temp_dir().join(format!(
+            "parl-prompt-warn-user-{}-{}",
+            std::process::id(),
+            crate::util::new_id("t").replace('_', "")
+        ));
+        let user_dir = user_root.join(STATE_DIR_NAME);
+        std::fs::create_dir_all(home.join(".config/parl")).unwrap();
+        std::fs::create_dir_all(&user_dir).unwrap();
+        let legacy = home.join(".config/parl/orchestrator.md");
+
+        // no legacy file anywhere: nothing to warn about
+        assert_eq!(legacy_config_prompt(Some(&home), Some(&user_dir)), None);
+        assert_eq!(legacy_config_prompt(None, Some(&user_dir)), None);
+        // legacy exists, the new location does not: the moved file is named
+        std::fs::write(&legacy, "old").unwrap();
+        assert_eq!(
+            legacy_config_prompt(Some(&home), Some(&user_dir)),
+            Some(legacy.clone())
+        );
+        // both exist: the move happened, no warning
+        std::fs::write(user_dir.join("orchestrator.md"), "new").unwrap();
+        assert_eq!(legacy_config_prompt(Some(&home), Some(&user_dir)), None);
     }
 }
