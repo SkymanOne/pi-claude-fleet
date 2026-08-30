@@ -35,7 +35,7 @@ fn fake_pi() -> PathBuf {
 /// killed when the harness drops.
 struct Fleet {
     tmp: tempfile::TempDir,
-    fleet_dir: PathBuf,
+    parl_dir: PathBuf,
     run_id: String,
     run_dir: PathBuf,
     monitor: Option<Child>,
@@ -44,13 +44,13 @@ struct Fleet {
 impl Fleet {
     fn new(prefix: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let fleet_dir = tmp.path().join(".parl");
+        let parl_dir = tmp.path().join(".parl");
         let run_id = format!("{prefix}20260828141530");
-        let run_dir = fleet_dir.join("runs").join(&run_id);
+        let run_dir = parl_dir.join("runs").join(&run_id);
         std::fs::create_dir_all(&run_dir).unwrap();
         Self {
             tmp,
-            fleet_dir,
+            parl_dir,
             run_id,
             run_dir,
             monitor: None,
@@ -65,7 +65,7 @@ impl Fleet {
     /// `spawn_monitor`, which reads it at boot).
     fn write_state_with(&self, tweak: impl FnOnce(&mut RunState)) {
         let mut state = RunState::new(
-            self.fleet_dir.to_str().unwrap(),
+            self.parl_dir.to_str().unwrap(),
             &self.run_id,
             "w",
             self.root().to_str().unwrap(),
@@ -102,15 +102,14 @@ impl Fleet {
             if check(&state) {
                 return state;
             }
-            if Instant::now() >= deadline {
-                panic!(
-                    "timed out waiting on run.json; last status {:?} error {:?}\nevents: {}\npi.log tail: {}",
-                    state.status,
-                    state.error,
-                    self.read("events.jsonl"),
-                    tail(&self.run_dir.join("pi.log"), 30)
-                );
-            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting on run.json; last status {:?} error {:?}\nevents: {}\npi.log tail: {}",
+                state.status,
+                state.error,
+                self.read("events.jsonl"),
+                tail(&self.run_dir.join("pi.log"), 30)
+            );
             std::thread::sleep(Duration::from_millis(POLL_MS));
         }
     }
@@ -134,12 +133,11 @@ impl Fleet {
             if let Some(ev) = self.events().iter().find(|ev| check(ev)) {
                 return ev.clone();
             }
-            if Instant::now() >= deadline {
-                panic!(
-                    "timed out waiting for an event; have: {}",
-                    self.read("events.jsonl")
-                );
-            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for an event; have: {}",
+                self.read("events.jsonl")
+            );
             std::thread::sleep(Duration::from_millis(POLL_MS));
         }
     }
@@ -159,12 +157,12 @@ impl Fleet {
         let mut command = Command::new(assert_cmd::cargo_bin!("parl"));
         command
             .args(["monitor", "--fleet-dir"])
-            .arg(&self.fleet_dir)
+            .arg(&self.parl_dir)
             .args(["--run", &self.run_id])
             .env("PARL_PI_BIN", format!("node {}", fake_pi().display()))
             // The child must never inherit an ambient PARL_DIR: this
             // monitor's fleet is the one this test created.
-            .env("PARL_DIR", &self.fleet_dir)
+            .env("PARL_DIR", &self.parl_dir)
             .stdin(Stdio::null());
         for (key, value) in extra_env {
             command.env(key, value);
@@ -250,13 +248,16 @@ fn full_run_settles_and_captures_report_events_and_exits() {
         Some("Working: wrote hello.txt")
     );
     assert_eq!(state.last_tool.as_deref(), Some("bash"));
-    assert!(state.last_activity.is_some());
-    assert!(state.settled_at.is_some());
+    assert!(state.last_activity.is_some(), "last activity was recorded");
+    assert!(state.settled_at.is_some(), "the settle time was recorded");
     assert_eq!(state.error, None);
-    assert!(state.pid.is_some());
+    assert!(state.pid.is_some(), "the monitor pid is recorded");
 
     // The report lives in the new layout: runs/<id>/report.md.
-    assert!(fleet.run_dir.join("report.md").is_file());
+    assert!(
+        fleet.run_dir.join("report.md").is_file(),
+        "the report lives at runs/<id>/report.md"
+    );
 
     let events = fleet.read("events.jsonl");
     assert!(events.contains("\"task_prompt\""), "{events}");
@@ -271,7 +272,7 @@ fn full_run_settles_and_captures_report_events_and_exits() {
     let pi_log = fleet.read("pi.log");
     assert!(pi_log.contains("\"agent_settled\""), "{pi_log}");
     assert!(pi_log.contains("\"turn_start\""), "{pi_log}");
-    assert!(pi_log.contains("[monitor] supervising run"));
+    assert!(pi_log.contains("[monitor] supervising run"), "{pi_log}");
 
     // The monitor shuts pi down and exits after settling.
     let code = fleet.wait_monitor_exit(Duration::from_secs(15));
@@ -304,7 +305,10 @@ fn records_commands_and_forwards_a_command_as_a_prompt() {
                 .first()
                 .is_some_and(|s| s.message == "command: /session-name mine")
     });
-    assert!(fleet.has_event(|ev| ev["type"] == "command_delivered"));
+    assert!(
+        fleet.has_event(|ev| ev["type"] == "command_delivered"),
+        "a command_delivered event was written"
+    );
 
     fleet.append_inbox(&Envelope::abort(
         Party::Console,
@@ -370,7 +374,10 @@ fn reports_and_changes_the_thinking_level() {
         state.thinking_level.as_deref() == Some("xhigh")
     });
     assert_eq!(state.thinking_level.as_deref(), Some("xhigh"));
-    assert!(fleet.has_event(|ev| ev["type"] == "thinking_requested"));
+    assert!(
+        fleet.has_event(|ev| ev["type"] == "thinking_requested"),
+        "a thinking_requested event was written"
+    );
 
     fleet.append_inbox(&Envelope::thinking(
         Party::Console,
@@ -428,10 +435,10 @@ fn child_exit_without_settling_is_an_error_with_the_stderr_tail() {
     let mut command = Command::new(assert_cmd::cargo_bin!("parl"));
     command
         .args(["monitor", "--fleet-dir"])
-        .arg(&fleet.fleet_dir)
+        .arg(&fleet.parl_dir)
         .args(["--run", &fleet.run_id])
         .env("PARL_PI_BIN", format!("node {}", fail_pi.display()))
-        .env("PARL_DIR", &fleet.fleet_dir)
+        .env("PARL_DIR", &fleet.parl_dir)
         .stdin(Stdio::null());
     fleet.monitor = Some(command.spawn().unwrap());
     let state = settled_or(&fleet, Duration::from_secs(30));
@@ -442,7 +449,10 @@ fn child_exit_without_settling_is_an_error_with_the_stderr_tail() {
         error.contains("model provider unreachable"),
         "stderr tail captured: {error}"
     );
-    assert!(state.settled_at.is_some());
+    assert!(
+        state.settled_at.is_some(),
+        "the failure was recorded as settled"
+    );
     let failure = fleet.wait_event(Duration::from_secs(10), |ev| ev["type"] == "run_failed");
     assert!(
         failure["error"]
@@ -459,10 +469,10 @@ fn missing_pi_binary_is_a_spawn_error() {
     let mut command = Command::new(assert_cmd::cargo_bin!("parl"));
     command
         .args(["monitor", "--fleet-dir"])
-        .arg(&fleet.fleet_dir)
+        .arg(&fleet.parl_dir)
         .args(["--run", &fleet.run_id])
         .env("PARL_PI_BIN", "/nonexistent/pi-binary")
-        .env("PARL_DIR", &fleet.fleet_dir)
+        .env("PARL_DIR", &fleet.parl_dir)
         .stdin(Stdio::null());
     fleet.monitor = Some(command.spawn().unwrap());
     let state = settled_or(&fleet, Duration::from_secs(30));
@@ -508,7 +518,10 @@ fn console_steering_mid_run_is_delivered_logged_and_reflected_in_the_report() {
             ("orchestrator", "then summarize")
         ]
     );
-    assert!(state.steering_log.iter().all(|s| !s.ts.is_empty()));
+    assert!(
+        state.steering_log.iter().all(|s| !s.ts.is_empty()),
+        "every steering record is timestamped"
+    );
     let events = fleet.read("events.jsonl");
     assert!(events.contains("\"steering_delivered\""), "{events}");
     assert!(events.contains("use tabs not spaces"), "{events}");
@@ -528,8 +541,11 @@ fn abort_via_the_inbox_stops_the_run() {
     ));
     let state = settled_or(&fleet, Duration::from_secs(30));
     assert_eq!(state.status, RunStatus::Stopped);
-    assert!(state.settled_at.is_some());
-    assert!(fleet.has_event(|ev| ev["type"] == "abort_requested"));
+    assert!(state.settled_at.is_some(), "the stop was recorded");
+    assert!(
+        fleet.has_event(|ev| ev["type"] == "abort_requested"),
+        "an abort_requested event was written"
+    );
 }
 
 #[test]
@@ -595,8 +611,16 @@ fn outbox_questions_and_progress_mirror_into_state_and_events_and_answers_resolv
         Some(vec!["bcrypt".into(), "argon2".into()])
     );
     assert_eq!(pending.context, None);
-    assert!(pending.id.starts_with("q_fake_"));
-    assert!(pending.asked_at.starts_with("2"));
+    assert!(
+        pending.id.starts_with("q_fake_"),
+        "the question carries the fake's id: {}",
+        pending.id
+    );
+    assert!(
+        pending.asked_at.starts_with('2'),
+        "asked_at is an RFC3339 timestamp: {}",
+        pending.asked_at
+    );
     assert_eq!(state.last_progress.as_deref(), Some("starting the work"));
 
     // A running worker waiting on its question reads as blocked.
@@ -610,7 +634,10 @@ fn outbox_questions_and_progress_mirror_into_state_and_events_and_answers_resolv
         .expect("worker_question mirrored");
     assert_eq!(question["questionId"], pending.id.as_str());
     assert_eq!(question["question"], "bcrypt or argon2?");
-    assert!(events.iter().any(|ev| ev["type"] == "worker_progress"));
+    assert!(
+        events.iter().any(|ev| ev["type"] == "worker_progress"),
+        "a worker_progress event was mirrored"
+    );
 
     fleet.append_inbox(&Envelope::answer(
         Party::Orchestrator,
@@ -674,7 +701,10 @@ fn an_unanswered_question_times_out_and_the_run_still_settles() {
         .find(|ev| ev["type"] == "worker_question_resolved")
         .expect("resolved event");
     assert_eq!(resolved["how"], "timeout");
-    assert!(!fleet.has_event(|ev| ev["type"] == "answer_delivered"));
+    assert!(
+        !fleet.has_event(|ev| ev["type"] == "answer_delivered"),
+        "no answer was delivered"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -699,7 +729,7 @@ fn the_monitor_passes_the_materialized_extension_and_skill_to_pi() {
     let argv: Vec<String> =
         serde_json::from_str(&std::fs::read_to_string(&argv_file).unwrap()).unwrap();
     assert_eq!(&argv[..2], &["--mode".to_string(), "rpc".to_string()]);
-    let paths = FleetPaths::new(&fleet.fleet_dir);
+    let paths = FleetPaths::new(&fleet.parl_dir);
     // The extension and skill were materialized into the fleet dir.
     let extension = paths.pi_extension();
     let skill = paths.pi_skill();
@@ -729,9 +759,18 @@ fn the_monitor_passes_the_materialized_extension_and_skill_to_pi() {
     assert_eq!(pair("--thinking"), "high");
     // The materialized skill keeps the report-skill frontmatter and the template.
     let skill_md = std::fs::read_to_string(&skill).unwrap();
-    assert!(skill_md.starts_with("---\nname: fleet-worker-report\n"));
-    assert!(skill_md.contains("## Steering received"));
-    assert!(skill_md.contains("$PARL_DIR/runs/$PARL_RUN/report.md"));
+    assert!(
+        skill_md.starts_with("---\nname: fleet-worker-report\n"),
+        "the skill keeps its frontmatter"
+    );
+    assert!(
+        skill_md.contains("## Steering received"),
+        "the skill keeps the report template"
+    );
+    assert!(
+        skill_md.contains("$PARL_DIR/runs/$PARL_RUN/report.md"),
+        "the skill targets the PARL layout"
+    );
     // The extension speaks the PARL layout.
     let extension_ts = std::fs::read_to_string(&extension).unwrap();
     assert!(extension_ts.contains("PARL_RUN"), "env names");
@@ -837,7 +876,10 @@ fn an_unresolvable_model_is_reported_not_guessed() {
     );
     // pi was never asked to switch: the resolved model is unchanged.
     assert_eq!(fleet.state().active_model.as_deref(), Some("fake/model-1"));
-    assert!(!fleet.has_event(|ev| ev["type"] == "model_rejected"));
+    assert!(
+        !fleet.has_event(|ev| ev["type"] == "model_rejected"),
+        "pi was never told to switch"
+    );
     fleet.append_inbox(&Envelope::abort(
         Party::Console,
         Party::worker(&fleet.run_id),
@@ -884,7 +926,10 @@ fn a_dialog_request_is_recorded_and_an_answer_reaches_pi() {
     // The value reply reached pi and was recorded.
     let report = fleet.read("report.md");
     assert!(report.contains(r#""value":"b""#), "{report}");
-    assert!(fleet.has_event(|ev| ev["type"] == "answer_delivered"));
+    assert!(
+        fleet.has_event(|ev| ev["type"] == "answer_delivered"),
+        "the answer reached pi"
+    );
 }
 
 #[test]
@@ -912,10 +957,13 @@ fn an_unanswered_dialog_is_cancelled_before_pis_own_timeout() {
     // pi got the cancellation, not its own timeout resolution.
     assert!(report.contains(r#""cancelled":true"#), "{report}");
     assert!(!report.contains("(pi timeout)"), "{report}");
-    assert!(fleet.has_event(|ev| ev["type"] == "dialog_cancelled"));
+    assert!(
+        fleet.has_event(|ev| ev["type"] == "dialog_cancelled"),
+        "a dialog_cancelled event was written"
+    );
 }
 
-fn settled_status() -> RunStatus {
+const fn settled_status() -> RunStatus {
     RunStatus::Settled
 }
 
@@ -930,7 +978,10 @@ fn fire_and_forget_ui_requests_are_recorded_without_replies() {
     let events = fleet.read("events.jsonl");
     assert!(events.contains("\"notify\""), "{events}");
     assert!(events.contains("\"setTitle\""), "{events}");
-    assert!(!fleet.has_event(|ev| ev["type"] == "dialog_cancelled"));
+    assert!(
+        !fleet.has_event(|ev| ev["type"] == "dialog_cancelled"),
+        "no cancellation was needed"
+    );
 }
 
 /// A dialog answered as a `confirm` maps the text to confirmed true/false.
@@ -968,10 +1019,10 @@ fn spawn_failures_are_diagnosed_in_pi_log() {
     let mut command = Command::new(assert_cmd::cargo_bin!("parl"));
     command
         .args(["monitor", "--fleet-dir"])
-        .arg(&fleet.fleet_dir)
+        .arg(&fleet.parl_dir)
         .args(["--run", &fleet.run_id])
         .env("PARL_PI_BIN", "/nonexistent/pi-binary")
-        .env("PARL_DIR", &fleet.fleet_dir)
+        .env("PARL_DIR", &fleet.parl_dir)
         .stdin(Stdio::null());
     fleet.monitor = Some(command.spawn().unwrap());
     settled_or(&fleet, Duration::from_secs(30));

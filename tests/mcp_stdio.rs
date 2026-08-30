@@ -27,7 +27,9 @@ const FAKE_PI_DELAY_MS: &str = "200";
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn fake_pi() -> PathBuf {
@@ -87,7 +89,7 @@ struct McpClient {
 
 impl McpClient {
     /// Spawn `parl mcp [--cwd root]` with the given extra environment.
-    fn spawn(root: Option<&Path>, extra_env: &[(&str, &str)]) -> McpClient {
+    fn spawn(root: Option<&Path>, extra_env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(assert_cmd::cargo_bin!("parl"));
         command.args(["mcp"]);
         if let Some(root) = root {
@@ -114,7 +116,7 @@ impl McpClient {
         let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        let mut client = McpClient {
+        let mut client = Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
@@ -157,7 +159,7 @@ impl McpClient {
         }
     }
 
-    fn request(&mut self, method: &str, params: Value) -> Value {
+    fn request(&mut self, method: &str, params: &Value) -> Value {
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
@@ -167,7 +169,7 @@ impl McpClient {
     fn initialize(&mut self) -> Value {
         let result = self.request(
             "initialize",
-            json!({
+            &json!({
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
                 "clientInfo": {"name": "parl-test", "version": "0"},
@@ -180,7 +182,7 @@ impl McpClient {
     }
 
     fn list_tools(&mut self) -> Vec<Value> {
-        self.request("tools/list", json!({}))
+        self.request("tools/list", &json!({}))
             .get("tools")
             .and_then(Value::as_array)
             .cloned()
@@ -189,7 +191,7 @@ impl McpClient {
 
     /// The `tools/call` result object; an ops refusal is a result here, only
     /// a protocol-level failure would error.
-    fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
+    fn call_tool(&mut self, name: &str, arguments: &Value) -> Value {
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({
@@ -258,7 +260,7 @@ fn speaks_mcp_over_stdio_with_a_clean_stdout() {
     expected.sort_unstable();
     assert_eq!(names, expected, "{names:?}");
 
-    let status = client.call_tool("fleet_status", json!({}));
+    let status = client.call_tool("fleet_status", &json!({}));
     assert_eq!(status["isError"], json!(false), "{status}");
     assert_eq!(text_of(&status), "(no runs)\nexit: 0");
     client.assert_pure_stdout();
@@ -297,7 +299,7 @@ fn derives_the_fleet_from_parl_dir_when_cwd_is_absent() {
     run::save_state(&paths.run_dir(run_id), &state).unwrap();
 
     let mut client = McpClient::spawn(None, &[("PARL_DIR", paths.root().to_str().unwrap())]);
-    let status = client.call_tool("fleet_status", json!({}));
+    let status = client.call_tool("fleet_status", &json!({}));
     assert_eq!(status["isError"], json!(false), "{status}");
     let text = text_of(&status);
     assert!(text.contains('w') && text.contains("running"), "{text}");
@@ -320,7 +322,7 @@ fn malformed_input_does_not_kill_the_server() {
     let tools = client.list_tools();
     assert_eq!(tools.len(), 13);
     client.send_raw("}{ garbage }{");
-    let status = client.call_tool("fleet_status", json!({}));
+    let status = client.call_tool("fleet_status", &json!({}));
     assert_eq!(text_of(&status), "(no runs)\nexit: 0");
     client.assert_pure_stdout();
 }
@@ -339,7 +341,7 @@ fn spawn_wait_report_status_and_cleanup_over_fake_pi() {
 
     let spawned = client.call_tool(
         "fleet_spawn",
-        json!({"name": "hello", "brief": "write hello.txt", "worktree": false}),
+        &json!({"name": "hello", "brief": "write hello.txt", "worktree": false}),
     );
     assert_eq!(spawned["isError"], json!(false), "{}", text_of(&spawned));
     let run_id = spawned["structuredContent"]["runId"]
@@ -357,11 +359,11 @@ fn spawn_wait_report_status_and_cleanup_over_fake_pi() {
     assert!(text.contains("Spawned hello-"), "{text}");
     assert!(text.ends_with("exit: 0"), "{text}");
 
-    let waited = client.call_tool("fleet_wait", json!({"name": "hello", "timeoutSec": 30}));
+    let waited = client.call_tool("fleet_wait", &json!({"name": "hello", "timeoutSec": 30}));
     assert_eq!(waited["isError"], json!(false), "{}", text_of(&waited));
     assert_eq!(text_of(&waited), "hello settled\nexit: 0");
 
-    let report = client.call_tool("fleet_report", json!({"name": "hello"}));
+    let report = client.call_tool("fleet_report", &json!({"name": "hello"}));
     assert_eq!(report["isError"], json!(false), "{}", text_of(&report));
     assert!(
         text_of(&report).contains("## Status\ndone"),
@@ -369,51 +371,54 @@ fn spawn_wait_report_status_and_cleanup_over_fake_pi() {
         text_of(&report)
     );
 
-    let status = client.call_tool("fleet_status", json!({}));
+    let status = client.call_tool("fleet_status", &json!({}));
     let runs = status["structuredContent"]["runs"].as_array().unwrap();
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0]["name"], "hello");
     assert_eq!(runs[0]["status"], "settled");
-    assert!(text_of(&status).contains("hello") && text_of(&status).contains("settled"));
-    let one = client.call_tool("fleet_status", json!({"name": "hello"}));
+    assert!(
+        text_of(&status).contains("hello") && text_of(&status).contains("settled"),
+        "{status}"
+    );
+    let one = client.call_tool("fleet_status", &json!({"name": "hello"}));
     assert_eq!(
         one["structuredContent"]["runs"][0]["taskBrief"],
         "write hello.txt"
     );
 
-    let output = client.call_tool("fleet_output", json!({"name": "hello", "tail": 3}));
+    let output = client.call_tool("fleet_output", &json!({"name": "hello", "tail": 3}));
     assert!(
         text_of(&output).starts_with("bash: hi"),
         "{}",
         text_of(&output)
     );
-    let logs = client.call_tool("fleet_logs", json!({"name": "hello", "tail": 2}));
+    let logs = client.call_tool("fleet_logs", &json!({"name": "hello", "tail": 2}));
     assert!(
         text_of(&logs).contains("agent_settled"),
         "{}",
         text_of(&logs)
     );
 
-    let answer = client.call_tool("fleet_answer", json!({"name": "hello", "answer": "x"}));
+    let answer = client.call_tool("fleet_answer", &json!({"name": "hello", "answer": "x"}));
     assert_eq!(answer["isError"], json!(true), "{}", text_of(&answer));
     let text = text_of(&answer);
     assert!(text.contains("nothing is waiting for an answer"), "{text}");
     assert!(text.ends_with("exit: 1"), "{text}");
-    let send = client.call_tool("fleet_send", json!({"name": "hello", "message": "again"}));
+    let send = client.call_tool("fleet_send", &json!({"name": "hello", "message": "again"}));
     assert_eq!(send["isError"], json!(true));
     assert!(
         text_of(&send).contains("steering refused"),
         "{}",
         text_of(&send)
     );
-    let merge = client.call_tool("fleet_merge", json!({"name": "hello"}));
+    let merge = client.call_tool("fleet_merge", &json!({"name": "hello"}));
     assert_eq!(merge["isError"], json!(true));
     assert!(
         text_of(&merge).contains("has no branch"),
         "{}",
         text_of(&merge)
     );
-    let missing = client.call_tool("fleet_report", json!({"name": "nope"}));
+    let missing = client.call_tool("fleet_report", &json!({"name": "nope"}));
     assert_eq!(missing["isError"], json!(true));
     assert!(
         text_of(&missing).contains("No run found matching \"nope\""),
@@ -424,14 +429,14 @@ fn spawn_wait_report_status_and_cleanup_over_fake_pi() {
     // An unresolvable model is refused before anything is created: exit 2.
     let bad_model = client.call_tool(
         "fleet_spawn",
-        json!({"name": "badmodel", "brief": "b", "model": "no-such-model", "worktree": false}),
+        &json!({"name": "badmodel", "brief": "b", "model": "no-such-model", "worktree": false}),
     );
     assert_eq!(bad_model["isError"], json!(true), "{}", text_of(&bad_model));
     let text = text_of(&bad_model);
     assert!(text.contains("spawn: unknown model"), "{text}");
     assert!(text.ends_with("exit: 2"), "{text}");
 
-    let cleanup = client.call_tool("fleet_cleanup", json!({"target": "hello"}));
+    let cleanup = client.call_tool("fleet_cleanup", &json!({"target": "hello"}));
     assert_eq!(cleanup["isError"], json!(false), "{}", text_of(&cleanup));
     assert!(
         text_of(&cleanup).starts_with("archived hello-"),
@@ -451,7 +456,7 @@ fn fleet_merge_aborts_on_conflict_and_leaves_the_checkout_clean() {
 
     let spawned = client.call_tool(
         "fleet_spawn",
-        json!({"name": "hello", "brief": "write hello.txt"}),
+        &json!({"name": "hello", "brief": "write hello.txt"}),
     );
     assert_eq!(spawned["isError"], json!(false), "{}", text_of(&spawned));
     let worktree = PathBuf::from(spawned["structuredContent"]["worktree"].as_str().unwrap());
@@ -459,12 +464,12 @@ fn fleet_merge_aborts_on_conflict_and_leaves_the_checkout_clean() {
         spawned["structuredContent"]["branch"].as_str().is_some(),
         "a worktree run has a branch"
     );
-    let waited = client.call_tool("fleet_wait", json!({"name": "hello", "timeoutSec": 30}));
+    let waited = client.call_tool("fleet_wait", &json!({"name": "hello", "timeoutSec": 30}));
     assert_eq!(waited["isError"], json!(false), "{}", text_of(&waited));
 
     // The fake pi wrote hello.txt but did not commit; diff sees nothing
     // committed and warns about the uncommitted file.
-    let dirty = client.call_tool("fleet_diff", json!({"name": "hello"}));
+    let dirty = client.call_tool("fleet_diff", &json!({"name": "hello"}));
     assert_eq!(dirty["isError"], json!(false), "{}", text_of(&dirty));
     let text = text_of(&dirty);
     assert!(text.contains("(no changes)"), "{text}");
@@ -477,7 +482,7 @@ fn fleet_merge_aborts_on_conflict_and_leaves_the_checkout_clean() {
     // The worker commits; the diff then shows the committed work.
     git(&worktree, &["add", "."]);
     git(&worktree, &["commit", "-qm", "worker hello"]);
-    let committed = client.call_tool("fleet_diff", json!({"name": "hello"}));
+    let committed = client.call_tool("fleet_diff", &json!({"name": "hello"}));
     assert!(
         text_of(&committed).contains("hello.txt"),
         "{}",
@@ -489,7 +494,7 @@ fn fleet_merge_aborts_on_conflict_and_leaves_the_checkout_clean() {
     git(&root, &["add", "hello.txt"]);
     git(&root, &["commit", "-qm", "conflict"]);
 
-    let merge = client.call_tool("fleet_merge", json!({"name": "hello"}));
+    let merge = client.call_tool("fleet_merge", &json!({"name": "hello"}));
     assert_eq!(merge["isError"], json!(true), "{}", text_of(&merge));
     let text = text_of(&merge);
     assert!(text.contains("conflicts in:\nhello.txt"), "{text}");
@@ -497,12 +502,7 @@ fn fleet_merge_aborts_on_conflict_and_leaves_the_checkout_clean() {
         text.contains("merge was aborted; the checkout is clean"),
         "{text}"
     );
-    assert!(
-        regex::Regex::new(r"rebase its branch parl/hello-")
-            .unwrap()
-            .is_match(&text),
-        "{text}"
-    );
+    assert!(text.contains("rebase its branch parl/hello-"), "{text}");
     assert!(text.ends_with("exit: 5"), "{text}");
 
     // The checkout is clean apart from the gitignore spawn introduced.
@@ -517,13 +517,16 @@ fn fleet_merge_aborts_on_conflict_and_leaves_the_checkout_clean() {
         .filter(|line| !line.is_empty() && *line != "?? .gitignore")
         .collect();
     assert_eq!(porcelain, Vec::<&str>::new(), "{porcelain:?}");
-    assert!(!root.join(".git").join("MERGE_HEAD").exists());
+    assert!(
+        !root.join(".git").join("MERGE_HEAD").exists(),
+        "the merge abort removed MERGE_HEAD"
+    );
     assert_eq!(
         std::fs::read_to_string(root.join("hello.txt")).unwrap(),
         "different\n"
     );
 
-    let cleanup = client.call_tool("fleet_cleanup", json!({"target": "hello", "force": true}));
+    let cleanup = client.call_tool("fleet_cleanup", &json!({"target": "hello", "force": true}));
     assert_eq!(cleanup["isError"], json!(false), "{}", text_of(&cleanup));
     client.assert_pure_stdout();
 }

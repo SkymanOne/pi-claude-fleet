@@ -32,7 +32,9 @@ static SERIAL: Mutex<()> = Mutex::new(());
 const POLL: Duration = Duration::from_millis(150);
 
 fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn parl() -> assert_cmd::Command {
@@ -249,7 +251,9 @@ fn wait_code(root: &Path, name: &str, timeout_secs: u64) -> i32 {
 fn monitor_pid(run_json: &Path) -> Option<i32> {
     let raw = std::fs::read_to_string(run_json).ok()?;
     let state: Value = serde_json::from_str(&raw).ok()?;
-    state["pid"].as_i64().map(|pid| pid as i32)
+    state["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
 }
 
 /// Block until the run's detached monitor is gone, so a test never leaves a
@@ -404,13 +408,13 @@ fn every_public_subcommand_reaches_its_implementation() {
     );
     assert!(stderr.contains("unknown model"), "{stderr}");
     // The model check happens before anything is created.
-    assert!(
+    assert_eq!(
         root.join(parl::paths::STATE_DIR_NAME)
             .join("runs")
             .read_dir()
-            .map(|entries| entries.count())
-            .unwrap_or(0)
-            == 0,
+            .map(std::iter::Iterator::count)
+            .unwrap_or(0),
+        0,
         "no run was created"
     );
 
@@ -485,7 +489,10 @@ fn the_hidden_orchestrator_monitor_reaches_its_implementation() {
     );
     // The boot state landed in the documented layout, and the failure was
     // diagnosed in the raw protocol log.
-    assert!(fleet_dir.join("orchestrator/state.json").is_file());
+    assert!(
+        fleet_dir.join("orchestrator/state.json").is_file(),
+        "the boot state landed in the documented layout"
+    );
     let claude_log =
         std::fs::read_to_string(fleet_dir.join("orchestrator/claude.log")).unwrap_or_default();
     assert!(claude_log.contains("could not spawn"), "{claude_log}");
@@ -692,7 +699,7 @@ fn the_prompt_override_chain_resolves_in_order() {
     std::fs::write(&user, "user override").unwrap();
     assert_eq!(
         resolve_prompt_source(None, &repo, Some(home)).unwrap(),
-        Some(user.clone())
+        Some(user)
     );
 
     // <repo>/.parl/orchestrator.md beats the user config.
@@ -830,10 +837,22 @@ fn the_worker_extension_is_materialized_from_the_binary() {
     assert!(extension.starts_with(&fleet), "{extension:?}");
     // The materialized files are the worker protocol: the skill keeps the
     // report template, the extension speaks the PARL layout.
-    assert!(FLEET_SKILL_MD.starts_with("---\nname: fleet-worker-report\n"));
-    assert!(FLEET_SKILL_MD.contains("## Steering received"));
-    assert!(FLEET_EXTENSION_TS.contains("PARL_RUN"));
-    assert!(!FLEET_EXTENSION_TS.contains("PI_FLEET"));
+    assert!(
+        FLEET_SKILL_MD.starts_with("---\nname: fleet-worker-report\n"),
+        "the skill keeps its frontmatter"
+    );
+    assert!(
+        FLEET_SKILL_MD.contains("## Steering received"),
+        "the skill keeps the report template"
+    );
+    assert!(
+        FLEET_EXTENSION_TS.contains("PARL_RUN"),
+        "the extension speaks the PARL layout"
+    );
+    assert!(
+        !FLEET_EXTENSION_TS.contains("PI_FLEET"),
+        "old env names are gone from the extension"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,7 +1105,10 @@ fn full_worker_lifecycle_happy_path() {
         worktree.join("seed.txt").exists(),
         "the worktree is a checkout"
     );
-    assert!(state["baseCommit"].as_str().is_some());
+    assert!(
+        state["baseCommit"].as_str().is_some(),
+        "a worktree run records its base commit: {state}"
+    );
     assert_eq!(state["isGit"], json!(true));
 
     // The fleet table shows the run.
@@ -1178,12 +1200,13 @@ fn full_worker_lifecycle_happy_path() {
     // The single-run JSON carries the session file pi wrote.
     let state = status_json(&root, "alpha");
     let session_file = state["sessionFile"].as_str().unwrap_or_default();
+    let session_path = Path::new(session_file);
     assert!(
-        session_file.starts_with(run_dir.join("session").to_str().unwrap())
-            && session_file.ends_with(".jsonl"),
+        session_path.starts_with(run_dir.join("session"))
+            && session_path.extension() == Some(std::ffi::OsStr::new("jsonl")),
         "{state}"
     );
-    assert!(Path::new(session_file).is_file());
+    assert!(session_path.is_file(), "{session_path:?}");
 
     // Diff sees the worker's committed work once it is committed.
     git(&worktree, &["add", "."]);
@@ -1220,7 +1243,10 @@ fn full_worker_lifecycle_happy_path() {
         .current_dir(&root)
         .output()
         .unwrap();
-    assert!(String::from_utf8_lossy(&listed.stdout).trim().is_empty());
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
+        "the merged branch is deleted"
+    );
     let (code, stdout, _) = run(&root, &["cleanup", "alpha"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("already archived"), "{stdout}");
@@ -1474,7 +1500,10 @@ fn a_conflicting_branch_merges_with_exit_five_and_a_clean_checkout() {
         .filter(|line| !line.is_empty() && *line != "?? .gitignore")
         .collect();
     assert_eq!(porcelain, Vec::<&str>::new(), "{porcelain:?}");
-    assert!(!root.join(".git").join("MERGE_HEAD").exists());
+    assert!(
+        !root.join(".git").join("MERGE_HEAD").exists(),
+        "the merge abort removed MERGE_HEAD"
+    );
     assert_eq!(
         std::fs::read_to_string(root.join("hello.txt")).unwrap(),
         "different\n"

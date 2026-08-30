@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 /// One fleet dir anchored at `<dir>/.parl` with a run whose state is already
 /// on disk — the same shape the ops tests prepare.
 struct Fleet {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     paths: FleetPaths,
     run_id: String,
 }
@@ -36,15 +36,11 @@ impl Fleet {
         // `find_run("w")` matches it.
         let run_id = "w-20260828141530".to_owned();
         std::fs::create_dir_all(paths.run_dir(&run_id)).unwrap();
-        Self {
-            _dir: dir,
-            paths,
-            run_id,
-        }
+        Self { dir, paths, run_id }
     }
 
     fn root(&self) -> &Path {
-        self._dir.path()
+        self.dir.path()
     }
 
     fn write_state_with(&self, tweak: impl FnOnce(&mut RunState)) {
@@ -130,7 +126,7 @@ struct Client {
 }
 
 impl Client {
-    async fn connect(fleet: &Fleet) -> (Client, tokio::task::JoinHandle<()>) {
+    async fn connect(fleet: &Fleet) -> (Self, tokio::task::JoinHandle<()>) {
         // The fleet dir is pinned: the ambient `PARL_DIR` must never
         // redirect the server's per-call resolution to another fleet.
         let server = FleetServer::with_parl_dir(
@@ -148,7 +144,7 @@ impl Client {
             let _ = running.waiting().await;
         });
         let (client_read, client_write) = tokio::io::split(client_half);
-        let mut client = Client {
+        let mut client = Self {
             io: tokio::io::BufReader::new(DuplexClientEnd {
                 read: client_read,
                 write: client_write,
@@ -390,7 +386,10 @@ async fn an_unknown_tool_is_a_protocol_error() {
     let (mut client, server) = Client::connect(&fleet).await;
     let error = client.call_tool_error("fleet_teleport", json!({})).await;
     assert_eq!(error["code"], json!(-32602), "{error}");
-    assert!(error["message"].as_str().unwrap().contains("Unknown tool"));
+    assert!(
+        error["message"].as_str().unwrap().contains("Unknown tool"),
+        "{error}"
+    );
     shutdown(client, server).await;
 }
 
@@ -409,10 +408,16 @@ async fn spawn_refuses_an_empty_brief_before_touching_the_fleet() {
         .call_tool("fleet_spawn", json!({"name": "x", "brief": "  "}))
         .await;
     assert_eq!(refused["isError"], json!(true), "{refused}");
-    assert!(text_of(&refused).contains("task brief required"));
-    assert!(text_of(&refused).ends_with("exit: 1"));
+    assert!(
+        text_of(&refused).contains("task brief required"),
+        "{refused}"
+    );
+    assert!(text_of(&refused).ends_with("exit: 1"), "{refused}");
     // Nothing was created.
-    assert!(run::list_runs(fleet.paths.root()).is_empty());
+    assert!(
+        run::list_runs(fleet.paths.root()).is_empty(),
+        "the refused spawn created nothing"
+    );
     shutdown(client, server).await;
 }
 
@@ -429,7 +434,10 @@ async fn wait_times_out_with_exit_3_and_ends_badly_with_exit_4() {
         .call_tool("fleet_wait", json!({"name": "w", "timeoutSec": 1}))
         .await;
     assert_eq!(timed_out["isError"], json!(true), "{timed_out}");
-    assert!(text_of(&timed_out).contains("timed out after 1s"));
+    assert!(
+        text_of(&timed_out).contains("timed out after 1s"),
+        "{timed_out}"
+    );
     assert!(text_of(&timed_out).ends_with("exit: 3"), "{timed_out}");
 
     let stopped = Fleet::new("mcp-wait2-");
@@ -469,20 +477,6 @@ async fn answer_resolves_the_pending_question_with_orchestrator_provenance() {
     });
     let (mut client, server) = Client::connect(&fleet).await;
 
-    // Nothing pending is a refusal; with the question pending it queues.
-    let empty = Fleet::new("mcp-answer2-");
-    empty.write_state_with(|state| {
-        state.status = RunStatus::Running;
-        state.pid = Some(1);
-    });
-    let (mut client2, server2) = Client::connect(&empty).await;
-    let refused = client2
-        .call_tool("fleet_answer", json!({"name": "w", "answer": "x"}))
-        .await;
-    assert_eq!(refused["isError"], json!(true), "{refused}");
-    assert!(text_of(&refused).contains("no pending question"));
-    assert!(text_of(&refused).ends_with("exit: 1"));
-
     let answered = client
         .call_tool("fleet_answer", json!({"name": "w", "answer": "argon2"}))
         .await;
@@ -502,7 +496,26 @@ async fn answer_resolves_the_pending_question_with_orchestrator_provenance() {
         })
     );
     shutdown(client, server).await;
-    shutdown(client2, server2).await;
+}
+
+#[tokio::test]
+async fn answer_with_nothing_pending_refuses_with_exit_1() {
+    let fleet = Fleet::new("mcp-answer2-");
+    fleet.write_state_with(|state| {
+        state.status = RunStatus::Running;
+        state.pid = Some(1);
+    });
+    let (mut client, server) = Client::connect(&fleet).await;
+    let refused = client
+        .call_tool("fleet_answer", json!({"name": "w", "answer": "x"}))
+        .await;
+    assert_eq!(refused["isError"], json!(true), "{refused}");
+    assert!(
+        text_of(&refused).contains("no pending question"),
+        "{refused}"
+    );
+    assert!(text_of(&refused).ends_with("exit: 1"), "{refused}");
+    shutdown(client, server).await;
 }
 
 #[tokio::test]
@@ -525,7 +538,7 @@ async fn answer_also_resolves_a_pending_pi_dialog() {
         .call_tool("fleet_answer", json!({"name": "w", "answer": "yes"}))
         .await;
     assert_eq!(answered["isError"], json!(false), "{answered}");
-    assert!(text_of(&answered).contains("(question ui-9)"));
+    assert!(text_of(&answered).contains("(question ui-9)"), "{answered}");
     let envelopes = fleet.inbox();
     assert_eq!(
         envelopes[0].decode(),
@@ -552,10 +565,13 @@ async fn steering_a_terminal_run_refuses_with_the_resume_hint() {
     assert!(text.ends_with("exit: 1"), "{text}");
     // A refused stop reads "nothing to stop" with the same exit code.
     let stop = client.call_tool("fleet_stop", json!({"name": "w"})).await;
-    assert!(text_of(&stop).contains("nothing to stop"));
+    assert!(text_of(&stop).contains("nothing to stop"), "{stop}");
     assert_eq!(stop["isError"], json!(true));
     // Nothing reached the inbox.
-    assert!(fleet.inbox().is_empty());
+    assert!(
+        fleet.inbox().is_empty(),
+        "the refusals left the inbox untouched"
+    );
     shutdown(client, server).await;
 }
 

@@ -65,9 +65,10 @@ fn fake_claude_env(over: &[(&str, &str)]) -> HashMap<String, String> {
 }
 
 fn is_alive(pid: u32) -> bool {
+    let pid = i32::try_from(pid).expect("pids fit in i32");
     // SIGCONT is a no-op on a running process, and the only signal nix can
     // send without a target-specific risk; ESRCH means it is gone.
-    matches!(kill(Pid::from_raw(pid as i32), Signal::SIGCONT), Ok(()))
+    matches!(kill(Pid::from_raw(pid), Signal::SIGCONT), Ok(()))
 }
 
 fn start_proc(
@@ -104,7 +105,7 @@ async fn collect_until(
             Ok(Some(event)) if pred(&event) => return (skipped, event),
             Ok(Some(event)) => skipped.push(event),
             Ok(None) => panic!("event stream ended"),
-            Err(_) => panic!("timed out waiting for an event"),
+            Err(err) => panic!("timed out waiting for an event: {err}"),
         }
     }
 }
@@ -143,7 +144,7 @@ fn result_text(event: &ProcEvent) -> Option<String> {
 // Tests
 
 #[tokio::test]
-async fn a_turn_over_fake_claude_init_replay_deltas_assistant_result() {
+async fn a_turn_over_fake_claude_emits_init_replay_deltas_assistant_and_result() {
     if node_bin().is_none() {
         eprintln!("skipping: node is not available");
         return;
@@ -157,10 +158,14 @@ async fn a_turn_over_fake_claude_init_replay_deltas_assistant_result() {
             ("FAKE_CLAUDE_SESSION_ID", "sess-fixed"),
         ],
     );
-    assert!(process.pid().is_some() && process.running());
-    assert!(!process.init_received());
-    assert!(process.send("hello"));
-    assert!(process.turn_active());
+    assert!(process.pid().is_some(), "the child spawned with a pid");
+    assert!(process.running(), "the process is running");
+    assert!(
+        !process.init_received(),
+        "init arrives only with the first turn"
+    );
+    assert!(process.send("hello"), "the first message was accepted");
+    assert!(process.turn_active(), "a send starts a turn");
 
     // The fake emits system/init first, then the replay, deltas, assistant and
     // result: collect through to the result and find each shape in between.
@@ -172,8 +177,12 @@ async fn a_turn_over_fake_claude_init_replay_deltas_assistant_result() {
         unreachable!()
     };
     assert_eq!(result.subtype, "success");
-    assert!(!process.turn_active());
-    assert_eq!(process.cost_usd(), 0.001);
+    assert!(!process.turn_active(), "the turn ended with the result");
+    let cost = process.cost_usd();
+    assert!(
+        (cost - 0.001).abs() < f64::EPSILON,
+        "one turn costs $0.001, was {cost}"
+    );
     assert_eq!(process.num_turns(), 1);
 
     let init = events
@@ -224,7 +233,10 @@ async fn a_turn_over_fake_claude_init_replay_deltas_assistant_result() {
         .position(|a| a == "--permission-prompt-tool")
         .map(|i| &argv[i + 1]);
     assert_eq!(prompt_tool.map(String::as_str), Some("stdio"));
-    assert!(argv.iter().any(|a| a == "--replay-user-messages"));
+    assert!(
+        argv.iter().any(|a| a == "--replay-user-messages"),
+        "expected the replay flag in the argv: {argv:?}"
+    );
 
     // the protocol log carries both directions. Key order inside a line is
     // serde_json's (sorted), so match on type markers, not on byte shapes.
@@ -244,7 +256,7 @@ async fn a_turn_over_fake_claude_init_replay_deltas_assistant_result() {
 
     // the real CLI re-emits system/init after every user message; the wrapper
     // must not mind
-    assert!(process.send("second"));
+    assert!(process.send("second"), "the second message was accepted");
     let (second, _) = collect_until(&mut rx, Duration::from_secs(10), |event| {
         matches!(event, ProcEvent::Result(_))
     })
@@ -257,11 +269,18 @@ async fn a_turn_over_fake_claude_init_replay_deltas_assistant_result() {
         1
     );
     assert_eq!(process.num_turns(), 2);
-    assert_eq!(process.cost_usd(), 0.002);
+    let cost = process.cost_usd();
+    assert!(
+        (cost - 0.002).abs() < f64::EPSILON,
+        "two turns cost $0.002, was {cost}"
+    );
 
     process.stop().await;
-    assert!(!is_alive(process.pid().unwrap()));
-    assert!(process.exited().is_some());
+    assert!(
+        !is_alive(process.pid().unwrap()),
+        "the child is gone after stop"
+    );
+    assert!(process.exited().is_some(), "the exit is recorded");
 }
 
 #[tokio::test]
@@ -305,7 +324,10 @@ async fn permission_requests_allow_deny_and_ask_user_question() {
     }
     let root = tmp_dir("parl-proc-2-");
     let (process, mut rx) = start_proc(&root, &[]);
-    assert!(process.send("perm:touch a.txt"));
+    assert!(
+        process.send("perm:touch a.txt"),
+        "the permission prompt was requested"
+    );
     let ProcEvent::PermissionRequest(req) = wait_for(&mut rx, Duration::from_secs(10), |event| {
         matches!(event, ProcEvent::PermissionRequest(_))
     })
@@ -319,7 +341,10 @@ async fn permission_requests_allow_deny_and_ask_user_question() {
     assert_eq!(process.pending_requests().len(), 1);
 
     let suggestions = req.request.permission_suggestions.clone();
-    assert!(process.allow(&req.request_id, Some(&suggestions)));
+    assert!(
+        process.allow(&req.request_id, Some(&suggestions)),
+        "the allow is accepted"
+    );
     assert_eq!(process.pending_requests().len(), 0);
     assert!(!process.allow(&req.request_id, None), "already answered");
     let r1 = wait_for(&mut rx, Duration::from_secs(10), |event| {
@@ -328,7 +353,10 @@ async fn permission_requests_allow_deny_and_ask_user_question() {
     .await;
     assert_eq!(result_text(&r1).as_deref(), Some("allowed:touch a.txt"));
 
-    assert!(process.send("perm:rm -rf x"));
+    assert!(
+        process.send("perm:rm -rf x"),
+        "the second prompt was requested"
+    );
     let ProcEvent::PermissionRequest(req2) = wait_for(&mut rx, Duration::from_secs(10), |event| {
         matches!(event, ProcEvent::PermissionRequest(_))
     })
@@ -343,7 +371,10 @@ async fn permission_requests_allow_deny_and_ask_user_question() {
     .await;
     assert_eq!(result_text(&r2).as_deref(), Some("denied:not that"));
 
-    assert!(process.send("ask:Which style?|terse|verbose"));
+    assert!(
+        process.send("ask:Which style?|terse|verbose"),
+        "the question was queued"
+    );
     let ProcEvent::PermissionRequest(ask) = wait_for(&mut rx, Duration::from_secs(10), |event| {
         matches!(event, ProcEvent::PermissionRequest(_))
     })
@@ -389,7 +420,7 @@ async fn interrupt_stops_a_streaming_turn_errors_surface_and_set_model_answers()
     }
     let root = tmp_dir("parl-proc-3-");
     let (process, mut rx) = start_proc(&root, &[("FAKE_CLAUDE_NO_FLAG_SETTINGS", "1")]);
-    assert!(process.send("slow:"));
+    assert!(process.send("slow:"), "the slow turn was accepted");
     wait_for(&mut rx, Duration::from_secs(10), |event| {
         matches!(event, ProcEvent::TextDelta(_))
     })
@@ -409,10 +440,10 @@ async fn interrupt_stops_a_streaming_turn_errors_surface_and_set_model_answers()
         unreachable!()
     };
     assert_eq!(result.result.as_deref(), Some("interrupted"));
-    assert!(!process.turn_active());
+    assert!(!process.turn_active(), "the interrupt ended the turn");
 
     // errors surface as results
-    assert!(process.send("fail:"));
+    assert!(process.send("fail:"), "the failing turn was accepted");
     let failed = wait_for(&mut rx, Duration::from_secs(10), |event| {
         matches!(event, ProcEvent::Result(_))
     })
@@ -462,7 +493,10 @@ async fn the_handshake_goes_out_before_the_first_turn_so_prompts_arrive() {
         1,
         "sent exactly once: {log}"
     );
-    assert!(process.send("perm:touch d.txt"));
+    assert!(
+        process.send("perm:touch d.txt"),
+        "the permission prompt was requested"
+    );
     let ProcEvent::PermissionRequest(req) = wait_for(&mut rx, Duration::from_secs(10), |event| {
         matches!(event, ProcEvent::PermissionRequest(_))
     })
@@ -470,7 +504,10 @@ async fn the_handshake_goes_out_before_the_first_turn_so_prompts_arrive() {
     else {
         unreachable!()
     };
-    assert!(process.allow(&req.request_id, None));
+    assert!(
+        process.allow(&req.request_id, None),
+        "the allow is accepted"
+    );
     let result = wait_for(&mut rx, Duration::from_secs(10), |event| {
         matches!(event, ProcEvent::Result(_))
     })
@@ -487,12 +524,12 @@ async fn stop_ends_a_running_turn_before_closing_the_child() {
     }
     let root = tmp_dir("parl-proc-stopturn-");
     let (process, mut rx) = start_proc(&root, &[]);
-    assert!(process.send("slow:"));
+    assert!(process.send("slow:"), "the slow turn was accepted");
     wait_for(&mut rx, Duration::from_secs(10), |event| {
         matches!(event, ProcEvent::TextDelta(_))
     })
     .await;
-    assert!(process.turn_active());
+    assert!(process.turn_active(), "the turn is active while streaming");
     process.stop().await;
     // the interrupt went out before the child was closed, so the turn is not
     // left half-finished for the next session to resume into
@@ -505,7 +542,7 @@ async fn stop_ends_a_running_turn_before_closing_the_child() {
         "and the turn ended before we closed the child: {}",
         &log[interrupt_at..]
     );
-    assert!(!process.turn_active());
+    assert!(!process.turn_active(), "the interrupt ended the turn");
     // a second stop is a no-op returning the recorded exit
     let info = process.stop_now().await;
     assert_eq!(info, process.exited().unwrap());
@@ -543,7 +580,10 @@ async fn stop_escalates_to_sigterm_for_a_child_that_ignores_stdin_closing() {
         started.elapsed()
     );
     assert_eq!(info.signal.as_deref(), Some("SIGTERM"));
-    assert!(!is_alive(process.pid().unwrap()));
+    assert!(
+        !is_alive(process.pid().unwrap()),
+        "the child is gone after stop"
+    );
 }
 
 #[tokio::test]
@@ -589,15 +629,25 @@ async fn writing_after_death_fails_cleanly() {
     let root = tmp_dir("parl-proc-dead-");
     let (process, mut rx) = start_proc(&root, &[]);
     process.stop().await;
-    assert!(process.exited().is_some());
-    assert!(!process.running());
+    assert!(process.exited().is_some(), "the exit is recorded");
+    assert!(!process.running(), "the process is no longer running");
     // A write racing the child's death must not take the process down.
-    assert!(!process.send("too late"));
-    assert!(!process.allow("req_x", None));
-    assert!(!process.deny("req_x", "no"));
+    assert!(!process.send("too late"), "a write after death is refused");
+    assert!(
+        !process.allow("req_x", None),
+        "an allow after death is refused"
+    );
+    assert!(
+        !process.deny("req_x", "no"),
+        "a deny after death is refused"
+    );
     let started = Instant::now();
     assert_eq!(process.interrupt(false).await, None);
-    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the dead-child write returned fast, took {:?}",
+        started.elapsed()
+    );
     // the event stream still ends with the exit
     let _ = wait_for(&mut rx, Duration::from_secs(2), |event| {
         matches!(event, ProcEvent::Exit(_))

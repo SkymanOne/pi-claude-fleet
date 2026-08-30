@@ -112,9 +112,8 @@ async fn wait_event(
         assert!(Instant::now() < deadline, "timed out waiting for an event");
         match tokio::time::timeout(POLL, rx.recv()).await {
             Ok(Some(event)) if pred(&event) => return event,
-            Ok(Some(_)) => {}
+            Ok(Some(_)) | Err(_) => {}
             Ok(None) => panic!("event stream ended"),
-            Err(_) => {}
         }
     }
 }
@@ -395,12 +394,18 @@ async fn the_model_command_switches_the_session_and_shutdown_ends_the_monitor() 
     let state = state_of(&fixture.fleet_dir).unwrap();
     assert!(state.exited.is_some(), "the state records that it is gone");
     assert_eq!(state.pid, None);
-    assert!(!client.running());
+    assert!(
+        !client.running(),
+        "the console no longer has a live session"
+    );
     client.stop();
 
     // the next console starts a new one rather than attaching to a corpse
     let after = fixture.client(false);
-    assert!(!after.start().unwrap());
+    assert!(
+        !after.start().unwrap(),
+        "a new console starts its own session"
+    );
     wait(WAIT, || after.running()).await;
     after.stop();
     stop_monitor(&fixture.fleet_dir).await;
