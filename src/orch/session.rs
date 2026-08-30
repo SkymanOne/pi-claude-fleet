@@ -147,6 +147,13 @@ impl OrchestratorSession {
 pub struct FleetSessions {
     pub version: u8,
     pub sessions: HashMap<Uuid, OrchestratorSession>,
+    /// Top-level keys this store does not model — the console's prefs under
+    /// `"console"`, anything a newer writer adds — round-tripped untouched
+    /// through load → mutate → save. `save` is the one serde boundary in
+    /// this crate that would otherwise destroy what it does not know, and a
+    /// newer writer must never destroy what an older reader wrote.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl FleetSessions {
@@ -156,6 +163,7 @@ impl FleetSessions {
         Self {
             version: SESSION_VERSION,
             sessions: HashMap::new(),
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -727,6 +735,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load(&fleet), None);
+    }
+
+    #[test]
+    fn unknown_top_level_keys_round_trip_through_store_saves() {
+        let fleet = tmp_fleet("parl-session-extra-");
+        // a real session row the heartbeat will touch
+        let session = create_session(&fleet, Some("alpha")).unwrap();
+        // a console's prefs key and a newer writer's unknown key
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(session_path(&fleet)).unwrap()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("console".into(), json!({"railMode": "wide"}));
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("somethingNew".into(), json!({ "deep": [1, 2] }));
+        std::fs::write(session_path(&fleet), value.to_string()).unwrap();
+
+        // load sees them, without swallowing the modeled keys
+        let store = load(&fleet).unwrap();
+        assert_eq!(
+            store
+                .extra
+                .get("console")
+                .and_then(|v| v.get("railMode"))
+                .and_then(serde_json::Value::as_str),
+            Some("wide")
+        );
+        assert!(store.extra.contains_key("somethingNew"));
+        assert_eq!(store.sessions.len(), 1);
+
+        // load → touch_heartbeat → save: the unknown keys come back intact
+        touch_heartbeat(&fleet, session.uuid).unwrap();
+        let raw = std::fs::read_to_string(session_path(&fleet)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["console"]["railMode"], "wide", "{raw}");
+        assert_eq!(value["somethingNew"]["deep"][0], 1, "{raw}");
+        // the modeled keys are still theirs, not captured by the flatten
+        assert_eq!(value["version"], SESSION_VERSION, "{raw}");
+        assert!(
+            value["sessions"][session.uuid.to_string()].is_object(),
+            "{raw}"
+        );
+        // and a later load still reads the heartbeat
+        let store = load(&fleet).unwrap();
+        assert!(
+            store.sessions[&session.uuid].last_heartbeat.is_some(),
+            "touch_heartbeat still lands in the row"
+        );
     }
 
     #[test]

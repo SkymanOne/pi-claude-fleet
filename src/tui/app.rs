@@ -37,39 +37,10 @@ use crate::tui::palette::{
     McpServerInfo, PaletteAction, PaletteContext, PaletteItem, PaletteScope, build_items, ranked,
 };
 use crate::tui::transcript::Transcript;
-use crate::util::{now_ms, parse_ts_ms};
+use crate::util::now_ms;
 
 /// How long a toolbar note stays up.
 const FLASH_MS: i64 = 6_000;
-
-/// A session whose monitor has not reported for this long reads as wedged
-/// in `/sessions` — distinct from dead (no heartbeat ever written: the
-/// session's monitor never started, or the row is an orphan).
-const SESSION_HEARTBEAT_STALE_MS: i64 = 30_000;
-
-/// How a session's last heartbeat reads, for the `/sessions` table:
-/// healthy (fresh), wedged (stale), or silent (never reported).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionHealth {
-    Healthy,
-    Wedged,
-    Silent,
-}
-
-/// Classify a session by its monitor's last heartbeat.
-fn session_health(heartbeat: Option<&str>, now: i64) -> (&'static str, SessionHealth) {
-    match heartbeat {
-        Some(ts) => {
-            let age = now.saturating_sub(parse_ts_ms(ts).unwrap_or(0));
-            if age <= SESSION_HEARTBEAT_STALE_MS {
-                ("healthy", SessionHealth::Healthy)
-            } else {
-                ("wedged", SessionHealth::Wedged)
-            }
-        }
-        None => ("no heartbeat", SessionHealth::Silent),
-    }
-}
 
 /// What claude's own `/thinking` accepts; pi workers use [`THINKING_LEVELS`].
 const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -239,8 +210,12 @@ pub struct Flash {
 pub struct Prefs {
     /// Width of the session list beside the transcript.
     pub rail_mode: String,
-    /// The session that was open when the console last closed.
+    /// The row that was open when the console last closed (`orchestrator`
+    /// or a run id), restored within the opened session.
     pub last_session: Option<String>,
+    /// The session that was open, by uuid: re-anchors the console on open,
+    /// so a switch is remembered even when the row changed afterwards.
+    pub last_session_uuid: Option<String>,
 }
 
 impl Default for Prefs {
@@ -248,6 +223,7 @@ impl Default for Prefs {
         Self {
             rail_mode: "auto".to_string(),
             last_session: None,
+            last_session_uuid: None,
         }
     }
 }
@@ -788,29 +764,36 @@ impl Console {
             {
                 self.prefs.rail_mode = mode.to_string();
             }
-            if let Some(session) = prefs.get("lastSession").and_then(Value::as_str) {
-                self.prefs.last_session = Some(session.to_string());
+            if let Some(session) = prefs.get("lastSessionUuid").and_then(Value::as_str) {
+                self.prefs.last_session_uuid = Some(session.to_string());
+            }
+            if let Some(row) = prefs.get("lastSession").and_then(Value::as_str) {
+                // the pre-split console overloaded this field with the
+                // session uuid; a uuid here migrates into lastSessionUuid
+                if row.parse::<uuid::Uuid>().is_ok() {
+                    self.prefs.last_session_uuid = Some(row.to_string());
+                } else {
+                    self.prefs.last_session = Some(row.to_string());
+                }
             }
         }
     }
 
-    /// Write the remembered preferences, preserving the rest of `fleet.json`.
+    /// Write the remembered preferences under the store's lock, so a write
+    /// interleaving with the monitor's heartbeat never loses either side's
+    /// data: the store now round-trips unknown keys (the `"console"` one
+    /// included), and every fleet.json write the console makes goes through
+    /// the same `fleet.json.lock` the monitor uses.
     pub fn save_prefs(&self) {
-        let path = self.fleet.fleet_json();
-        let mut value = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .unwrap_or_else(|| json!({}));
-        if let Some(map) = value.as_object_mut() {
-            map.insert(
-                "console".into(),
-                json!({
-                    "railMode": self.prefs.rail_mode,
-                    "lastSession": self.prefs.last_session,
-                }),
-            );
-        }
-        let _ = crate::util::atomic_write_json(&path, &value);
+        let fleet_dir = self.fleet.root().to_path_buf();
+        let prefs = json!({
+            "railMode": self.prefs.rail_mode,
+            "lastSession": self.prefs.last_session,
+            "lastSessionUuid": self.prefs.last_session_uuid,
+        });
+        let _ = crate::orch::session::with_store_mutation(&fleet_dir, |store| {
+            store.extra.insert("console".into(), prefs);
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -1819,12 +1802,13 @@ impl Console {
     // Session commands (`/sessions`, `/session`, `/shutdown <key>`)
 
     /// `/sessions`: every live session with its alias, short uuid, worker
-    /// count and health — `healthy` from a fresh heartbeat, `wedged` from a
-    /// stale one (its monitor stopped reporting), `no heartbeat` for a row
-    /// that never reported (its monitor never started). The full list goes
-    /// into the transcript to look back at; the toolbar carries a tally.
+    /// count and monitor health — `running` from a live monitor with a fresh
+    /// heartbeat, `wedged` from a live one that stopped stamping (two missed
+    /// stamps inside the 15 s grace), `stopped` for a row with no live
+    /// monitor (never started, or its pid is gone). The full list goes into
+    /// the transcript to look back at; the toolbar carries a tally.
     fn show_sessions(&mut self) {
-        let sessions = crate::tui::session_api::list_sessions(self.fleet.root());
+        let sessions = crate::orch::session::list_sessions(self.fleet.root());
         if sessions.is_empty() {
             self.notice("· no sessions yet — /session new starts one", false);
             return;
@@ -1832,9 +1816,9 @@ impl Console {
         let counts = self.worker_counts_by_session();
         let now = crate::util::now_ms();
         let mut lines = Vec::with_capacity(sessions.len());
-        let mut healthy = 0;
+        let mut running = 0;
         let mut wedged = 0;
-        let mut silent = 0;
+        let mut stopped = 0;
         for session in &sessions {
             let short = crate::util::short_uuid(&session.uuid);
             let label = match session.alias.as_deref() {
@@ -1842,12 +1826,24 @@ impl Console {
                 None => short,
             };
             let workers = counts.get(&session.uuid).copied().unwrap_or(0);
-            let (health, state) = session_health(session.last_heartbeat.as_deref(), now);
-            match state {
-                SessionHealth::Healthy => healthy += 1,
-                SessionHealth::Wedged => wedged += 1,
-                SessionHealth::Silent => silent += 1,
-            }
+            let health = match crate::orch::session::monitor_health(
+                session,
+                crate::fleet::run::is_alive,
+                now,
+            ) {
+                crate::orch::session::MonitorHealth::Running => {
+                    running += 1;
+                    "running"
+                }
+                crate::orch::session::MonitorHealth::Wedged => {
+                    wedged += 1;
+                    "wedged"
+                }
+                crate::orch::session::MonitorHealth::Stopped => {
+                    stopped += 1;
+                    "stopped"
+                }
+            };
             let active = session.uuid == self.orch_key.uuid;
             lines.push(format!(
                 "{}{} · {} worker{} · {}",
@@ -1861,7 +1857,7 @@ impl Console {
         self.orch_transcript.push_notice(&lines.join("\n"));
         self.toast(
             format!(
-                "· {} session{} · {healthy} healthy · {wedged} wedged · {silent} without a heartbeat",
+                "· {} session{} · {running} running · {wedged} wedged · {stopped} stopped",
                 sessions.len(),
                 if sessions.len() == 1 { "" } else { "s" },
             ),
@@ -1907,9 +1903,9 @@ impl Console {
                     let rest: Vec<&str> = words.collect();
                     (!rest.is_empty()).then(|| rest.join(" "))
                 };
-                match crate::tui::session_api::create_session(self.fleet.root(), alias.as_deref()) {
+                match crate::orch::session::create_session(self.fleet.root(), alias.as_deref()) {
                     Ok(session) => {
-                        self.prefs.last_session = Some(session.uuid.to_string());
+                        self.prefs.last_session_uuid = Some(session.uuid.to_string());
                         let label = session_display_name(session.alias.as_deref(), session.uuid);
                         self.notice(
                             format!(
@@ -1925,27 +1921,28 @@ impl Console {
                     }
                 }
             }
-            Some(key) => {
-                let Some(session) = crate::tui::session_api::session_by_key(self.fleet.root(), key)
-                else {
+            Some(key) => match crate::orch::session::resolve_session_by_key(self.fleet.root(), key)
+            {
+                Ok(session) => {
+                    if session.uuid == self.orch_key.uuid {
+                        self.toast("· already on this session", false);
+                        return Vec::new();
+                    }
+                    let label = session_display_name(session.alias.as_deref(), session.uuid);
                     self.notice(
-                        "! no session matches — /sessions lists them (an alias shared by several sessions is ambiguous)",
-                        true,
+                        format!("· switched to {label} — /sessions lists every session"),
+                        false,
                     );
-                    return Vec::new();
-                };
-                if session.uuid == self.orch_key.uuid {
-                    self.toast("· already on this session", false);
-                    return Vec::new();
+                    self.prefs.last_session_uuid = Some(session.uuid.to_string());
+                    vec![Effect::SavePrefs, Effect::SwitchSession(session.key())]
                 }
-                let label = session_display_name(session.alias.as_deref(), session.uuid);
-                self.notice(
-                    format!("· switched to {label} — /sessions lists every session"),
-                    false,
-                );
-                self.prefs.last_session = Some(session.uuid.to_string());
-                vec![Effect::SavePrefs, Effect::SwitchSession(session.key())]
-            }
+                Err(err) => {
+                    // a miss may be an ambiguous alias: the error names the
+                    // colliding sessions so the user can pick a uuid
+                    self.notice(format!("! {err:#}"), true);
+                    Vec::new()
+                }
+            },
         }
     }
 
@@ -1956,29 +1953,30 @@ impl Console {
     fn shutdown_command(&mut self, argument: &str) -> Vec<Effect> {
         let (message, action) = if argument.is_empty() {
             (self.shutdown_question(), ConfirmAction::Shutdown)
-        } else if let Some(session) =
-            crate::tui::session_api::session_by_key(self.fleet.root(), argument)
-        {
-            if session.uuid == self.orch_key.uuid {
-                // naming the active session is the same shutdown
-                (self.shutdown_question(), ConfirmAction::Shutdown)
-            } else {
-                let live = self.live_worker_count_for(session.uuid);
-                let label = session_display_name(session.alias.as_deref(), session.uuid);
-                (
-                    format!(
-                        "Stop {label}'s orchestrator and its {live} running {}? Worktrees and branches are kept; the console stays open.",
-                        if live == 1 { "worker" } else { "workers" }
-                    ),
-                    ConfirmAction::ShutdownSession(session.key()),
-                )
-            }
         } else {
-            self.notice(
-                "! no session <uuid-or-alias> matches — /sessions lists them",
-                true,
-            );
-            return Vec::new();
+            match crate::orch::session::resolve_session_by_key(self.fleet.root(), argument) {
+                Ok(session) if session.uuid == self.orch_key.uuid => {
+                    // naming the active session is the same shutdown
+                    (self.shutdown_question(), ConfirmAction::Shutdown)
+                }
+                Ok(session) => {
+                    let live = self.live_worker_count_for(session.uuid);
+                    let label = session_display_name(session.alias.as_deref(), session.uuid);
+                    (
+                        format!(
+                            "Stop {label}'s orchestrator and its {live} running {}? Worktrees and branches are kept; the console stays open.",
+                            if live == 1 { "worker" } else { "workers" }
+                        ),
+                        ConfirmAction::ShutdownSession(session.key()),
+                    )
+                }
+                Err(err) => {
+                    // the miss may be an ambiguous alias: the error names the
+                    // colliding sessions so the user can pick a uuid
+                    self.notice(format!("! {err:#}"), true);
+                    return Vec::new();
+                }
+            }
         };
         self.overlay = Some(Overlay::Confirm(ConfirmState { message, action }));
         Vec::new()
@@ -4222,17 +4220,19 @@ mod tests {
         use time::{Duration, OffsetDateTime};
 
         let mut c = test_console();
-        let mut healthy = OrchestratorSession::new("/repo");
-        healthy.alias = Some("add-auth".into());
-        healthy.last_heartbeat = Some(crate::util::now_iso());
+        let mut running = OrchestratorSession::new("/repo");
+        running.alias = Some("add-auth".into());
+        running.pid = Some(std::process::id() as i32); // live monitor
+        running.last_heartbeat = Some(crate::util::now_iso());
         let mut wedged = OrchestratorSession::new("/repo");
         wedged.alias = Some("stale".into());
+        wedged.pid = Some(std::process::id() as i32); // alive, but not stamping
         wedged.last_heartbeat = Some(crate::util::iso_at(
             OffsetDateTime::now_utc() - Duration::minutes(10),
         ));
-        let silent = OrchestratorSession::new("/repo"); // no alias, no heartbeat
-        write_sessions(&c, vec![healthy.clone(), wedged.clone(), silent.clone()]);
-        write_run(&c, "auth-20260830000000", "auth", healthy.uuid);
+        let stopped = OrchestratorSession::new("/repo"); // no pid, no heartbeat
+        write_sessions(&c, vec![running.clone(), wedged.clone(), stopped.clone()]);
+        write_run(&c, "auth-20260830000000", "auth", running.uuid);
 
         let effects = c.submit("/sessions");
         assert!(effects.is_empty());
@@ -4245,20 +4245,20 @@ mod tests {
             .join("\n");
         assert!(text.contains("add-auth"), "{text}");
         assert!(
-            text.contains(&crate::util::short_uuid(&healthy.uuid)),
+            text.contains(&crate::util::short_uuid(&running.uuid)),
             "{text}"
         );
         assert!(text.contains("1 worker"), "{text}");
-        assert!(text.contains("· healthy"), "{text}");
+        assert!(text.contains("· running"), "{text}");
         assert!(text.contains("stale ("), "{text}");
         assert!(text.contains("· wedged"), "{text}");
-        assert!(text.contains("· no heartbeat"), "{text}");
+        assert!(text.contains("· stopped"), "{text}");
         // the toolbar carries a tally, one line
         let flash = c.flash().unwrap();
         assert!(
             flash
                 .text
-                .contains("3 sessions · 1 healthy · 1 wedged · 1 without a heartbeat"),
+                .contains("3 sessions · 1 running · 1 wedged · 1 stopped"),
             "{}",
             flash.text
         );
@@ -4284,7 +4284,7 @@ mod tests {
             "the row is persisted"
         );
         assert_eq!(
-            c.prefs().last_session.as_deref(),
+            c.prefs().last_session_uuid.as_deref(),
             Some(key.uuid.to_string().as_str()),
             "the new session becomes the remembered one"
         );
@@ -4300,7 +4300,7 @@ mod tests {
     fn session_switch_resolves_uuid_then_alias_and_refuses_unknown() {
         let mut c = test_console();
         let session =
-            crate::tui::session_api::create_session(c.fleet.root(), Some("add-auth")).unwrap();
+            crate::orch::session::create_session(c.fleet.root(), Some("add-auth")).unwrap();
 
         // by uuid
         let effects = c.submit(&format!("/session {}", session.uuid));
@@ -4309,7 +4309,7 @@ mod tests {
             Effect::SwitchSession(key) if key.uuid == session.uuid
         ));
         assert_eq!(
-            c.prefs().last_session.as_deref(),
+            c.prefs().last_session_uuid.as_deref(),
             Some(session.uuid.to_string().as_str())
         );
         // by alias
@@ -4326,11 +4326,155 @@ mod tests {
         // unknown keys are refused, not guessed
         let effects = c.submit("/session nope");
         assert!(effects.is_empty());
-        assert!(c.flash().unwrap().text.contains("no session matches"));
+        assert!(
+            c.flash().unwrap().text.contains("no orchestrator session"),
+            "{}",
+            c.flash().unwrap().text
+        );
         // bare /session shows the usage
         let effects = c.submit("/session");
         assert!(effects.is_empty());
         assert!(c.flash().unwrap().text.contains("usage: /session"));
+    }
+
+    #[test]
+    fn prefs_and_store_writes_interleave_without_losing_either() {
+        let mut c = test_console();
+        // a session row, as the monitor owns it
+        let session = crate::orch::session::create_session(c.fleet.root(), Some("alpha")).unwrap();
+        c.prefs.rail_mode = "wide".into();
+        c.prefs.last_session_uuid = Some(session.uuid.to_string());
+
+        // order 1: the store writes a heartbeat, then the console writes prefs
+        crate::orch::session::touch_heartbeat(c.fleet.root(), session.uuid).unwrap();
+        c.save_prefs();
+        let raw = std::fs::read_to_string(c.fleet.fleet_json()).unwrap();
+        assert!(raw.contains("\"railMode\": \"wide\""), "{raw}");
+        let store = crate::orch::session::load(c.fleet.root()).unwrap();
+        assert!(
+            store.sessions[&session.uuid].last_heartbeat.is_some(),
+            "the heartbeat survived the console's write"
+        );
+        assert!(
+            store
+                .extra
+                .get("console")
+                .and_then(|v| v.get("railMode"))
+                .and_then(serde_json::Value::as_str)
+                == Some("wide"),
+            "the store itself round-trips the console key now"
+        );
+
+        // order 2: the console writes prefs, then the store writes a heartbeat
+        c.save_prefs();
+        crate::orch::session::touch_heartbeat(c.fleet.root(), session.uuid).unwrap();
+        let raw = std::fs::read_to_string(c.fleet.fleet_json()).unwrap();
+        assert!(raw.contains("\"railMode\": \"wide\""), "{raw}");
+        assert!(
+            raw.contains(&session.uuid.to_string()),
+            "the session row survived the prefs write: {raw}"
+        );
+        let store = crate::orch::session::load(c.fleet.root()).unwrap();
+        assert_eq!(store.sessions.len(), 1);
+        assert!(
+            store.sessions[&session.uuid].last_heartbeat.is_some(),
+            "the heartbeat survived the second prefs write"
+        );
+    }
+
+    #[test]
+    fn load_prefs_migrates_the_legacy_session_uuid_and_keeps_row_and_uuid_separate() {
+        let c = test_console();
+        let uuid = Uuid::new_v4();
+        // a pre-split console wrote the session uuid into lastSession
+        std::fs::write(
+            c.fleet.fleet_json(),
+            json!({
+                "version": 2,
+                "sessions": {},
+                "console": {"lastSession": uuid.to_string()},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut reopened = Console::new(FleetPaths::new(c.fleet.root().to_path_buf()));
+        reopened.load_prefs();
+        assert_eq!(
+            reopened.prefs().last_session_uuid.as_deref(),
+            Some(uuid.to_string().as_str()),
+            "the legacy uuid lands in the session field"
+        );
+        assert_eq!(reopened.prefs().last_session, None, "not doubled");
+
+        // a row key is a row key, a uuid a uuid: the fields stay separate
+        std::fs::write(
+            c.fleet.fleet_json(),
+            json!({
+                "version": 2,
+                "sessions": {},
+                "console": {
+                    "lastSession": "auth-20260830000000",
+                    "lastSessionUuid": uuid.to_string(),
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut reopened = Console::new(FleetPaths::new(c.fleet.root().to_path_buf()));
+        reopened.load_prefs();
+        assert_eq!(
+            reopened.prefs().last_session.as_deref(),
+            Some("auth-20260830000000")
+        );
+        assert_eq!(
+            reopened.prefs().last_session_uuid.as_deref(),
+            Some(uuid.to_string().as_str())
+        );
+        // and save_prefs persists both under the console key
+        reopened.prefs.rail_mode = "compact".into();
+        reopened.save_prefs();
+        let raw = std::fs::read_to_string(c.fleet.fleet_json()).unwrap();
+        assert!(raw.contains("\"lastSessionUuid\": \""), "{raw}");
+        assert!(
+            raw.contains("\"lastSession\": \"auth-20260830000000\""),
+            "{raw}"
+        );
+        assert!(raw.contains("\"railMode\": \"compact\""), "{raw}");
+    }
+
+    #[test]
+    fn an_ambiguous_alias_names_the_colliding_sessions() {
+        let mut c = test_console();
+        let first = crate::orch::session::create_session(c.fleet.root(), Some("dup")).unwrap();
+        let second = crate::orch::session::create_session(c.fleet.root(), Some("dup")).unwrap();
+        // resolving the alias must not pick silently: the error names both
+        let effects = c.submit("/session dup");
+        assert!(effects.is_empty());
+        let flash = c.flash().unwrap();
+        assert!(
+            flash.text.contains("several live sessions"),
+            "{}",
+            flash.text
+        );
+        assert!(
+            flash.text.contains(&crate::util::short_uuid(&first.uuid)),
+            "{}",
+            flash.text
+        );
+        assert!(
+            flash.text.contains(&crate::util::short_uuid(&second.uuid)),
+            "{}",
+            flash.text
+        );
+        // the same honesty applies to /shutdown <key>
+        let effects = c.submit("/shutdown dup");
+        assert!(effects.is_empty());
+        assert!(c.overlay().is_none());
+        assert!(
+            c.flash().unwrap().text.contains("several live sessions"),
+            "{}",
+            c.flash().unwrap().text
+        );
     }
 
     #[test]
@@ -4341,7 +4485,7 @@ mod tests {
         c.orch_key = mine.key();
         write_sessions(&c, vec![mine.clone()]);
         write_run(&c, "db-20260829120000", "db", mine.uuid);
-        let other = crate::tui::session_api::create_session(c.fleet.root(), Some("docs")).unwrap();
+        let other = crate::orch::session::create_session(c.fleet.root(), Some("docs")).unwrap();
         write_run(&c, "docs-20260829120001", "docs", other.uuid);
         c.set_runs(vec![running_run("db-20260829120000", "db")]);
 
@@ -4371,7 +4515,7 @@ mod tests {
     #[test]
     fn shutdown_naming_the_active_session_is_the_classic_shutdown() {
         let mut c = test_console();
-        let active = crate::tui::session_api::create_session(c.fleet.root(), None).unwrap();
+        let active = crate::orch::session::create_session(c.fleet.root(), None).unwrap();
         c.orch_key = active.key();
         let _effects = c.submit(&format!("/shutdown {}", active.uuid));
         let Overlay::Confirm(confirm) = c.overlay().unwrap() else {
@@ -4389,7 +4533,11 @@ mod tests {
         let effects = c.submit("/shutdown nobody");
         assert!(effects.is_empty());
         assert!(c.overlay().is_none());
-        assert!(c.flash().unwrap().text.contains("no session"));
+        assert!(
+            c.flash().unwrap().text.contains("no orchestrator session"),
+            "{}",
+            c.flash().unwrap().text
+        );
     }
 
     #[test]
@@ -4398,7 +4546,7 @@ mod tests {
         c.orch_transcript.push_sent("hello");
         c.handle_key(enter()); // in the session view now
         c.toast("a note", false);
-        let other = crate::tui::session_api::create_session(c.fleet.root(), Some("docs")).unwrap();
+        let other = crate::orch::session::create_session(c.fleet.root(), Some("docs")).unwrap();
         c.begin_session(&other.key());
         assert_eq!(c.orch_key, other.key());
         assert_eq!(c.view(), View::Dashboard);
