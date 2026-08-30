@@ -61,6 +61,15 @@ pi emits `{"type":"extension_ui_request","id":"…","method":"…",…}` on stdo
 
 Intended design for the worker-monitor step: treat a dialog request like a `fleet_ask` pending question — record it on the run so the console can show the session as blocked and answer it, and if nobody answers, send `cancelled: true` shortly before pi's own timeout so the worker never hangs. Reference: `/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/docs/rpc.md`.
 
+**3. The claude stream-json / control protocol, spiked against the real binary (claude 2.1.251, 2026-08-29).** The spike script that produced these (`scripts/spike-claude-protocol.ts`) was deleted at cutover; its findings are recorded here because they were not written down anywhere else.
+
+- `can_use_tool` arrives without any `initialize` handshake (`echo` never prompts — it is in the built-in read-only set — so probe with a writing command). The handshake is sent at startup anyway: its response carries the command/skill list. A bare `{subtype:"initialize"}` is acknowledged with success but is not needed.
+- `--allowedTools "mcp__fleet__*"` suppresses permission prompts for the fleet tools.
+- `updatedPermissions` built from the request's `permission_suggestions` is honored: after an allow-always, the same command does not prompt again.
+- `--append-system-prompt-file` is a hidden flag and works. `system/init` arrives only after the FIRST user message and is re-emitted after every user message; nothing at all is written before the first message. Extra stream messages observed: `system/status {status:"requesting"}`, thinking deltas, `system/task_started|task_notification|background_tasks_changed`.
+- A user message injected mid-turn is delivered inside the running turn as a system-reminder right after the next tool result; whether the model acts on it is up to the model (haiku once folded it in, once ignored it as a possible prompt injection). This is why the orchestrator prompt states that `<fleet-event>` messages arriving mid-turn are legitimate and must be acted on.
+- Permission modes: `--help` advertises acceptEdits, auto, bypassPermissions, manual, dontAsk, plan; `default` is NOT in that list but the flag accepts it (a hidden alias for `manual`; `bogus` is rejected, so the choice is validated). Over the control protocol, `set_permission_mode` succeeds for every one of default/auto/acceptEdits/dontAsk/plan/manual — the modes the console offers work both at launch and mid-session. The claude Agent SDK type definitions still exist, at `~/Library/Application Support/Code/agent-host/sdk-cache/claude/0.3.220/darwin-arm64/node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts` (only the old path went away); its `PermissionMode` type lags the flag reality.
+
 ## The `.parl` layout
 
 ```text

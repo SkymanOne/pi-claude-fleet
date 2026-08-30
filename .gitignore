@@ -1,7 +1,7 @@
-node_modules/
-.pi-fleet/
-dist/
+# Rust build output
 /target
 
-# parl
-.parl/
+# Legacy state directory of the retired TypeScript implementation. A live
+# orchestrator is still running out of it while the Rust rewrite is carried
+# out — do not remove this entry yet.
+.pi-fleet/
