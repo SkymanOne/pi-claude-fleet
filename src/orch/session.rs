@@ -51,7 +51,9 @@ pub struct WatcherState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LaunchOptions {
-    /// The model asked for at launch (claude's default when none).
+    /// The model asked for at launch (claude's default when none). Most
+    /// specific wins: the explicit flag, then this persisted record, then
+    /// `~/.parl/config.toml`'s `[orchestrator] model`.
     pub model: Option<String>,
     pub budget_usd: Option<f64>,
     pub permission_mode: Option<String>,

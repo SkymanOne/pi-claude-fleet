@@ -1,7 +1,8 @@
 //! The `.parl` state layout: one directory under the repo root holding every
-//! durable fact the fleet produces. Nothing outside this module should spell
-//! the directory name or the env-var prefix, so a future rename touches only
-//! the two constants below.
+//! durable fact the fleet produces, plus the user-level `~/.parl` directory
+//! holding the user's config. Nothing outside this module should spell the
+//! directory name or the env-var prefix, so a future rename touches only the
+//! constants below.
 
 use std::path::{Path, PathBuf};
 
@@ -191,6 +192,122 @@ fn git_root_of(dir: &Path) -> PathBuf {
         )
 }
 
+/// The user-level config directory: `~/.parl`, or the `$PARL_HOME` override
+/// wholesale (mirroring how `$PARL_DIR` overrides a fleet's location). Same
+/// name as [`STATE_DIR_NAME`], different scope, deliberately — the project's
+/// state lives under `<repo>/.parl`, the user's config under `~/.parl`.
+/// `None` when neither the override nor a home is known, which callers read
+/// as "no user config".
+#[must_use]
+pub fn user_dir() -> Option<PathBuf> {
+    user_dir_with_env(
+        std::env::var(env_var("HOME")).ok().as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+/// [`user_dir`] with the `$PARL_HOME` value and the home directory injected,
+/// mirroring [`FleetPaths::discover_with_env`]: tests pass synthetic values
+/// so resolution never touches the ambient environment, and the fallback
+/// branch needs no ambient read either.
+#[must_use]
+pub fn user_dir_with_env(parl_home: Option<&str>, home: Option<&Path>) -> Option<PathBuf> {
+    match parl_home {
+        Some(dir) if !dir.trim().is_empty() => Some(PathBuf::from(dir.trim())),
+        _ => home.map(|home| home.join(STATE_DIR_NAME)),
+    }
+}
+
+/// User-level config: `~/.parl/config.toml`. Every field is optional — a
+/// missing file, an empty file, or a file with only some keys all read as
+/// defaults — but a malformed file is an error, because silently ignoring a
+/// config the user wrote is worse than failing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct UserConfig {
+    /// Defaults for the orchestrator.
+    pub orchestrator: OrchestratorConfig,
+    /// Defaults for workers.
+    pub worker: WorkerConfig,
+}
+
+/// The `[orchestrator]` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct OrchestratorConfig {
+    /// The orchestrator model claude is launched with when nothing more
+    /// specific is recorded.
+    pub model: Option<String>,
+}
+
+/// The `[worker]` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct WorkerConfig {
+    /// The model spawned workers run with when no `--model` is passed.
+    pub model: Option<String>,
+    /// The provider spawned workers run under when no `--provider` is passed.
+    pub provider: Option<String>,
+}
+
+impl UserConfig {
+    /// The worker model, most specific wins: the explicit argument, then
+    /// the config's `[worker] model`, then `None` (let pi decide).
+    #[must_use]
+    pub fn worker_model<'a>(&'a self, explicit: Option<&'a str>) -> Option<&'a str> {
+        explicit.or(self.worker.model.as_deref())
+    }
+
+    /// The worker provider, same order as [`UserConfig::worker_model`].
+    #[must_use]
+    pub fn worker_provider<'a>(&'a self, explicit: Option<&'a str>) -> Option<&'a str> {
+        explicit.or(self.worker.provider.as_deref())
+    }
+
+    /// The orchestrator model, most specific wins: the explicit argument,
+    /// then the project's persisted launch record (`fleet.json`), then the
+    /// config's `[orchestrator] model`, then `None` (let claude decide).
+    #[must_use]
+    pub fn orchestrator_model<'a>(
+        &'a self,
+        explicit: Option<&'a str>,
+        persisted: Option<&'a str>,
+    ) -> Option<&'a str> {
+        explicit
+            .or(persisted)
+            .or(self.orchestrator.model.as_deref())
+    }
+}
+
+/// Load `~/.parl/config.toml` under `user_dir`. A missing or empty file
+/// reads as defaults; a malformed one is an error naming the path and the
+/// parse problem.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read or parsed.
+pub fn load_user_config(user_dir: Option<&Path>) -> anyhow::Result<UserConfig> {
+    use anyhow::Context as _;
+    let Some(user_dir) = user_dir else {
+        return Ok(UserConfig::default());
+    };
+    let path = user_dir.join("config.toml");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(UserConfig::default());
+        }
+        Err(err) => {
+            return Err(err).context(format!("reading user config {}", path.display()));
+        }
+    };
+    if raw.trim().is_empty() {
+        return Ok(UserConfig::default());
+    }
+    toml::from_str(&raw)
+        .map_err(|err| anyhow::anyhow!("parsing user config {}: {err}", path.display()))
+}
+
 /// Append `entry` to `<root>/.gitignore` unless a line already covers it.
 ///
 /// Introduces the `# parl` marker on first touch. Returns whether the file
@@ -316,9 +433,123 @@ mod tests {
             FleetPaths::discover_with_env(cwd, Some("  ")),
             FleetPaths::new("/repo/.parl")
         );
-        // The env name itself is derived, never spelled in full.
+        // The env names themselves are derived, never spelled in full.
         assert_eq!(env_var("DIR"), "PARL_DIR");
         assert_eq!(env_var("RUN"), "PARL_RUN");
+        assert_eq!(env_var("HOME"), "PARL_HOME");
+    }
+
+    /// A temp user dir, the way production resolves `~/.parl`: with the
+    /// injected `$PARL_HOME` the override wins wholesale, else `.parl` under
+    /// the injected home, else nothing. Every branch is injectable, so a test
+    /// can never land in the real home directory.
+    #[test]
+    fn user_dir_prefers_parl_home_and_falls_back_under_the_home() {
+        let home = Path::new("/home/alice");
+        assert_eq!(
+            user_dir_with_env(None, Some(home)),
+            Some(home.join(STATE_DIR_NAME))
+        );
+        assert_eq!(
+            user_dir_with_env(Some("/elsewhere/config"), Some(home)),
+            Some(PathBuf::from("/elsewhere/config"))
+        );
+        // A blank value is the variable set-but-empty: the fallback applies.
+        assert_eq!(
+            user_dir_with_env(Some("  "), Some(home)),
+            Some(home.join(STATE_DIR_NAME))
+        );
+        // The override stands alone; without any home there is no `.parl`.
+        assert_eq!(
+            user_dir_with_env(Some("/elsewhere/config"), None),
+            Some(PathBuf::from("/elsewhere/config"))
+        );
+        assert_eq!(user_dir_with_env(None, None), None);
+    }
+
+    /// The config file lives directly in the user dir and is read once.
+    fn write_config(user_dir: &Path, body: &str) {
+        std::fs::create_dir_all(user_dir).unwrap();
+        std::fs::write(user_dir.join("config.toml"), body).unwrap();
+    }
+
+    #[test]
+    fn user_config_reads_missing_empty_and_partial_files_as_defaults() {
+        let tmp = tmp_dir("parl-cfg-missing-");
+        assert_eq!(load_user_config(None).unwrap(), UserConfig::default());
+        // No file at all.
+        assert_eq!(load_user_config(Some(&tmp)).unwrap(), UserConfig::default());
+        // An empty file.
+        write_config(&tmp, "");
+        assert_eq!(load_user_config(Some(&tmp)).unwrap(), UserConfig::default());
+        // Only one key of one section: the rest stay absent.
+        write_config(&tmp, "[worker]\nmodel = \"deepseek-v4-flash\"\n");
+        let config = load_user_config(Some(&tmp)).unwrap();
+        assert_eq!(config.worker.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(config.worker.provider, None);
+        assert_eq!(config.orchestrator.model, None);
+        // Unknown keys are tolerated, like every reader in this crate.
+        write_config(&tmp, "[orchestrator]\nmodel = \"opus\"\nfuture = 1\n");
+        let config = load_user_config(Some(&tmp)).unwrap();
+        assert_eq!(config.orchestrator.model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn user_config_parses_both_sections() {
+        let tmp = tmp_dir("parl-cfg-full-");
+        write_config(
+            &tmp,
+            "[orchestrator]\nmodel = \"claude-opus-5\"\n\n[worker]\nmodel = \"deepseek-v4-flash\"\nprovider = \"opencode-go\"\n",
+        );
+        let config = load_user_config(Some(&tmp)).unwrap();
+        assert_eq!(config.orchestrator.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(config.worker.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(config.worker.provider.as_deref(), Some("opencode-go"));
+    }
+
+    #[test]
+    fn a_malformed_user_config_names_the_path_and_the_problem() {
+        let tmp = tmp_dir("parl-cfg-bad-");
+        write_config(&tmp, "[orchestrator\nmodel = \"x\"\n");
+        let err = load_user_config(Some(&tmp))
+            .expect_err("a malformed config errors, never silently defaults")
+            .to_string();
+        assert!(err.contains("config.toml"), "names the file: {err}");
+        assert!(err.contains("line 1"), "names the parse problem: {err}");
+    }
+
+    #[test]
+    fn resolution_prefers_explicit_then_persisted_then_config_then_default() {
+        let config = UserConfig {
+            orchestrator: OrchestratorConfig {
+                model: Some("claude-fable-5".into()),
+            },
+            worker: WorkerConfig {
+                model: Some("deepseek-v4-flash".into()),
+                provider: Some("opencode-go".into()),
+            },
+        };
+        // Orchestrator: explicit beats the persisted record beats the config.
+        assert_eq!(
+            config.orchestrator_model(Some("opus"), Some("sonnet")),
+            Some("opus")
+        );
+        assert_eq!(
+            config.orchestrator_model(None, Some("sonnet")),
+            Some("sonnet")
+        );
+        assert_eq!(
+            config.orchestrator_model(None, None),
+            Some("claude-fable-5")
+        );
+        // Worker: explicit beats the config; provider resolves independently.
+        assert_eq!(config.worker_model(Some("glm-5.3")), Some("glm-5.3"));
+        assert_eq!(config.worker_model(None), Some("deepseek-v4-flash"));
+        assert_eq!(config.worker_provider(None), Some("opencode-go"));
+        // Nothing anywhere: the empty config still yields defaults.
+        assert_eq!(UserConfig::default().orchestrator_model(None, None), None);
+        assert_eq!(UserConfig::default().worker_model(None), None);
+        assert_eq!(UserConfig::default().worker_provider(None), None);
     }
 
     #[test]

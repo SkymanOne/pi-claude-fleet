@@ -81,19 +81,34 @@ pub async fn spawn_core(request: SpawnRequest) -> anyhow::Result<CommandResult<S
     spawn_core_with_env(request, super::ambient_parl_dir().as_deref()).await
 }
 
-/// [`spawn_core`] with the `$PARL_DIR` value injected (tests pass `None`).
+/// [`spawn_core`] with the `$PARL_DIR` value injected (tests and the MCP
+/// server pass it; MCP passes its own captured value).
 pub(crate) async fn spawn_core_with_env(
     request: SpawnRequest,
     parl_dir: Option<&str>,
 ) -> anyhow::Result<CommandResult<SpawnData>> {
+    spawn_core_with_dirs(request, parl_dir, crate::paths::user_dir().as_deref()).await
+}
+
+/// [`spawn_core_with_env`] with the user config dir injected too, so tests
+/// never resolve an ambient `~/.parl`.
+pub(crate) async fn spawn_core_with_dirs(
+    request: SpawnRequest,
+    parl_dir: Option<&str>,
+    user_config_dir: Option<&Path>,
+) -> anyhow::Result<CommandResult<SpawnData>> {
     if request.brief.trim().is_empty() {
         anyhow::bail!("spawn: task brief required after \"--\"");
     }
+    let config = crate::paths::load_user_config(user_config_dir)?;
+    // The resolved model is the one the monitor will actually run, so a bad
+    // name from the config is refused here too — before a worktree exists.
+    let model = config.worker_model(request.model.as_deref());
     let pi_bin = pi_bin_spec();
-    if let Some(bad) = check_model(&pi_bin, request.model.as_deref()).await? {
+    if let Some(bad) = check_model(&pi_bin, model).await? {
         return Ok(fail(ExitCode::NoReport, vec![format!("spawn: {bad}")]));
     }
-    let created = create_run_with_env(&request, parl_dir).await?;
+    let created = create_run_with_env(&request, parl_dir, user_config_dir).await?;
     let mut err: Vec<String> = Vec::new();
     if !created.state.is_git && request.worktree {
         err.push("warning: target is not a git repo — running in place without a worktree".into());
@@ -140,18 +155,34 @@ pub(crate) async fn spawn_core_with_env(
 /// worktree git cannot cut. A prior terminal run of the same name is
 /// archived here, not refused.
 pub async fn create_run(request: &SpawnRequest) -> anyhow::Result<CreatedRun> {
-    create_run_with_env(request, super::ambient_parl_dir().as_deref()).await
+    create_run_with_env(
+        request,
+        super::ambient_parl_dir().as_deref(),
+        crate::paths::user_dir().as_deref(),
+    )
+    .await
 }
 
-/// [`create_run`] with the `$PARL_DIR` value injected (tests pass `None`).
+/// [`create_run`] with the `$PARL_DIR` value and the user config dir
+/// injected (tests pass `None`s).
 async fn create_run_with_env(
     request: &SpawnRequest,
     parl_dir: Option<&str>,
+    user_config_dir: Option<&Path>,
 ) -> anyhow::Result<CreatedRun> {
     let name = sanitize_name(&request.name);
     if name.is_empty() {
         anyhow::bail!("spawn: <name> required");
     }
+    // User-level defaults sit under the explicit flags: the run records the
+    // resolved model/provider, which is what the monitor hands to pi.
+    let config = crate::paths::load_user_config(user_config_dir)?;
+    let model = config
+        .worker_model(request.model.as_deref())
+        .map(str::to_string);
+    let provider = config
+        .worker_provider(request.provider.as_deref())
+        .map(str::to_string);
     let fleet = resolve_fleet_dir_with_env(request.cwd.as_deref(), parl_dir).await?;
     // The fixed layout plus the gitignore entry; idempotent.
     fleet.paths.ensure()?;
@@ -218,8 +249,8 @@ one live run; stop or clean it first, or use another name.",
             .map(|p| p.to_string_lossy().into_owned()),
         branch,
         request.base.clone(),
-        request.model.clone(),
-        request.provider.clone(),
+        model,
+        provider,
         request.thinking.clone(),
         request.session.clone(),
         request.skill.clone(),
@@ -311,11 +342,14 @@ mod tests {
     /// fine. Each attempt is self-contained — a new run id every second, so
     /// no collision with a failed attempt's leftovers — so poll `Err` and
     /// return the first `Ok`; a persistent failure surfaces as the last Err.
-    async fn create_run_with_retry(request: &SpawnRequest) -> anyhow::Result<CreatedRun> {
+    async fn create_run_with_retry(
+        request: &SpawnRequest,
+        user_config_dir: Option<&Path>,
+    ) -> anyhow::Result<CreatedRun> {
         // Operation-level, so a longer bound than the per-spawn helper's.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            match create_run_with_env(request, None).await {
+            match create_run_with_env(request, None, user_config_dir).await {
                 Ok(created) => return Ok(created),
                 Err(err) => {
                     if Instant::now() >= deadline {
@@ -357,9 +391,10 @@ mod tests {
     #[tokio::test]
     async fn create_run_builds_layout_worktree_and_initial_state() {
         let root = init_repo("parl-spawn-");
-        let created = create_run_with_retry(&request("auth-worker", "create hello", &root, true))
-            .await
-            .unwrap();
+        let created =
+            create_run_with_retry(&request("auth-worker", "create hello", &root, true), None)
+                .await
+                .unwrap();
         assert!(
             regex::Regex::new(r"^auth-worker-\d{14}$")
                 .unwrap()
@@ -398,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn create_run_in_a_plain_directory_runs_in_place() {
         let dir = tmp_dir("parl-spawn-plain-");
-        let created = create_run_with_retry(&request("flat", "b", &dir, true))
+        let created = create_run_with_retry(&request("flat", "b", &dir, true), None)
             .await
             .unwrap();
         assert_eq!(created.worktree_path, None);
@@ -411,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn create_run_skips_the_worktree_when_asked() {
         let root = init_repo("parl-spawn-");
-        let created = create_run_with_retry(&request("nowt", "b", &root, false))
+        let created = create_run_with_retry(&request("nowt", "b", &root, false), None)
             .await
             .unwrap();
         assert_eq!(created.worktree_path, None);
@@ -498,7 +533,7 @@ mod tests {
             RunStatus::Settled,
             None,
         );
-        let created = create_run_with_retry(&request("auth", "new work", &root, true))
+        let created = create_run_with_retry(&request("auth", "new work", &root, true), None)
             .await
             .unwrap();
         assert_ne!(created.run_id, "auth-20990101000000", "a fresh run id");
@@ -530,7 +565,7 @@ mod tests {
             RunStatus::Running,
             Some(std::process::id().cast_signed()),
         );
-        let err = create_run_with_env(&request("auth", "again", &root, true), None)
+        let err = create_run_with_env(&request("auth", "again", &root, true), None, None)
             .await
             .unwrap_err()
             .to_string();
@@ -547,7 +582,7 @@ mod tests {
     #[tokio::test]
     async fn empty_names_and_briefs_are_refused() {
         let dir = tmp_dir("parl-spawn-bad-");
-        let err = create_run_with_env(&request("!!!", "b", &dir, false), None)
+        let err = create_run_with_env(&request("!!!", "b", &dir, false), None, None)
             .await
             .unwrap_err()
             .to_string();
@@ -557,5 +592,42 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(err, "spawn: task brief required after \"--\"");
+    }
+
+    #[tokio::test]
+    async fn the_user_config_supplies_worker_model_and_provider_defaults() {
+        let root = init_repo("parl-spawn-cfg-");
+        let user_dir = tmp_dir("parl-user-cfg-");
+        std::fs::write(
+            user_dir.join("config.toml"),
+            "[worker]\nmodel = \"deepseek-v4-flash\"\nprovider = \"opencode-go\"\n",
+        )
+        .unwrap();
+        let created = create_run_with_retry(
+            &request("cfg-worker", "do the thing", &root, true),
+            Some(&user_dir),
+        )
+        .await
+        .unwrap();
+        // The run records the resolved defaults, which the monitor hands to pi.
+        assert_eq!(created.state.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(created.state.provider.as_deref(), Some("opencode-go"));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_worker_model_beats_the_user_config() {
+        let root = init_repo("parl-spawn-cfg-explicit-");
+        let user_dir = tmp_dir("parl-user-cfg-explicit-");
+        std::fs::write(
+            user_dir.join("config.toml"),
+            "[worker]\nmodel = \"deepseek-v4-flash\"\nprovider = \"opencode-go\"\n",
+        )
+        .unwrap();
+        let mut req = request("cfg-explicit", "do the thing", &root, true);
+        req.model = Some("glm-5.3".into());
+        let created = create_run_with_retry(&req, Some(&user_dir)).await.unwrap();
+        assert_eq!(created.state.model.as_deref(), Some("glm-5.3"));
+        // The provider carries no explicit value, so the config still fills it.
+        assert_eq!(created.state.provider.as_deref(), Some("opencode-go"));
     }
 }

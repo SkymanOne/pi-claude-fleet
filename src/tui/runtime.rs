@@ -366,8 +366,18 @@ fn compact_stat(stat: &str) -> Option<String> {
 /// takes only `--fleet-dir`, so before spawning, the console's launch flags
 /// are recorded in the session store ([`crate::orch::session::LaunchOptions`])
 /// where the monitor's boot reads them; on attach they are left alone so a
-/// running monitor keeps whatever it was launched or live-changed to.
-fn ensure_orchestrator(fleet: &FleetPaths, options: &TuiOptions) -> anyhow::Result<bool> {
+/// running monitor keeps whatever it was launched or live-changed to. The
+/// user config dir is injectable so tests never resolve a real home.
+///
+/// # Errors
+///
+/// Returns an error when the user config is malformed or the monitor cannot
+/// be spawned.
+fn ensure_orchestrator(
+    fleet: &FleetPaths,
+    options: &TuiOptions,
+    user_config_dir: Option<&Path>,
+) -> anyhow::Result<bool> {
     let state = std::fs::read_to_string(fleet.orchestrator_state())
         .ok()
         .and_then(|raw| serde_json::from_str::<OrchestratorState>(&raw).ok());
@@ -376,7 +386,7 @@ fn ensure_orchestrator(fleet: &FleetPaths, options: &TuiOptions) -> anyhow::Resu
     {
         return Ok(false);
     }
-    record_launch_options(fleet, options);
+    record_launch_options(fleet, options, user_config_dir)?;
     let exe = std::env::current_exe().context("finding the parl binary")?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -402,17 +412,26 @@ fn ensure_orchestrator(fleet: &FleetPaths, options: &TuiOptions) -> anyhow::Resu
 /// monitor writes its own mode changes back, so a restarted monitor keeps
 /// running the way the last one did). Same parsing as the ops client's
 /// spawn: the budget rides in as a display string and leaves as dollars.
-fn record_launch_options(fleet: &FleetPaths, options: &TuiOptions) {
+fn record_launch_options(
+    fleet: &FleetPaths,
+    options: &TuiOptions,
+    user_config_dir: Option<&Path>,
+) -> anyhow::Result<()> {
     let mut session = if fleet.fleet_json().exists() {
         let Some(session) = crate::orch::session::load(fleet.root()) else {
-            return;
+            return Ok(());
         };
         session
     } else {
         crate::orch::session::OrchestratorSession::new(&repo_cwd(fleet))
     };
+    // The config layer sits under the explicit flag and above the built-in
+    // default: the model launched can come from `~/.parl/config.toml`.
+    let config = crate::paths::load_user_config(user_config_dir)?;
     session.launch = crate::orch::session::LaunchOptions {
-        model: options.model.clone(),
+        model: config
+            .orchestrator_model(options.model.as_deref(), None)
+            .map(str::to_string),
         budget_usd: options
             .budget
             .as_deref()
@@ -423,6 +442,7 @@ fn record_launch_options(fleet: &FleetPaths, options: &TuiOptions) {
         fresh: Some(options.fresh),
     };
     let _ = crate::orch::session::save(fleet.root(), &mut session);
+    Ok(())
 }
 
 /// Raw mode means ctrl-c never becomes SIGINT: the runtime reads it as the
@@ -485,7 +505,7 @@ pub async fn run_console(
         console.select_target(&key);
     }
 
-    let started = match ensure_orchestrator(&fleet, &options) {
+    let started = match ensure_orchestrator(&fleet, &options, crate::paths::user_dir().as_deref()) {
         Ok(true) => {
             console.notice("· orchestrator monitor started", false);
             true
@@ -694,7 +714,7 @@ mod tests {
 
         // our own pid is alive: attach, and the recorded flags are untouched
         // — even though this console was opened with a different model
-        assert!(!ensure_orchestrator(&fleet, &tui_options(Some("fable"))).unwrap());
+        assert!(!ensure_orchestrator(&fleet, &tui_options(Some("fable")), None).unwrap());
         let session = crate::orch::session::load(fleet.root()).unwrap();
         assert_eq!(session.launch.model.as_deref(), Some("sonnet"));
     }
@@ -723,7 +743,7 @@ mod tests {
         options.permission_mode = Some("acceptEdits".into());
         options.remote_control = Some(String::new());
         options.fresh = true;
-        assert!(ensure_orchestrator(&fleet, &options).unwrap());
+        assert!(ensure_orchestrator(&fleet, &options, None).unwrap());
         let session = crate::orch::session::load(fleet.root()).unwrap();
         assert_eq!(session.launch.model.as_deref(), Some("fable"));
         assert_eq!(session.launch.budget_usd, Some(2.5));
@@ -739,11 +759,40 @@ mod tests {
     fn a_launch_record_without_flags_reads_as_claude_defaults() {
         let (_dir, fleet) = tmp_fleet();
         std::fs::create_dir_all(fleet.orchestrator_dir()).unwrap();
-        assert!(ensure_orchestrator(&fleet, &tui_options(None)).unwrap());
+        assert!(ensure_orchestrator(&fleet, &tui_options(None), None).unwrap());
         let session = crate::orch::session::load(fleet.root()).unwrap();
         assert_eq!(session.launch.model, None);
         assert_eq!(session.launch.budget_usd, None, "no budget: no dollars");
         assert_eq!(session.launch.fresh, Some(false));
+    }
+
+    #[test]
+    fn the_user_config_supplies_the_orchestrator_model_unless_an_explicit_flag_wins() {
+        let (_dir, fleet) = tmp_fleet();
+        std::fs::create_dir_all(fleet.orchestrator_dir()).unwrap();
+        // A fabricated `~/.parl` with an `[orchestrator] model`; injected, so
+        // nothing resolves the machine's real home.
+        let user_root = std::env::temp_dir().join(format!(
+            "parl-tui-user-{}-{}",
+            std::process::id(),
+            crate::util::new_id("t").replace('_', "")
+        ));
+        let user_dir = user_root.join(".parl");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(
+            user_dir.join("config.toml"),
+            "[orchestrator]\nmodel = \"claude-fable-5\"\n",
+        )
+        .unwrap();
+
+        // No explicit flag: the config model reaches the launch record.
+        assert!(ensure_orchestrator(&fleet, &tui_options(None), Some(&user_dir)).unwrap());
+        let session = crate::orch::session::load(fleet.root()).unwrap();
+        assert_eq!(session.launch.model.as_deref(), Some("claude-fable-5"));
+        // An explicit flag still wins over the config.
+        assert!(ensure_orchestrator(&fleet, &tui_options(Some("opus")), Some(&user_dir)).unwrap());
+        let session = crate::orch::session::load(fleet.root()).unwrap();
+        assert_eq!(session.launch.model.as_deref(), Some("opus"));
     }
 
     // -- the watcher seam ---------------------------------------------------

@@ -30,6 +30,7 @@ textwrap = "0.16.2"
 thiserror = "2.0.20"
 time = { version = "0.3.55", features = ["formatting", "parsing", "macros", "serde-well-known"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "fs", "sync", "time", "signal"] }
+toml = "1.1.4"
 tui-textarea = "0.7.0"
 unicode-width = "0.2.0"
 
