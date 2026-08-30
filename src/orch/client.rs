@@ -429,7 +429,10 @@ impl OrchestratorClient {
         session::save(&self.options.fleet_dir, &mut session_record)?;
 
         // The monitor outlives the console: its own process group, streams to
-        // the orchestrator log.
+        // the orchestrator log. The child is reaped by a background task —
+        // Node's unref() reaped for free; here nobody waits on the handle, so
+        // an unreaped monitor would linger as a zombie and keep its pid
+        // looking alive.
         let binary = match &self.options.monitor_bin {
             Some(binary) => binary.clone(),
             None => std::env::current_exe().context("locate the parl binary for the monitor")?,
@@ -442,7 +445,7 @@ impl OrchestratorClient {
         let stderr = log
             .try_clone()
             .context("cannot share the log file handle")?;
-        let mut command = std::process::Command::new(binary);
+        let mut command = tokio::process::Command::new(binary);
         command
             .args(["orchestrator-monitor", "--fleet-dir"])
             .arg(&self.options.fleet_dir)
@@ -454,12 +457,15 @@ impl OrchestratorClient {
         }
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt as _;
             command.process_group(0);
         }
-        command
+        let mut child = command
             .spawn()
             .context("cannot spawn the orchestrator monitor")?;
+        tokio::spawn(async move {
+            // reap whenever the monitor exits; the runtime outlives the console
+            let _ = child.wait().await;
+        });
         Ok(())
     }
 }

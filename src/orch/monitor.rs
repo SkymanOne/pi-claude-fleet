@@ -601,14 +601,12 @@ impl Monitor {
                 request_id,
                 decision,
             } => {
+                // The pending map is the source of truth; the state file's
+                // list is derived from it on every flush, so removing from
+                // anything else would be clobbered on the next flush.
                 let Some(pending) = ({
                     let mut sh = self.shared();
-                    let index = sh
-                        .state
-                        .pending_requests
-                        .iter()
-                        .position(|p| p.request_id == *request_id);
-                    index.map(|index| sh.state.pending_requests.remove(index))
+                    sh.pending.remove(request_id.as_str())
                 }) else {
                     return;
                 };
