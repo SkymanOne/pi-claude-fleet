@@ -13,7 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::orch::protocol::is_ask_user_question;
 use crate::tui::app::{
-    ConfirmState, Overlay, PaletteState, PermissionOverlay, SearchState, questions_of,
+    BriefState, ConfirmState, Overlay, PaletteState, PermissionOverlay, SearchState, questions_of,
 };
 use crate::tui::keys::help_lines;
 use crate::tui::theme::{OverlayRole, Palette};
@@ -35,6 +35,7 @@ pub fn draw(
         Overlay::Permission(state) => permission(frame, area, state, feeds, pal),
         Overlay::Palette(state) => palette(frame, area, state, pal),
         Overlay::Search(state) => search(frame, area, state, pal),
+        Overlay::Brief(state) => brief(frame, area, state, pal),
     }
 }
 
@@ -435,6 +436,58 @@ fn search(frame: &mut Frame, area: Rect, state: &SearchState, pal: &Palette) {
         ),
     ];
     draw_lines(frame, inner, lines);
+}
+
+// -- brief ------------------------------------------------------------------
+
+/// The selected session's full brief (the run's `taskBrief`, or the
+/// rendered orchestrator prompt), scrollable. A missing source shows a
+/// dimmed placeholder; long briefs page with the wheel and the scroll keys.
+fn brief(frame: &mut Frame, area: Rect, state: &BriefState, pal: &Palette) {
+    let width = 74u16.min(area.width.saturating_sub(4));
+    let inner_width = width.saturating_sub(4) as usize;
+    let lines = wrap(&state.text, inner_width);
+    let inner = panel(
+        frame,
+        centered(area, width, area.height.saturating_sub(2)),
+        "brief",
+        OverlayRole::Help,
+        pal,
+    );
+    // the window, clamped to the wrapped text: never past the last line
+    let height = inner.height as usize;
+    let offset = state.offset.min(lines.len().saturating_sub(height));
+    let mut body: Vec<Line<'static>> = lines
+        .iter()
+        .skip(offset)
+        .take(height.saturating_sub(1))
+        .map(|line| {
+            let style = if state.placeholder {
+                pal.dim()
+            } else {
+                Style::default()
+            };
+            Line::styled(line.clone(), style)
+        })
+        .collect();
+    if lines.len() > offset + height.saturating_sub(1) {
+        body.push(Line::styled(
+            format!(
+                "… {} more line{} — scroll or ctrl-d/ctrl-u",
+                lines.len() - offset - height.saturating_sub(1),
+                if lines.len() - offset - height.saturating_sub(1) == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            pal.dim(),
+        ));
+    } else if height > body.len() {
+        body.push(Line::default());
+        body.push(Line::styled("esc closes", pal.dim()));
+    }
+    draw_lines(frame, inner, body);
 }
 
 #[cfg(test)]
