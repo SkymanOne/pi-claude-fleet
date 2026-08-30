@@ -28,13 +28,9 @@ pub struct Feeds<'a> {
     pub runs: &'a [RunEntry],
 }
 
-/// Draw the whole console for one frame.
-pub fn draw(
-    frame: &mut Frame,
-    console: &mut Console,
-    feeds: &Feeds<'_>,
-    pal: &Palette,
-) -> anyhow::Result<()> {
+/// Draw the whole console for one frame. Infallible: every widget here
+/// renders into the buffer, nothing touches fallible IO.
+pub fn draw(frame: &mut Frame, console: &mut Console, feeds: &Feeds<'_>, pal: &Palette) {
     let area = frame.area();
     let [main, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     match console.view() {
@@ -46,7 +42,6 @@ pub fn draw(
     if let Some(overlay) = console.overlay().cloned() {
         overlay::draw(frame, area, console, feeds, &overlay, pal);
     }
-    Ok(())
 }
 
 /// Clip to `max` printed columns, ellipsis on the cut. Shared by the
