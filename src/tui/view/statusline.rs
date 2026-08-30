@@ -12,8 +12,9 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use crate::fleet::run::derive_view;
-use crate::tui::app::{Console, SessionTarget};
+use crate::tui::app::Console;
 use crate::tui::keys::Mode;
+use crate::tui::model::SessionTarget;
 use crate::tui::theme::Palette;
 use crate::tui::view::Feeds;
 use crate::util::now_ms;
@@ -29,7 +30,7 @@ pub fn draw(frame: &mut Frame, area: Rect, console: &Console, feeds: &Feeds<'_>,
     };
 
     match console.selected_target() {
-        SessionTarget::Worker(run_id) => {
+        SessionTarget::Worker { run_id } => {
             if let Some(entry) = feeds.runs.iter().find(|r| r.run_id == run_id) {
                 let state = &entry.state;
                 let view = derive_view(state, crate::fleet::run::is_alive, now_ms());
@@ -55,7 +56,7 @@ pub fn draw(frame: &mut Frame, area: Rect, console: &Console, feeds: &Feeds<'_>,
                 part(&mut spans, "gone".to_string(), pal.error());
             }
         }
-        SessionTarget::Orchestrator => {
+        SessionTarget::Orchestrator(_) => {
             let transcript = console.orchestrator_transcript();
             let model = transcript
                 .model()

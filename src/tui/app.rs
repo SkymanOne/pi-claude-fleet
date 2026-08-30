@@ -15,6 +15,7 @@ use std::path::Path;
 use anyhow::Context as _;
 use crossterm::event::KeyEvent;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::fleet::envelope::{Envelope, Party, append_envelope};
 use crate::fleet::event::FleetEvent;
@@ -29,16 +30,46 @@ use crate::tui::completions::{
 };
 use crate::tui::keys::{KeyAction, Mode, map_key};
 use crate::tui::model::{
-    DashboardRow, OrchSummary, RunRow, activity_line, build_rows, worker_activity_line,
+    DashboardRow, OrchSummary, RunRow, SessionTarget, activity_line, build_rows,
+    session_display_name, worker_activity_line,
 };
 use crate::tui::palette::{
     McpServerInfo, PaletteAction, PaletteContext, PaletteItem, PaletteScope, build_items, ranked,
 };
 use crate::tui::transcript::Transcript;
-use crate::util::now_ms;
+use crate::util::{now_ms, parse_ts_ms};
 
 /// How long a toolbar note stays up.
 const FLASH_MS: i64 = 6_000;
+
+/// A session whose monitor has not reported for this long reads as wedged
+/// in `/sessions` — distinct from dead (no heartbeat ever written: the
+/// session's monitor never started, or the row is an orphan).
+const SESSION_HEARTBEAT_STALE_MS: i64 = 30_000;
+
+/// How a session's last heartbeat reads, for the `/sessions` table:
+/// healthy (fresh), wedged (stale), or silent (never reported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionHealth {
+    Healthy,
+    Wedged,
+    Silent,
+}
+
+/// Classify a session by its monitor's last heartbeat.
+fn session_health(heartbeat: Option<&str>, now: i64) -> (&'static str, SessionHealth) {
+    match heartbeat {
+        Some(ts) => {
+            let age = now.saturating_sub(parse_ts_ms(ts).unwrap_or(0));
+            if age <= SESSION_HEARTBEAT_STALE_MS {
+                ("healthy", SessionHealth::Healthy)
+            } else {
+                ("wedged", SessionHealth::Wedged)
+            }
+        }
+        None => ("no heartbeat", SessionHealth::Silent),
+    }
+}
 
 /// What claude's own `/thinking` accepts; pi workers use [`THINKING_LEVELS`].
 const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -97,8 +128,15 @@ pub struct ConfirmState {
 /// What confirming actually does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmAction {
-    RemoveWorker { run_id: String, force: bool },
+    RemoveWorker {
+        run_id: String,
+        force: bool,
+    },
+    /// Stop the active session and close the console (`Q` / bare `/shutdown`).
     Shutdown,
+    /// Stop one named session's orchestrator and its workers; the console
+    /// stays open and other sessions are untouched.
+    ShutdownSession(SessionKey),
 }
 
 /// The permission/question overlay's own state (port of `Approval.tsx`).
@@ -251,6 +289,14 @@ pub enum Effect {
     },
     /// Stop the orchestrator for good (`/shutdown`).
     StopOrchestrator,
+    /// Stop one named session's orchestrator (`/shutdown <key>`); its
+    /// workers are aborted alongside, and the console stays open.
+    StopSession(SessionKey),
+    /// Point the console at another session (`/session <key>`, `/session
+    /// new`): the runtime saves the current session's watcher cursors and
+    /// re-anchors the polls on the new key. No IO happens here — `execute`
+    /// leaves it to the runtime's event loop, which watches for it.
+    SwitchSession(SessionKey),
     /// Steer a running worker (delivered after its current tool call).
     WorkerSteer { run_id: String, message: String },
     /// Queue a message for after the worker finishes its current work.
@@ -287,29 +333,6 @@ pub enum Effect {
 pub struct RunEntry {
     pub run_id: String,
     pub state: RunState,
-}
-
-/// Which session a console surface is aimed at.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionTarget {
-    Orchestrator,
-    Worker(String),
-}
-
-impl SessionTarget {
-    #[must_use]
-    pub const fn is_worker(&self) -> bool {
-        matches!(self, Self::Worker(_))
-    }
-}
-
-impl From<&crate::tui::model::SessionTarget> for SessionTarget {
-    fn from(target: &crate::tui::model::SessionTarget) -> Self {
-        match target {
-            crate::tui::model::SessionTarget::Orchestrator => Self::Orchestrator,
-            crate::tui::model::SessionTarget::Worker { run_id } => Self::Worker(run_id.clone()),
-        }
-    }
 }
 
 /// An `AskUserQuestion`'s question, as the overlay picks from it.
@@ -602,8 +625,8 @@ impl Console {
     #[must_use]
     pub fn open_transcript(&mut self) -> &Transcript {
         match self.selected_target() {
-            SessionTarget::Orchestrator => &self.orch_transcript,
-            SessionTarget::Worker(run_id) => self.worker_transcripts.entry(run_id).or_default(),
+            SessionTarget::Orchestrator(_) => &self.orch_transcript,
+            SessionTarget::Worker { run_id } => self.worker_transcripts.entry(run_id).or_default(),
         }
     }
 
@@ -620,15 +643,16 @@ impl Console {
     }
 
     /// The prompt the composer shows: who it is talking to, or what it is
-    /// answering.
+    /// answering. The orchestrator prompt names the served session (its
+    /// alias, or the short uuid while none is derived).
     #[must_use]
     pub fn composer_prompt(&self) -> String {
         if let Some(answering) = &self.composer.answering {
             return format!("answer ({}) > ", answering.question_id);
         }
         match self.selected_target() {
-            SessionTarget::Orchestrator => "orchestrator > ".to_string(),
-            SessionTarget::Worker(run_id) => {
+            SessionTarget::Orchestrator(_) => format!("{} > ", self.session_name()),
+            SessionTarget::Worker { run_id } => {
                 let label = self.run_state(&run_id).map_or_else(
                     || "worker".to_string(),
                     |s| {
@@ -644,11 +668,10 @@ impl Console {
     /// The selected session's target.
     #[must_use]
     pub fn selected_target(&self) -> SessionTarget {
-        self.rows
-            .get(self.selected)
-            .map_or(SessionTarget::Orchestrator, |row| {
-                SessionTarget::from(&row.target)
-            })
+        self.rows.get(self.selected).map_or_else(
+            || SessionTarget::Orchestrator(self.orch_key.uuid),
+            |row| row.target.clone(),
+        )
     }
 
     /// The selected row, if any.
@@ -694,8 +717,8 @@ impl Console {
     #[must_use]
     pub fn activity_line(&self, now: i64) -> Option<String> {
         match self.selected_target() {
-            SessionTarget::Orchestrator => activity_line(self.orch_transcript.activity(), now),
-            SessionTarget::Worker(run_id) => {
+            SessionTarget::Orchestrator(_) => activity_line(self.orch_transcript.activity(), now),
+            SessionTarget::Worker { run_id } => {
                 let state = self.run_state(&run_id)?;
                 let view = derive_view(state, crate::fleet::run::is_alive, now);
                 worker_activity_line(state, view, now)
@@ -716,6 +739,8 @@ impl Console {
             turn_active: self.orch.turn_active || self.orch_transcript.turn_active(),
             exited: self.orch.exited.is_some() || self.orch_transcript.exited(),
             pending_approvals: self.orch.pending_requests.len(),
+            session_uuid: self.orch_key.uuid,
+            session_name: self.session_name(),
         };
         let rows: Vec<RunRow<'_>> = self
             .runs
@@ -730,6 +755,13 @@ impl Console {
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
         }
+    }
+
+    /// What to call the served orchestrator session: its alias, its short
+    /// uuid (until the orchestrator derives an alias), or the legacy
+    /// `orchestrator` spelling for the default session.
+    fn session_name(&self) -> String {
+        session_display_name(self.orch_key.alias.as_deref(), self.orch_key.uuid)
     }
 
     fn worker_transcript_mut(&mut self, run_id: &str) -> &mut Transcript {
@@ -844,7 +876,9 @@ impl Console {
             self.toast(
                 match state.action {
                     ConfirmAction::RemoveWorker { .. } => "· removal cancelled",
-                    ConfirmAction::Shutdown => "· shutdown cancelled",
+                    ConfirmAction::Shutdown | ConfirmAction::ShutdownSession(_) => {
+                        "· shutdown cancelled"
+                    }
                 },
                 false,
             );
@@ -856,6 +890,7 @@ impl Console {
                 vec![Effect::RemoveWorker { run_id, force }]
             }
             ConfirmAction::Shutdown => self.shutdown_effects(),
+            ConfirmAction::ShutdownSession(key) => self.shutdown_effects_for(&key),
         }
     }
 
@@ -873,6 +908,24 @@ impl Console {
         }
         effects.push(Effect::StopOrchestrator);
         effects.push(Effect::Quit);
+        effects
+    }
+
+    /// Stop one named session: abort its live workers and stop its
+    /// orchestrator. The console stays open and no other session is touched.
+    fn shutdown_effects_for(&self, key: &SessionKey) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for summary in crate::fleet::run::list_runs_for_owner(self.fleet.root(), key.uuid) {
+            let Ok(state) = crate::fleet::run::load_state(&summary.run_dir) else {
+                continue;
+            };
+            if Self::is_live(&state) {
+                effects.push(Effect::WorkerAbort {
+                    run_id: summary.run_id,
+                });
+            }
+        }
+        effects.push(Effect::StopSession(key.clone()));
         effects
     }
 
@@ -1160,7 +1213,7 @@ impl Console {
     /// monitor has not written it yet.
     fn open_brief(&mut self) -> Vec<Effect> {
         let (text, placeholder) = match self.selected_target() {
-            SessionTarget::Worker(run_id) => match self.run_state(&run_id) {
+            SessionTarget::Worker { run_id } => match self.run_state(&run_id) {
                 Some(state) if !state.task_brief.trim().is_empty() => {
                     (state.task_brief.clone(), false)
                 }
@@ -1169,7 +1222,7 @@ impl Console {
                     (text, true)
                 }
             },
-            SessionTarget::Orchestrator => {
+            SessionTarget::Orchestrator(_) => {
                 match std::fs::read_to_string(self.fleet.orchestrator_prompt(&self.orch_key)) {
                     Ok(text) if !text.trim().is_empty() => (text, false),
                     _ => (
@@ -1221,8 +1274,8 @@ impl Console {
         }
         let q = query.to_lowercase();
         let blocks: &[crate::tui::transcript::Block] = match self.selected_target() {
-            SessionTarget::Orchestrator => self.orch_transcript.blocks(),
-            SessionTarget::Worker(run_id) => self
+            SessionTarget::Orchestrator(_) => self.orch_transcript.blocks(),
+            SessionTarget::Worker { run_id } => self
                 .worker_transcripts
                 .get(&run_id)
                 .map_or(&[], |t| t.blocks()),
@@ -1407,8 +1460,8 @@ impl Console {
 
     fn open_transcript_blocks_len(&self) -> usize {
         match self.selected_target() {
-            SessionTarget::Orchestrator => self.orch_transcript.blocks().len(),
-            SessionTarget::Worker(run_id) => self
+            SessionTarget::Orchestrator(_) => self.orch_transcript.blocks().len(),
+            SessionTarget::Worker { run_id } => self
                 .worker_transcripts
                 .get(&run_id)
                 .map_or(0, |t| t.blocks().len()),
@@ -1570,8 +1623,8 @@ impl Console {
     fn recompute_completion(&mut self) {
         let ctx = crate::tui::completions::CompletionContext {
             target: match self.selected_target() {
-                SessionTarget::Orchestrator => CompletionTarget::Orchestrator,
-                SessionTarget::Worker(_) => CompletionTarget::Worker,
+                SessionTarget::Orchestrator(_) => CompletionTarget::Orchestrator,
+                SessionTarget::Worker { .. } => CompletionTarget::Worker,
             },
             workers: self
                 .runs
@@ -1591,7 +1644,7 @@ impl Console {
     /// The agent's own commands for whichever session is selected, verbatim.
     fn agent_commands_for_target(&self) -> Vec<AgentCommandOption> {
         match self.selected_target() {
-            SessionTarget::Orchestrator => self
+            SessionTarget::Orchestrator(_) => self
                 .orch
                 .commands
                 .iter()
@@ -1603,7 +1656,7 @@ impl Console {
                     )
                 })
                 .collect(),
-            SessionTarget::Worker(run_id) => self
+            SessionTarget::Worker { run_id } => self
                 .run_state(&run_id)
                 .map(|state| {
                     state
@@ -1642,8 +1695,8 @@ impl Console {
     /// `up`/`down` with no completions open: recall what you sent here.
     fn recall_history(&mut self, delta: i64) {
         let key = match self.selected_target() {
-            SessionTarget::Orchestrator => "orchestrator".to_string(),
-            SessionTarget::Worker(run_id) => run_id,
+            SessionTarget::Orchestrator(_) => self.orch_key.uuid.to_string(),
+            SessionTarget::Worker { run_id } => run_id,
         };
         let entries = self.history.entry(key).or_default();
         if entries.is_empty() {
@@ -1732,7 +1785,7 @@ impl Console {
     }
 
     fn run_state_worker(&self, target: &SessionTarget) -> Option<&RunState> {
-        let SessionTarget::Worker(run_id) = target else {
+        let SessionTarget::Worker { run_id } = target else {
             return None;
         };
         self.run_state(run_id)
@@ -1763,7 +1816,195 @@ impl Console {
     }
 
     // -----------------------------------------------------------------------
-    // Normal-mode session actions
+    // Session commands (`/sessions`, `/session`, `/shutdown <key>`)
+
+    /// `/sessions`: every live session with its alias, short uuid, worker
+    /// count and health — `healthy` from a fresh heartbeat, `wedged` from a
+    /// stale one (its monitor stopped reporting), `no heartbeat` for a row
+    /// that never reported (its monitor never started). The full list goes
+    /// into the transcript to look back at; the toolbar carries a tally.
+    fn show_sessions(&mut self) {
+        let sessions = crate::tui::session_api::list_sessions(self.fleet.root());
+        if sessions.is_empty() {
+            self.notice("· no sessions yet — /session new starts one", false);
+            return;
+        }
+        let counts = self.worker_counts_by_session();
+        let now = crate::util::now_ms();
+        let mut lines = Vec::with_capacity(sessions.len());
+        let mut healthy = 0;
+        let mut wedged = 0;
+        let mut silent = 0;
+        for session in &sessions {
+            let short = crate::util::short_uuid(&session.uuid);
+            let label = match session.alias.as_deref() {
+                Some(alias) => format!("{alias} ({short})"),
+                None => short,
+            };
+            let workers = counts.get(&session.uuid).copied().unwrap_or(0);
+            let (health, state) = session_health(session.last_heartbeat.as_deref(), now);
+            match state {
+                SessionHealth::Healthy => healthy += 1,
+                SessionHealth::Wedged => wedged += 1,
+                SessionHealth::Silent => silent += 1,
+            }
+            let active = session.uuid == self.orch_key.uuid;
+            lines.push(format!(
+                "{}{} · {} worker{} · {}",
+                if active { "▸ " } else { "  " },
+                label,
+                workers,
+                if workers == 1 { "" } else { "s" },
+                health
+            ));
+        }
+        self.orch_transcript.push_notice(&lines.join("\n"));
+        self.toast(
+            format!(
+                "· {} session{} · {healthy} healthy · {wedged} wedged · {silent} without a heartbeat",
+                sessions.len(),
+                if sessions.len() == 1 { "" } else { "s" },
+            ),
+            false,
+        );
+    }
+
+    /// One session's worker count, non-archived runs only: `runs/` is
+    /// scanned as-written for the `/sessions` table, regardless of which
+    /// session the console serves.
+    fn worker_counts_by_session(&self) -> HashMap<Uuid, usize> {
+        let mut counts = HashMap::new();
+        for summary in crate::fleet::run::list_runs(self.fleet.root()) {
+            let Ok(state) = crate::fleet::run::load_state(&summary.run_dir) else {
+                continue;
+            };
+            if state.status == crate::fleet::run::RunStatus::Archived {
+                continue;
+            }
+            if let Some(owner) = state.orchestrator_id {
+                *counts.entry(owner).or_default() += 1;
+            }
+        }
+        counts
+    }
+
+    /// `/session new [alias]` and `/session <uuid-or-alias>`: create or
+    /// resolve a session and point the console at it. The switch itself is
+    /// the runtime's job ([`Effect::SwitchSession`]); here the session is
+    /// recorded as the remembered one and the command is answered.
+    fn session_command(&mut self, argument: &str) -> Vec<Effect> {
+        let mut words = argument.split_whitespace();
+        match words.next() {
+            None => {
+                self.notice(
+                    "· usage: /session new [alias], or /session <uuid-or-alias> — /sessions lists them",
+                    false,
+                );
+                Vec::new()
+            }
+            Some("new") => {
+                let alias: Option<String> = {
+                    let rest: Vec<&str> = words.collect();
+                    (!rest.is_empty()).then(|| rest.join(" "))
+                };
+                match crate::tui::session_api::create_session(self.fleet.root(), alias.as_deref()) {
+                    Ok(session) => {
+                        self.prefs.last_session = Some(session.uuid.to_string());
+                        let label = session_display_name(session.alias.as_deref(), session.uuid);
+                        self.notice(
+                            format!(
+                                "· new session {label} — the orchestrator derives an alias from its first prompt"
+                            ),
+                            false,
+                        );
+                        vec![Effect::SavePrefs, Effect::SwitchSession(session.key())]
+                    }
+                    Err(err) => {
+                        self.notice(format!("! creating a session: {err:#}"), true);
+                        Vec::new()
+                    }
+                }
+            }
+            Some(key) => {
+                let Some(session) = crate::tui::session_api::session_by_key(self.fleet.root(), key)
+                else {
+                    self.notice(
+                        "! no session matches — /sessions lists them (an alias shared by several sessions is ambiguous)",
+                        true,
+                    );
+                    return Vec::new();
+                };
+                if session.uuid == self.orch_key.uuid {
+                    self.toast("· already on this session", false);
+                    return Vec::new();
+                }
+                let label = session_display_name(session.alias.as_deref(), session.uuid);
+                self.notice(
+                    format!("· switched to {label} — /sessions lists every session"),
+                    false,
+                );
+                self.prefs.last_session = Some(session.uuid.to_string());
+                vec![Effect::SavePrefs, Effect::SwitchSession(session.key())]
+            }
+        }
+    }
+
+    /// `/shutdown` with no argument stops the active session and closes the
+    /// console (the classic `Q`); with a key it stops that session only —
+    /// its workers aborted, its orchestrator told to stop — and the console
+    /// stays open, so other sessions and their workers are untouched.
+    fn shutdown_command(&mut self, argument: &str) -> Vec<Effect> {
+        let (message, action) = if argument.is_empty() {
+            (self.shutdown_question(), ConfirmAction::Shutdown)
+        } else if let Some(session) =
+            crate::tui::session_api::session_by_key(self.fleet.root(), argument)
+        {
+            if session.uuid == self.orch_key.uuid {
+                // naming the active session is the same shutdown
+                (self.shutdown_question(), ConfirmAction::Shutdown)
+            } else {
+                let live = self.live_worker_count_for(session.uuid);
+                let label = session_display_name(session.alias.as_deref(), session.uuid);
+                (
+                    format!(
+                        "Stop {label}'s orchestrator and its {live} running {}? Worktrees and branches are kept; the console stays open.",
+                        if live == 1 { "worker" } else { "workers" }
+                    ),
+                    ConfirmAction::ShutdownSession(session.key()),
+                )
+            }
+        } else {
+            self.notice(
+                "! no session <uuid-or-alias> matches — /sessions lists them",
+                true,
+            );
+            return Vec::new();
+        };
+        self.overlay = Some(Overlay::Confirm(ConfirmState { message, action }));
+        Vec::new()
+    }
+
+    /// Reset the console onto another session: new key, fresh transcripts;
+    /// the runtime follows up by re-anchoring the polls on that key
+    /// ([`Effect::SwitchSession`]), which is what actually repopulates the
+    /// rows, runs and orchestrator state.
+    pub fn begin_session(&mut self, key: &SessionKey) {
+        self.orch_key = key.clone();
+        self.orch_transcript = Transcript::new();
+        self.worker_transcripts.clear();
+        self.diff_stats.clear();
+        self.runs.clear();
+        self.rows.clear();
+        self.selected = 0;
+        self.view = View::Dashboard;
+        self.scroll = None;
+        self.search = None;
+        self.permission_answers.clear();
+        self.pending_effort = None;
+        self.pending_thinking.clear();
+        self.composer.answering = None;
+        self.flash = None;
+    }
 
     fn name_of(&self, run_id: &str) -> String {
         self.run_state(run_id)
@@ -1788,6 +2029,18 @@ impl Console {
             .count()
     }
 
+    /// How many of another session's workers are live, for the `/shutdown
+    /// <key>` confirmation.
+    fn live_worker_count_for(&self, owner: Uuid) -> usize {
+        crate::fleet::run::list_runs_for_owner(self.fleet.root(), owner)
+            .iter()
+            .filter(|summary| {
+                crate::fleet::run::load_state(&summary.run_dir)
+                    .is_ok_and(|state| Self::is_live(&state))
+            })
+            .count()
+    }
+
     fn shutdown_question(&self) -> String {
         let live = self.live_worker_count();
         format!(
@@ -1799,7 +2052,7 @@ impl Console {
     /// `a`: answer the selected session's pending question or dialog.
     fn answer_selected(&mut self) -> Vec<Effect> {
         match self.selected_target() {
-            SessionTarget::Orchestrator => {
+            SessionTarget::Orchestrator(_) => {
                 if self.orch.pending_requests.is_empty() {
                     self.toast("! the orchestrator has nothing waiting for an answer", true);
                     return Vec::new();
@@ -1826,7 +2079,7 @@ impl Console {
                 }));
                 Vec::new()
             }
-            SessionTarget::Worker(run_id) => {
+            SessionTarget::Worker { run_id } => {
                 let Some(state) = self.run_state(&run_id).cloned() else {
                     self.toast("! that worker is gone", true);
                     return Vec::new();
@@ -1878,7 +2131,7 @@ impl Console {
     /// `s`: stop the selected session.
     fn stop_selected(&mut self) -> Vec<Effect> {
         match self.selected_target() {
-            SessionTarget::Orchestrator => {
+            SessionTarget::Orchestrator(_) => {
                 if self.orch.turn_active || self.orch_transcript.turn_active() {
                     self.toast("· interrupt requested", false);
                     return vec![Effect::Interrupt];
@@ -1886,7 +2139,7 @@ impl Console {
                 self.toast("· the orchestrator is idle", false);
                 Vec::new()
             }
-            SessionTarget::Worker(run_id) => {
+            SessionTarget::Worker { run_id } => {
                 let Some(state) = self.run_state(&run_id).cloned() else {
                     self.toast("! that worker is gone", true);
                     return Vec::new();
@@ -1907,7 +2160,7 @@ impl Console {
 
     /// `x`: remove the selected worker, asking first.
     fn remove_selected(&mut self) -> Vec<Effect> {
-        let SessionTarget::Worker(run_id) = self.selected_target() else {
+        let SessionTarget::Worker { run_id } = self.selected_target() else {
             self.toast("! /remove needs a worker selected", true);
             return Vec::new();
         };
@@ -1937,14 +2190,14 @@ impl Console {
     /// `t`: cycle the selected session's thinking level.
     fn cycle_thinking(&mut self) -> Vec<Effect> {
         match self.selected_target() {
-            SessionTarget::Orchestrator => {
+            SessionTarget::Orchestrator(_) => {
                 let current = self.effort().map(str::to_string);
                 let next = next_level(&CLAUDE_EFFORT_LEVELS, current.as_deref());
                 self.pending_effort = Some(next.clone());
                 self.toast(format!("· thinking {next}"), false);
                 vec![Effect::SetEffort(next)]
             }
-            SessionTarget::Worker(run_id) => {
+            SessionTarget::Worker { run_id } => {
                 let Some(state) = self.run_state(&run_id).cloned() else {
                     self.toast("! that worker is gone", true);
                     return Vec::new();
@@ -2002,10 +2255,10 @@ impl Console {
     /// or a worker `model` envelope; claude validates its own names.
     fn model_effect(&self, model_id: &str, provider: Option<String>) -> Vec<Effect> {
         match self.selected_target() {
-            SessionTarget::Orchestrator => {
+            SessionTarget::Orchestrator(_) => {
                 vec![Effect::SetOrchestratorModel(model_id.to_string())]
             }
-            SessionTarget::Worker(run_id) => vec![Effect::WorkerModel {
+            SessionTarget::Worker { run_id } => vec![Effect::WorkerModel {
                 run_id,
                 model_id: model_id.to_string(),
                 provider,
@@ -2038,27 +2291,29 @@ impl Console {
             }];
         }
         // the console's global commands work wherever the selection is
-        let head = text.split(' ').next().unwrap_or("");
+        let (head, argument) = match text.split_once(' ') {
+            Some((head, rest)) => (head, rest.trim()),
+            None => (text.as_str(), ""),
+        };
         match resolve_command(head).map(|spec| spec.name) {
             Some("/quit") => return vec![Effect::Quit],
             Some("/help") => {
                 self.overlay = Some(Overlay::Help);
                 return Vec::new();
             }
-            Some("/shutdown") => {
-                self.overlay = Some(Overlay::Confirm(ConfirmState {
-                    message: self.shutdown_question(),
-                    action: ConfirmAction::Shutdown,
-                }));
+            Some("/shutdown") => return self.shutdown_command(argument),
+            Some("/sessions") => {
+                self.show_sessions();
                 return Vec::new();
             }
-            Some("/rail") => return self.set_rail(text.split_once(' ').map(|(_, rest)| rest)),
+            Some("/session") => return self.session_command(argument),
+            Some("/rail") => return self.set_rail((!argument.is_empty()).then_some(argument)),
             _ => {}
         }
         self.remember_history(&text);
         match self.selected_target() {
-            SessionTarget::Worker(run_id) => self.submit_to_worker(&run_id, &text),
-            SessionTarget::Orchestrator => self.submit_to_orchestrator(&text),
+            SessionTarget::Worker { run_id } => self.submit_to_worker(&run_id, &text),
+            SessionTarget::Orchestrator(_) => self.submit_to_orchestrator(&text),
         }
     }
 
@@ -2085,8 +2340,8 @@ impl Console {
 
     fn remember_history(&mut self, text: &str) {
         let key = match self.selected_target() {
-            SessionTarget::Orchestrator => "orchestrator".to_string(),
-            SessionTarget::Worker(run_id) => run_id,
+            SessionTarget::Orchestrator(_) => self.orch_key.uuid.to_string(),
+            SessionTarget::Worker { run_id } => run_id,
         };
         let entries = self.history.entry(key).or_default();
         if entries.last().map(String::as_str) != Some(text) {
@@ -2446,6 +2701,14 @@ impl Console {
                 Effect::StopOrchestrator => {
                     self.append_orchestrator(&OrchestratorCommand::Stop)?;
                 }
+                Effect::StopSession(key) => {
+                    self.append_orchestrator_to(&key, &OrchestratorCommand::Stop)?;
+                }
+                Effect::SwitchSession(_) => {
+                    // the runtime's event loop watches for it: nothing to
+                    // carry out here (it re-anchors the polls, watcher and
+                    // monitor, which live in `runtime.rs`)
+                }
                 Effect::WorkerSteer { run_id, message } => {
                     crate::ops::steer::send(&run_id, Some(&repo_root), &message).await?;
                 }
@@ -2510,8 +2773,21 @@ impl Console {
     }
 
     fn append_orchestrator(&self, command: &OrchestratorCommand) -> std::io::Result<()> {
+        self.append_orchestrator_to(&self.orch_key, command)
+    }
+
+    /// Write one envelope into a session's inbox; [`Console::append_orchestrator`]
+    /// is the console's own session, [`Console::append_orchestrator_to`] any
+    /// named one (a `/shutdown <key>` of another session). The `to` party
+    /// rides the legacy default spelling either way; the physical inbox the
+    /// envelope lands in is what routes it.
+    fn append_orchestrator_to(
+        &self,
+        key: &SessionKey,
+        command: &OrchestratorCommand,
+    ) -> std::io::Result<()> {
         let envelope = command.to_envelope(Party::Console);
-        append_envelope(&self.fleet.orchestrator_inbox(&self.orch_key), &envelope)
+        append_envelope(&self.fleet.orchestrator_inbox(key), &envelope)
     }
 }
 
@@ -2667,6 +2943,7 @@ mod tests {
         PendingDialog, PendingQuestion, RunStatus, WorkerCommand, WorkerModel,
     };
     use crate::orch::protocol::{AgentCommand, CanUseToolRequest, McpServerStatus};
+    use crate::orch::session::OrchestratorSession;
     use crossterm::event::{KeyCode, KeyModifiers};
 
     fn test_console() -> Console {
@@ -2773,7 +3050,9 @@ mod tests {
         assert_eq!(c.selected(), 1);
         assert_eq!(
             c.selected_target(),
-            SessionTarget::Worker("auth-20260830000000".into())
+            SessionTarget::Worker {
+                run_id: "auth-20260830000000".into()
+            }
         );
         assert!(c.select_target("orchestrator"));
         assert_eq!(c.selected(), 0);
@@ -3877,6 +4156,264 @@ mod tests {
         assert_eq!(edit_distance("kitten", "sitting"), 3);
         assert_eq!(edit_distance("", "abc"), 3);
         assert_eq!(edit_distance("same", "same"), 0);
+    }
+
+    // -- sessions -----------------------------------------------------------
+
+    /// Persist sessions into the console's fleet, the way the orchestrator
+    /// slice's store does.
+    fn write_sessions(c: &Console, sessions: Vec<OrchestratorSession>) {
+        let mut store = crate::orch::session::FleetSessions::new();
+        for session in sessions {
+            store.upsert(session);
+        }
+        crate::orch::session::save(c.fleet.root(), &mut store).unwrap();
+    }
+
+    /// Persist a running run owned by `owner` into the console's fleet.
+    fn write_run(c: &Console, run_id: &str, name: &str, owner: Uuid) {
+        let mut entry = running_run(run_id, name);
+        entry.state.orchestrator_id = Some(owner);
+        let dir = c.fleet.run_dir(run_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::fleet::run::save_state(&dir, &entry.state).unwrap();
+    }
+
+    #[test]
+    fn selected_target_and_rows_carry_the_served_session_uuid() {
+        let mut c = test_console();
+        let key = SessionKey::new(Some("docs".into()), Uuid::new_v4());
+        c.orch_key = key.clone();
+        c.set_runs(vec![running_run("auth-20260830000000", "auth")]);
+        assert_eq!(
+            c.rows()[0].target,
+            SessionTarget::Orchestrator(key.uuid),
+            "the orchestrator row names its session"
+        );
+        assert_eq!(c.rows()[0].name, "docs");
+        assert_eq!(c.selected_target(), SessionTarget::Orchestrator(key.uuid));
+        assert_eq!(c.selected_target().key(), "orchestrator");
+
+        // a session without an alias is shown by its short uuid until one
+        // appears, and the composer prompt follows
+        let key = SessionKey::new(None, Uuid::new_v4());
+        c.orch_key = key.clone();
+        c.set_runs(Vec::new());
+        let short = crate::util::short_uuid(&key.uuid);
+        assert_eq!(c.rows()[0].name, short);
+        assert_eq!(c.composer_prompt(), format!("{short} > "));
+        // the legacy default session keeps the old spelling
+        c.orch_key = SessionKey::default();
+        c.set_runs(Vec::new());
+        assert_eq!(c.rows()[0].name, "orchestrator");
+        assert_eq!(c.composer_prompt(), "orchestrator > ");
+    }
+
+    #[test]
+    fn sessions_with_no_rows_says_so() {
+        let mut c = test_console();
+        let effects = c.submit("/sessions");
+        assert!(effects.is_empty());
+        assert!(c.flash().unwrap().text.contains("no sessions yet"));
+    }
+
+    #[test]
+    fn sessions_lists_alias_short_uuid_workers_and_health() {
+        use time::{Duration, OffsetDateTime};
+
+        let mut c = test_console();
+        let mut healthy = OrchestratorSession::new("/repo");
+        healthy.alias = Some("add-auth".into());
+        healthy.last_heartbeat = Some(crate::util::now_iso());
+        let mut wedged = OrchestratorSession::new("/repo");
+        wedged.alias = Some("stale".into());
+        wedged.last_heartbeat = Some(crate::util::iso_at(
+            OffsetDateTime::now_utc() - Duration::minutes(10),
+        ));
+        let silent = OrchestratorSession::new("/repo"); // no alias, no heartbeat
+        write_sessions(&c, vec![healthy.clone(), wedged.clone(), silent.clone()]);
+        write_run(&c, "auth-20260830000000", "auth", healthy.uuid);
+
+        let effects = c.submit("/sessions");
+        assert!(effects.is_empty());
+        let text = c
+            .orchestrator_transcript()
+            .blocks()
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("add-auth"), "{text}");
+        assert!(
+            text.contains(&crate::util::short_uuid(&healthy.uuid)),
+            "{text}"
+        );
+        assert!(text.contains("1 worker"), "{text}");
+        assert!(text.contains("· healthy"), "{text}");
+        assert!(text.contains("stale ("), "{text}");
+        assert!(text.contains("· wedged"), "{text}");
+        assert!(text.contains("· no heartbeat"), "{text}");
+        // the toolbar carries a tally, one line
+        let flash = c.flash().unwrap();
+        assert!(
+            flash
+                .text
+                .contains("3 sessions · 1 healthy · 1 wedged · 1 without a heartbeat"),
+            "{}",
+            flash.text
+        );
+    }
+
+    #[test]
+    fn session_new_creates_a_session_and_switches_to_it() {
+        let mut c = test_console();
+        let effects = c.submit("/session new");
+        assert_eq!(effects.len(), 2, "{effects:?}");
+        assert!(matches!(&effects[0], Effect::SavePrefs));
+        let Effect::SwitchSession(key) = &effects[1] else {
+            panic!("expected a switch: {effects:?}");
+        };
+        assert!(
+            key.alias.is_none(),
+            "no alias: none until the orchestrator derives it"
+        );
+        assert!(!key.uuid.is_nil());
+        let store = crate::orch::session::load(c.fleet.root()).unwrap();
+        assert!(
+            store.sessions.contains_key(&key.uuid),
+            "the row is persisted"
+        );
+        assert_eq!(
+            c.prefs().last_session.as_deref(),
+            Some(key.uuid.to_string().as_str()),
+            "the new session becomes the remembered one"
+        );
+
+        let effects = c.submit("/session new db-ops");
+        let Effect::SwitchSession(key) = &effects[1] else {
+            panic!("{effects:?}");
+        };
+        assert_eq!(key.alias.as_deref(), Some("db-ops"));
+    }
+
+    #[test]
+    fn session_switch_resolves_uuid_then_alias_and_refuses_unknown() {
+        let mut c = test_console();
+        let session =
+            crate::tui::session_api::create_session(c.fleet.root(), Some("add-auth")).unwrap();
+
+        // by uuid
+        let effects = c.submit(&format!("/session {}", session.uuid));
+        assert!(matches!(
+            &effects[1],
+            Effect::SwitchSession(key) if key.uuid == session.uuid
+        ));
+        assert_eq!(
+            c.prefs().last_session.as_deref(),
+            Some(session.uuid.to_string().as_str())
+        );
+        // by alias
+        let effects = c.submit("/session add-auth");
+        assert!(matches!(
+            &effects[1],
+            Effect::SwitchSession(key) if key.uuid == session.uuid
+        ));
+        // switching to the session already served is a no-op
+        c.orch_key = session.key();
+        let effects = c.submit("/session add-auth");
+        assert!(effects.is_empty());
+        assert!(c.flash().unwrap().text.contains("already on this session"));
+        // unknown keys are refused, not guessed
+        let effects = c.submit("/session nope");
+        assert!(effects.is_empty());
+        assert!(c.flash().unwrap().text.contains("no session matches"));
+        // bare /session shows the usage
+        let effects = c.submit("/session");
+        assert!(effects.is_empty());
+        assert!(c.flash().unwrap().text.contains("usage: /session"));
+    }
+
+    #[test]
+    fn shutdown_with_a_key_stops_only_that_session() {
+        let mut c = test_console();
+        let mut mine = OrchestratorSession::new("/repo");
+        mine.alias = Some("mine".into());
+        c.orch_key = mine.key();
+        write_sessions(&c, vec![mine.clone()]);
+        write_run(&c, "db-20260829120000", "db", mine.uuid);
+        let other = crate::tui::session_api::create_session(c.fleet.root(), Some("docs")).unwrap();
+        write_run(&c, "docs-20260829120001", "docs", other.uuid);
+        c.set_runs(vec![running_run("db-20260829120000", "db")]);
+
+        let effects = c.submit("/shutdown docs");
+        assert!(effects.is_empty(), "waits for confirmation");
+        let Overlay::Confirm(confirm) = c.overlay().unwrap() else {
+            panic!("expected a confirm");
+        };
+        assert!(confirm.message.contains("docs"), "{}", confirm.message);
+        assert_eq!(confirm.action, ConfirmAction::ShutdownSession(other.key()));
+
+        let effects = c.handle_key(ch('y'));
+        assert!(effects.contains(&Effect::WorkerAbort {
+            run_id: "docs-20260829120001".into(),
+        }));
+        assert!(effects.contains(&Effect::StopSession(other.key())));
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                Effect::WorkerAbort { run_id, .. } if run_id == "db-20260829120000"
+            )),
+            "the active session's workers are untouched: {effects:?}"
+        );
+        assert!(!effects.contains(&Effect::Quit), "the console stays open");
+    }
+
+    #[test]
+    fn shutdown_naming_the_active_session_is_the_classic_shutdown() {
+        let mut c = test_console();
+        let active = crate::tui::session_api::create_session(c.fleet.root(), None).unwrap();
+        c.orch_key = active.key();
+        let _effects = c.submit(&format!("/shutdown {}", active.uuid));
+        let Overlay::Confirm(confirm) = c.overlay().unwrap() else {
+            panic!("expected a confirm");
+        };
+        assert_eq!(confirm.action, ConfirmAction::Shutdown);
+        let effects = c.handle_key(ch('y'));
+        assert!(effects.contains(&Effect::StopOrchestrator));
+        assert!(effects.contains(&Effect::Quit));
+    }
+
+    #[test]
+    fn shutdown_with_an_unknown_key_is_refused() {
+        let mut c = test_console();
+        let effects = c.submit("/shutdown nobody");
+        assert!(effects.is_empty());
+        assert!(c.overlay().is_none());
+        assert!(c.flash().unwrap().text.contains("no session"));
+    }
+
+    #[test]
+    fn begin_session_resets_console_state_for_the_new_session() {
+        let mut c = setup_with_worker();
+        c.orch_transcript.push_sent("hello");
+        c.handle_key(enter()); // in the session view now
+        c.toast("a note", false);
+        let other = crate::tui::session_api::create_session(c.fleet.root(), Some("docs")).unwrap();
+        c.begin_session(&other.key());
+        assert_eq!(c.orch_key, other.key());
+        assert_eq!(c.view(), View::Dashboard);
+        assert!(
+            c.runs.is_empty(),
+            "the new session's runs arrive with the feeds"
+        );
+        assert!(c.rows().is_empty());
+        assert!(c.worker_transcripts.is_empty());
+        assert!(c.orch_transcript.blocks().is_empty());
+        assert_eq!(c.selected(), 0);
+        assert!(
+            c.flash().is_none(),
+            "the old session's notes do not carry over"
+        );
     }
 
     #[test]

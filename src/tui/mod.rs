@@ -63,6 +63,7 @@ pub mod markdown;
 pub mod model;
 pub mod palette;
 pub mod runtime;
+pub mod session_api;
 pub mod theme;
 pub mod transcript;
 pub mod view;

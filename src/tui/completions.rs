@@ -81,6 +81,20 @@ pub const COMMANDS: &[CommandSpec] = &[
         aliases: &["/rm", "/r"],
     },
     CommandSpec {
+        name: "/session",
+        detail: "switch sessions: /session new [alias], or /session <uuid-or-alias>",
+        takes_argument: true,
+        worker_only: false,
+        aliases: &[],
+    },
+    CommandSpec {
+        name: "/sessions",
+        detail: "list every session: alias, short uuid, workers, health",
+        takes_argument: false,
+        worker_only: false,
+        aliases: &[],
+    },
+    CommandSpec {
         name: "/thinking",
         detail: "set the reasoning level of the selected session",
         takes_argument: true,
@@ -124,7 +138,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/shutdown",
-        detail: "stop the orchestrator and every worker, then exit",
+        detail: "stop a session's orchestrator and its workers: bare = this one, then exit",
         takes_argument: false,
         worker_only: false,
         aliases: &["/sd"],
@@ -242,7 +256,7 @@ pub struct CompletionContext {
 }
 
 /// The console's own commands must all fit, with room for the agent's.
-pub const MAX_SUGGESTIONS: usize = 12;
+pub const MAX_SUGGESTIONS: usize = 16;
 
 /// What to offer for the current input, or `None` when nothing applies.
 #[must_use]
@@ -495,6 +509,29 @@ mod tests {
         assert_eq!(answer.value, "/answer ");
         let stop = state.items.iter().find(|s| s.label == "/stop").unwrap();
         assert_eq!(stop.value, "/stop");
+    }
+
+    #[test]
+    fn session_commands_are_offered_everywhere_with_their_argument_hint() {
+        // the session surface is console-wide: offered on both targets
+        for target in [CompletionTarget::Orchestrator, CompletionTarget::Worker] {
+            let state = completions_for("/", &ctx(target)).unwrap();
+            let labels: Vec<&str> = state.items.iter().map(|s| s.label.as_str()).collect();
+            assert!(labels.contains(&"/sessions"), "{labels:?}");
+            assert!(labels.contains(&"/session"), "{labels:?}");
+            assert!(labels.contains(&"/shutdown"));
+        }
+        // every console command fits, with room for the agent's
+        assert!(
+            COMMANDS.len() <= MAX_SUGGESTIONS,
+            "the cap must hold them all"
+        );
+        // /session takes an argument: accepting it opens the composer
+        let state = completions_for("/session", &ctx(CompletionTarget::Orchestrator)).unwrap();
+        assert_eq!(state.items[0].label, "/session");
+        assert_eq!(state.items[0].value, "/session ", "an argument follows");
+        // aliases still resolve
+        assert_eq!(resolve_command("/sd").unwrap().name, "/shutdown");
     }
 
     #[test]
