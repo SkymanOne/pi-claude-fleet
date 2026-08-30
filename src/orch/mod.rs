@@ -12,4 +12,5 @@ pub mod process;
 pub mod prompt;
 pub mod protocol;
 pub mod records;
+pub mod session;
 pub mod watcher;
