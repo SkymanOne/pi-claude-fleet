@@ -28,7 +28,7 @@ use crate::cli::ExitCode;
 use crate::orch::records::{EventRecord, OrchestratorState};
 use crate::orch::watcher::{FleetWatcher, FleetWatcherOptions};
 use crate::paths::FleetPaths;
-use crate::tui::app::{Console, Effect, RunEntry};
+use crate::tui::app::{Console, Effect, RunEntry, TuiOptions};
 use crate::tui::completions::list_repo_files;
 use crate::tui::theme::Palette;
 use crate::tui::view::{self, Feeds};
@@ -274,12 +274,12 @@ impl Poll {
 /// `orchestrator/claude.log`.
 ///
 /// Returns whether a monitor was started (`false`: one was already running
-/// and this console is attaching). Launch flags — model, budget, permission
-/// mode, Remote Control — are not part of the frozen `orchestrator-monitor`
-/// CLI yet, so they ride unused for now; the integration step wires them
-/// through (the console can still set model, effort and permission mode live
-/// once attached).
-fn ensure_orchestrator(fleet: &FleetPaths) -> anyhow::Result<bool> {
+/// and this console is attaching). The frozen `orchestrator-monitor` CLI
+/// takes only `--fleet-dir`, so before spawning, the console's launch flags
+/// are recorded in the session store ([`crate::orch::session::LaunchOptions`])
+/// where the monitor's boot reads them; on attach they are left alone so a
+/// running monitor keeps whatever it was launched or live-changed to.
+fn ensure_orchestrator(fleet: &FleetPaths, options: &TuiOptions) -> anyhow::Result<bool> {
     let state = std::fs::read_to_string(fleet.orchestrator_state())
         .ok()
         .and_then(|raw| serde_json::from_str::<OrchestratorState>(&raw).ok());
@@ -288,6 +288,7 @@ fn ensure_orchestrator(fleet: &FleetPaths) -> anyhow::Result<bool> {
     {
         return Ok(false);
     }
+    record_launch_options(fleet, options);
     let exe = std::env::current_exe().context("finding the parl binary")?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -305,6 +306,35 @@ fn ensure_orchestrator(fleet: &FleetPaths) -> anyhow::Result<bool> {
         .spawn()
         .context("spawning the orchestrator monitor")?;
     Ok(true)
+}
+
+/// Record the console's launch flags for the monitor it is about to spawn.
+/// The channel is the session store's `launch` record — the monitor CLI takes
+/// nothing but `--fleet-dir`, and its boot applies what is written here (the
+/// monitor writes its own mode changes back, so a restarted monitor keeps
+/// running the way the last one did). Same parsing as the ops client's
+/// spawn: the budget rides in as a display string and leaves as dollars.
+fn record_launch_options(fleet: &FleetPaths, options: &TuiOptions) {
+    let mut session = if fleet.fleet_json().exists() {
+        let Some(session) = crate::orch::session::load(fleet.root()) else {
+            return;
+        };
+        session
+    } else {
+        crate::orch::session::OrchestratorSession::new(&repo_cwd(fleet))
+    };
+    session.launch = crate::orch::session::LaunchOptions {
+        model: options.model.clone(),
+        budget_usd: options
+            .budget
+            .as_deref()
+            .and_then(|budget| budget.trim().parse::<f64>().ok())
+            .filter(|usd| *usd > 0.0),
+        permission_mode: options.permission_mode.clone(),
+        remote_control: options.remote_control.clone(),
+        fresh: Some(options.fresh),
+    };
+    let _ = crate::orch::session::save(fleet.root(), &mut session);
 }
 
 /// Raw mode means ctrl-c never becomes SIGINT: the runtime reads it as the
@@ -328,6 +358,7 @@ pub async fn run_console(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     fleet: FleetPaths,
     lock: &ConsoleLock,
+    options: TuiOptions,
 ) -> anyhow::Result<ExitCode> {
     let repo_root = fleet.root().parent().unwrap_or(fleet.root()).to_path_buf();
     let mut console = Console::new(fleet.clone());
@@ -344,6 +375,7 @@ pub async fn run_console(
         FleetWatcher::new(FleetWatcherOptions {
             fleet_dir: fleet.root().to_path_buf(),
             cursors,
+            progress_events: options.progress_events,
             ..FleetWatcherOptions::default()
         }),
     );
@@ -354,7 +386,7 @@ pub async fn run_console(
     poll.tail_events(&mut console);
     console.set_files(list_repo_files(&repo_root).await);
 
-    let started = match ensure_orchestrator(&fleet) {
+    let started = match ensure_orchestrator(&fleet, &options) {
         Ok(true) => {
             console.notice("· orchestrator monitor started", false);
             true
@@ -537,16 +569,72 @@ mod tests {
     }
 
     #[test]
-    fn ensure_orchestrator_attaches_to_a_live_monitor_pid() {
+    fn attaching_leaves_the_running_monitors_launch_record_alone() {
         let (_dir, fleet) = tmp_fleet();
         std::fs::create_dir_all(fleet.orchestrator_dir()).unwrap();
+        // a live monitor that was launched with its own flags
+        let mut record = crate::orch::session::OrchestratorSession::new("/repo");
+        record.launch.model = Some("sonnet".into());
+        record.pid = Some(std::process::id() as i32);
+        crate::orch::session::save(fleet.root(), &mut record).unwrap();
         let state = OrchestratorState {
             pid: Some(std::process::id() as i32),
             ..OrchestratorState::default()
         };
         crate::util::atomic_write_json(&fleet.orchestrator_state(), &state).unwrap();
-        // our own pid is alive: no spawn
-        assert!(!ensure_orchestrator(&fleet).unwrap());
+
+        // our own pid is alive: attach, and the recorded flags are untouched
+        // — even though this console was opened with a different model
+        assert!(!ensure_orchestrator(&fleet, &tui_options(Some("fable"))).unwrap());
+        let session = crate::orch::session::load(fleet.root()).unwrap();
+        assert_eq!(session.launch.model.as_deref(), Some("sonnet"));
+    }
+
+    /// A `TuiOptions` with just the fields a test names; `main.rs` builds it
+    /// verbatim, so the field set is the frozen contract.
+    fn tui_options(model: Option<&str>) -> TuiOptions {
+        TuiOptions {
+            cwd: None,
+            model: model.map(str::to_string),
+            permission_mode: None,
+            remote_control: None,
+            fresh: false,
+            budget: None,
+            progress_events: false,
+        }
+    }
+
+    #[test]
+    fn spawning_a_monitor_records_the_launch_flags_in_the_session_store() {
+        let (_dir, fleet) = tmp_fleet();
+        std::fs::create_dir_all(fleet.orchestrator_dir()).unwrap();
+        // no monitor alive: the spawn path records the flags it was given
+        let mut options = tui_options(Some("fable"));
+        options.budget = Some(" 2.5 ".into());
+        options.permission_mode = Some("acceptEdits".into());
+        options.remote_control = Some("".into());
+        options.fresh = true;
+        assert!(ensure_orchestrator(&fleet, &options).unwrap());
+        let session = crate::orch::session::load(fleet.root()).unwrap();
+        assert_eq!(session.launch.model.as_deref(), Some("fable"));
+        assert_eq!(session.launch.budget_usd, Some(2.5));
+        assert_eq!(
+            session.launch.permission_mode.as_deref(),
+            Some("acceptEdits")
+        );
+        assert_eq!(session.launch.remote_control.as_deref(), Some(""));
+        assert_eq!(session.launch.fresh, Some(true));
+    }
+
+    #[test]
+    fn a_launch_record_without_flags_reads_as_claude_defaults() {
+        let (_dir, fleet) = tmp_fleet();
+        std::fs::create_dir_all(fleet.orchestrator_dir()).unwrap();
+        assert!(ensure_orchestrator(&fleet, &tui_options(None)).unwrap());
+        let session = crate::orch::session::load(fleet.root()).unwrap();
+        assert_eq!(session.launch.model, None);
+        assert_eq!(session.launch.budget_usd, None, "no budget: no dollars");
+        assert_eq!(session.launch.fresh, Some(false));
     }
 
     // -- the watcher seam ---------------------------------------------------

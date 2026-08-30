@@ -2460,7 +2460,8 @@ pub async fn run_app(options: TuiOptions) -> anyhow::Result<crate::cli::ExitCode
     crate::tui::runtime::install_panic_hook();
     let mut terminal = crate::tui::runtime::enter()?;
 
-    let result = crate::tui::runtime::run_console(&mut terminal, fleet.clone(), &lock).await;
+    let result =
+        crate::tui::runtime::run_console(&mut terminal, fleet.clone(), &lock, options).await;
 
     // the terminal comes back before anything prints, whatever happened
     crate::tui::runtime::restore();
