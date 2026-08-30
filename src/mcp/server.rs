@@ -61,6 +61,11 @@ pub const FLEET_TOOL_NAMES: [&str; 13] = [
 pub const SERVER_NAME: &str = "fleet";
 /// Serve the fleet tools over stdio until the client disconnects. A client
 /// that closes stdin without initializing has disconnected, not failed.
+///
+/// # Errors
+///
+/// Fails when the stdio transport cannot start or the server errors after
+/// initialization; a client that disconnects before `initialize` exits 0.
 pub async fn serve_stdio(cwd: Option<&Path>) -> anyhow::Result<ExitCode> {
     let server = FleetServer::new(cwd.map(Path::to_path_buf));
     let running = match server.serve(rmcp::transport::stdio()).await {
@@ -92,7 +97,7 @@ pub struct FleetServer {
 
 impl FleetServer {
     /// A server for `cwd` (the repo being orchestrated).
-    pub fn new(cwd: Option<PathBuf>) -> Self {
+    pub const fn new(cwd: Option<PathBuf>) -> Self {
         Self {
             cwd,
             pinned_parl_dir: None,
@@ -104,7 +109,7 @@ impl FleetServer {
     /// pin their own fleet dir so an ambient variable cannot redirect the
     /// tools to an unrelated fleet.
     #[doc(hidden)]
-    pub fn with_parl_dir(cwd: Option<PathBuf>, parl_dir: Option<String>) -> Self {
+    pub const fn with_parl_dir(cwd: Option<PathBuf>, parl_dir: Option<String>) -> Self {
         Self {
             cwd,
             pinned_parl_dir: parl_dir,
@@ -170,7 +175,7 @@ impl FleetServer {
                 let structured = structured_data(&r);
                 Ok(render_result(&r, structured))
             }
-            Err(err) => Ok(render_error(err)),
+            Err(err) => Ok(render_error(&err)),
         }
     }
 
@@ -190,7 +195,7 @@ impl FleetServer {
                 let structured = structured_data(&r);
                 Ok(render_result(&r, structured))
             }
-            Err(err) => Ok(render_error(err)),
+            Err(err) => Ok(render_error(&err)),
         }
     }
 
@@ -199,25 +204,25 @@ impl FleetServer {
         let timeout = opt_u64(args, "timeoutSec", 1, Some(600))?.unwrap_or(120);
         match wait_core_with_env(&name, self.cwd(), timeout, self.parl_dir().as_deref()).await {
             Ok(r) => Ok(render_result(&r, None)),
-            Err(err) => Ok(render_error(err)),
+            Err(err) => Ok(render_error(&err)),
         }
     }
 
     async fn fleet_output(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let name = req_str(args, "name")?;
-        let tail = opt_u64(args, "tail", 1, None)?.map(|n| n as usize);
+        let tail = tail_arg(args, "tail")?;
         match output_core_with_env(&name, self.cwd(), tail, self.parl_dir().as_deref()).await {
             Ok(r) => Ok(render_result(&r, None)),
-            Err(err) => Ok(render_error(err)),
+            Err(err) => Ok(render_error(&err)),
         }
     }
 
     async fn fleet_logs(&self, args: &JsonObject) -> Result<CallToolResult, McpError> {
         let name = req_str(args, "name")?;
-        let tail = opt_u64(args, "tail", 1, None)?.map(|n| n as usize);
+        let tail = tail_arg(args, "tail")?;
         match logs_core_with_env(&name, self.cwd(), tail, self.parl_dir().as_deref()).await {
             Ok(r) => Ok(render_result(&r, None)),
-            Err(err) => Ok(render_error(err)),
+            Err(err) => Ok(render_error(&err)),
         }
     }
 
@@ -234,7 +239,7 @@ impl FleetServer {
         .await
         {
             Ok(r) => Ok(render_result(&r, None)),
-            Err(err) => Ok(render_error(err)),
+            Err(err) => Ok(render_error(&err)),
         }
     }
 
@@ -251,7 +256,7 @@ impl FleetServer {
         .await
         {
             Ok(r) => Ok(render_result(&r, None)),
-            Err(err) => Ok(render_error(err)),
+            Err(err) => Ok(render_error(&err)),
         }
     }
 
@@ -270,7 +275,7 @@ impl FleetServer {
         .await
         {
             Ok(r) => Ok(render_result(&r, None)),
-            Err(err) => Ok(render_error(err)),
+            Err(err) => Ok(render_error(&err)),
         }
     }
 
@@ -285,7 +290,7 @@ impl FleetServer {
         .await
         {
             Ok(r) => Ok(render_result(&r, None)),
-            Err(err) => Ok(render_error(err)),
+            Err(err) => Ok(render_error(&err)),
         }
     }
 
@@ -293,7 +298,7 @@ impl FleetServer {
         let name = req_str(args, "name")?;
         match report_core_with_env(&name, self.cwd(), self.parl_dir().as_deref()).await {
             Ok(r) => Ok(render_result(&r, None)),
-            Err(err) => Ok(render_error(err)),
+            Err(err) => Ok(render_error(&err)),
         }
     }
 
@@ -302,7 +307,7 @@ impl FleetServer {
         let name_only = opt_bool(args, "nameOnly")?.unwrap_or(false);
         match diff_core_with_env(&name, self.cwd(), name_only, self.parl_dir().as_deref()).await {
             Ok(r) => Ok(render_result(&r, None)),
-            Err(err) => Ok(render_error(err)),
+            Err(err) => Ok(render_error(&err)),
         }
     }
 
@@ -311,7 +316,7 @@ impl FleetServer {
         let no_commit = opt_bool(args, "noCommit")?.unwrap_or(false);
         match merge_core_with_env(&name, self.cwd(), no_commit, self.parl_dir().as_deref()).await {
             Ok(r) => Ok(render_result(&r, None)),
-            Err(err) => Ok(render_error(err)),
+            Err(err) => Ok(render_error(&err)),
         }
     }
 
@@ -320,11 +325,11 @@ impl FleetServer {
         let force = opt_bool(args, "force")?.unwrap_or(false);
         let fleet = match resolve_fleet_dir_with_env(self.cwd(), self.parl_dir().as_deref()).await {
             Ok(fleet) => fleet,
-            Err(err) => return Ok(render_error(err)),
+            Err(err) => return Ok(render_error(&err)),
         };
         match cleanup_runs(fleet.paths.root(), &target, force).await {
             Ok(r) => Ok(render_result(&r, None)),
-            Err(err) => Ok(render_error(err)),
+            Err(err) => Ok(render_error(&err)),
         }
     }
 }
@@ -385,7 +390,7 @@ fn render_result<T: Serialize>(r: &CommandResult<T>, structured: Option<Value>) 
 
 /// A core that failed outright (unknown run, unreadable state): the error
 /// message plus `exit: 1`. The TypeScript `errorResult`.
-fn render_error(err: anyhow::Error) -> CallToolResult {
+fn render_error(err: &anyhow::Error) -> CallToolResult {
     let mut result = CallToolResult::default();
     result.content = vec![ContentBlock::text(format!("{err:#}\nexit: 1"))];
     result.is_error = Some(true);
@@ -402,7 +407,15 @@ fn render_error(err: anyhow::Error) -> CallToolResult {
 
 /// Every tool definition, for `tools/list`.
 fn fleet_tools() -> Vec<Tool> {
-    let shared_name = "Run name (the newest non-archived run of that name) or a full run id";
+    let mut tools = Vec::with_capacity(FLEET_TOOL_NAMES.len());
+    tools.extend(spawn_status_tools());
+    tools.extend(query_tools());
+    tools.extend(steering_tools());
+    tools.extend(integration_tools());
+    tools
+}
+/// The spawn and status tools; the structured-output pair.
+fn spawn_status_tools() -> Vec<Tool> {
     vec![
         make_tool(
             "fleet_spawn",
@@ -479,6 +492,12 @@ fn fleet_tools() -> Vec<Tool> {
                 })),
             )])),
         ),
+    ]
+}
+
+/// The query tools: wait, output, logs.
+fn query_tools() -> Vec<Tool> {
+    vec![
         make_tool(
             "fleet_wait",
             "Wait for a run",
@@ -486,7 +505,12 @@ fn fleet_tools() -> Vec<Tool> {
              (still running), 4 stopped/error/dead. Use only when you have nothing else to do; fleet events are \
              pushed to you anyway.",
             properties([
-                ("name", string_prop(shared_name)),
+                (
+                    "name",
+                    string_prop(
+                        "Run name (the newest non-archived run of that name) or a full run id",
+                    ),
+                ),
                 (
                     "timeoutSec",
                     integer_prop("Seconds to wait (default 120, max 600)", 1, Some(600)),
@@ -500,7 +524,12 @@ fn fleet_tools() -> Vec<Tool> {
             "Worker output",
             "The worker's last assistant text, or with tail=N the last N tool results (an activity trail).",
             properties([
-                ("name", string_prop(shared_name)),
+                (
+                    "name",
+                    string_prop(
+                        "Run name (the newest non-archived run of that name) or a full run id",
+                    ),
+                ),
                 (
                     "tail",
                     integer_prop("Print the last N tool results instead", 1, None),
@@ -514,12 +543,24 @@ fn fleet_tools() -> Vec<Tool> {
             "Worker RPC log",
             "The tail of the worker's raw pi RPC log; use it to diagnose error or dead runs.",
             properties([
-                ("name", string_prop(shared_name)),
+                (
+                    "name",
+                    string_prop(
+                        "Run name (the newest non-archived run of that name) or a full run id",
+                    ),
+                ),
                 ("tail", integer_prop("Lines to print (default 50)", 1, None)),
             ]),
             &["name"],
             None,
         ),
+    ]
+}
+
+/// The steering tools: send, follow-up, answer, stop.
+fn steering_tools() -> Vec<Tool> {
+    let shared_name = "Run name (the newest non-archived run of that name) or a full run id";
+    vec![
         make_tool(
             "fleet_send",
             "Steer a worker",
@@ -568,6 +609,13 @@ fn fleet_tools() -> Vec<Tool> {
             &["name"],
             None,
         ),
+    ]
+}
+
+/// The integration tools: report, diff, merge, cleanup.
+fn integration_tools() -> Vec<Tool> {
+    let shared_name = "Run name (the newest non-archived run of that name) or a full run id";
+    vec![
         make_tool(
             "fleet_report",
             "Worker report",
@@ -607,12 +655,13 @@ fn fleet_tools() -> Vec<Tool> {
             "fleet_cleanup",
             "Clean up runs",
             "Remove a finished run's worktree and branch and archive it (reports and events are kept). target is a \
-             run name or 'all'. force aborts running workers and discards unmerged branches and uncommitted changes.",
+             run name or 'all'. force discards unmerged branches and uncommitted changes; running workers are \
+             aborted only when named explicitly — 'all' always skips them.",
             properties([
                 ("target", string_prop("Run name or id, or 'all'")),
                 (
                     "force",
-                    bool_prop("Abort running workers and discard unmerged work"),
+                    bool_prop("Discard unmerged work (never aborts a run 'all' did not name)"),
                 ),
             ]),
             &["target"],
@@ -711,9 +760,15 @@ fn nullable_string_schema() -> Value {
     json_schema(json!({"type": ["string", "null"]}))
 }
 
+/// The `tail` argument as a line count: validated 1.., clamped to the host's
+/// `usize` so a 32-bit build cannot truncate a huge value.
+fn tail_arg(args: &JsonObject, key: &str) -> Result<Option<usize>, McpError> {
+    Ok(opt_u64(args, key, 1, None)?.map(|n| usize::try_from(n).unwrap_or(usize::MAX)))
+}
+
 /// Turn a `json!` value into a schema map; the shapes above are literals, so
 /// this cannot actually fail.
-fn json_schema(schema: Value) -> Value {
+const fn json_schema(schema: Value) -> Value {
     schema
 }
 
@@ -726,7 +781,7 @@ fn invalid_param(message: String) -> McpError {
     McpError::invalid_params(message, None)
 }
 
-fn type_of(value: &Value) -> &'static str {
+const fn type_of(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "a boolean",
@@ -847,7 +902,8 @@ mod tests {
 
     #[test]
     fn render_error_carries_the_message_and_exit_1() {
-        let rendered = render_error(anyhow::anyhow!("No run found matching \"nope\""));
+        let err = anyhow::anyhow!("No run found matching \"nope\"");
+        let rendered = render_error(&err);
         assert_eq!(
             text_of(&rendered),
             "No run found matching \"nope\"\nexit: 1"

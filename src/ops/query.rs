@@ -54,6 +54,10 @@ pub struct ReportData {
 }
 
 /// The fleet table, or one run's full state as JSON.
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved.
 pub async fn status(
     name: Option<&str>,
     cwd: Option<&Path>,
@@ -64,6 +68,10 @@ pub async fn status(
 }
 
 /// The worker's last assistant text, or the last `n` tool results.
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved.
 pub async fn output(
     name: &str,
     cwd: Option<&Path>,
@@ -73,6 +81,10 @@ pub async fn output(
 }
 
 /// Tail the captured raw RPC stream (`pi.log`).
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved.
 pub async fn logs(
     name: &str,
     cwd: Option<&Path>,
@@ -82,12 +94,20 @@ pub async fn logs(
 }
 
 /// The worker's final report plus the steering log; exit 2 when there is none.
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved.
 pub async fn report(name: &str, cwd: Option<&Path>) -> anyhow::Result<crate::cli::ExitCode> {
     Ok(print_result(report_core(name, cwd).await?))
 }
 
 /// Block until the run reaches a terminal state.
 /// Exit 3 on timeout, 4 when it ends stopped/error/dead.
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved.
 pub async fn wait(
     name: &str,
     cwd: Option<&Path>,
@@ -97,6 +117,10 @@ pub async fn wait(
 }
 
 /// Print the tail of one worker's transcript (the live console is `parl`).
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved.
 pub async fn attach(
     name: &str,
     cwd: Option<&Path>,
@@ -128,6 +152,11 @@ fn load_states(fleet_dir: &Path, all: bool) -> Vec<run::RunState> {
 
 /// The status core. One name: always JSON, including the session file so
 /// `--session` can resume it. Otherwise the fleet table, or `--json`.
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved, or when a given name
+/// matches no run.
 pub async fn status_core(
     name: Option<&str>,
     cwd: Option<&Path>,
@@ -155,9 +184,9 @@ pub(crate) async fn status_core_with_env(
             // resumes, so it travels with the single-run state.
             map.insert(
                 "sessionFile".to_string(),
-                run::find_session_file(&target.run_dir)
-                    .map(|p| Value::String(p.to_string_lossy().into_owned()))
-                    .unwrap_or(Value::Null),
+                run::find_session_file(&target.run_dir).map_or(Value::Null, |p| {
+                    Value::String(p.to_string_lossy().into_owned())
+                }),
             );
         }
         let rendered = serde_json::to_string_pretty(&derived).unwrap_or_else(|_| "{}".into());
@@ -234,6 +263,10 @@ fn fleet_table(states: &[run::RunState]) -> String {
 
 /// Wait for a terminal state. Exit 0 settled/archived, 3 timeout,
 /// 4 stopped/error/dead.
+///
+/// # Errors
+///
+/// Fails when the run cannot be resolved.
 pub async fn wait_core(
     name: &str,
     cwd: Option<&Path>,
@@ -272,7 +305,7 @@ pub(crate) async fn wait_core_with_env(
                     out: vec![format!("{} {derived}", state.name)],
                     err: Vec::new(),
                     data: WaitData {
-                        name: state.name.clone(),
+                        name: state.name,
                         status: Some(derived.to_string()),
                     },
                 });
@@ -293,6 +326,10 @@ pub(crate) async fn wait_core_with_env(
 }
 
 /// Last assistant text, or with `--tail n` the last `n` tool results.
+///
+/// # Errors
+///
+/// Fails when the run cannot be resolved.
 pub async fn output_core(
     name: &str,
     cwd: Option<&Path>,
@@ -313,9 +350,11 @@ pub(crate) async fn output_core_with_env(
         let text = target
             .state
             .last_assistant_text
-            .clone()
-            .unwrap_or_else(|| "(no output yet)".to_string());
-        return Ok(ok(TextData { text: text.clone() }, vec![text]));
+            .as_deref()
+            .unwrap_or("(no output yet)")
+            .to_string();
+        let line = vec![text.clone()];
+        return Ok(ok(TextData { text }, line));
     };
     let events: Vec<Value> = read_jsonl_tail(&paths.run_events(&target.run_id), 5_000);
     let ends: Vec<&Value> = events
@@ -345,6 +384,10 @@ pub(crate) async fn output_core_with_env(
 }
 
 /// Tail the captured raw RPC stream (`pi.log`).
+///
+/// # Errors
+///
+/// Fails when the run cannot be resolved.
 pub async fn logs_core(
     name: &str,
     cwd: Option<&Path>,
@@ -371,6 +414,11 @@ pub(crate) async fn logs_core_with_env(
 
 /// The report core: the report file wins, then the captured last assistant
 /// text, then exit 2. The steering log is appended either way.
+///
+/// # Errors
+///
+/// Fails when the run cannot be resolved; a run with neither report nor
+/// captured output is a `fail` (exit 2), not an error.
 pub async fn report_core(
     name: &str,
     cwd: Option<&Path>,
@@ -416,6 +464,10 @@ pub(crate) async fn report_core_with_env(
 
 /// A static tail of one worker's transcript, rebuilt from `events.jsonl`.
 /// Live viewing and steering live in the `parl` console.
+///
+/// # Errors
+///
+/// Fails when the run cannot be resolved.
 pub async fn attach_core(
     name: &str,
     cwd: Option<&Path>,
@@ -526,7 +578,7 @@ fn apply_transcript_event(t: &mut Vec<String>, ev: &Value) {
                 clip_line(first_line(str_of("brief")), 200)
             ));
         }
-        Some("steering_delivered") | Some("command_delivered") | Some("answer_delivered") => {
+        Some("steering_delivered" | "command_delivered" | "answer_delivered") => {
             t.push(format!("▶ {}: {}", str_of("source"), str_of("message")));
         }
         Some("abort_requested") => t.push("■ abort requested".to_string()),
@@ -880,7 +932,7 @@ mod tests {
         // run stays Running until then.
         let (dir, paths, run_id) = fleet_with_run("parl-query-wait-", RunStatus::Running, Some(1));
         let mut state = run::load_state(&paths.run_dir(&run_id)).unwrap();
-        state.pid = Some(std::process::id() as i32);
+        state.pid = Some(std::process::id().cast_signed());
         run::save_state(&paths.run_dir(&run_id), &state).unwrap();
         let late = paths.run_dir(&run_id);
         tokio::spawn(async move {
@@ -901,7 +953,7 @@ mod tests {
         // Timeout: run stays running with a live pid.
         let (dir2, paths2, run2) = fleet_with_run("parl-query-wait2-", RunStatus::Running, Some(1));
         let mut state = run::load_state(&paths2.run_dir(&run2)).unwrap();
-        state.pid = Some(std::process::id() as i32);
+        state.pid = Some(std::process::id().cast_signed());
         run::save_state(&paths2.run_dir(&run2), &state).unwrap();
         let timed_out = wait_core_with_env("auth", Some(&dir2), 1, None)
             .await

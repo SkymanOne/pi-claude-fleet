@@ -19,11 +19,14 @@ use crate::util::now_ms;
 use super::{CommandResult, fail, ok, print_result, resolve_fleet_dir_with_env};
 
 /// Locate the fleet dir for `cwd` and the newest non-archived run matching
-/// `name` (a name or a full run id). Shared by the whole ops layer.
-/// Locate the fleet dir for `cwd` and the newest non-archived run matching
 /// `name` (a name or a full run id), with the `$PARL_DIR` value injected
 /// (production passes the real environment; tests pass `None`). Shared by
 /// the whole ops layer.
+///
+/// # Errors
+///
+/// Fails on an empty name, an unresolvable fleet dir, or a run that does
+/// not match `name`.
 pub(crate) async fn resolve_run_with_env(
     name: &str,
     cwd: Option<&Path>,
@@ -65,7 +68,7 @@ pub enum SteerKind {
 impl SteerKind {
     /// The envelope `type` value.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Send => "steer",
             Self::FollowUp => "follow_up",
@@ -74,7 +77,7 @@ impl SteerKind {
         }
     }
 
-    fn refusal(self) -> &'static str {
+    const fn refusal(self) -> &'static str {
         match self {
             Self::Stop => "nothing to stop",
             Self::Answer => "nothing is waiting for an answer",
@@ -84,6 +87,11 @@ impl SteerKind {
 }
 
 /// Steer a running worker (delivered after its current tool calls).
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved; a terminal run or an empty
+/// message is a refusal through the printed exit code.
 pub async fn send(
     name: &str,
     cwd: Option<&Path>,
@@ -95,6 +103,10 @@ pub async fn send(
 }
 
 /// Queue a message for after the worker finishes its current work.
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved.
 pub async fn followup(
     name: &str,
     cwd: Option<&Path>,
@@ -106,6 +118,10 @@ pub async fn followup(
 }
 
 /// Answer the worker's pending `fleet_ask` question or extension dialog.
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved.
 pub async fn answer(
     name: &str,
     cwd: Option<&Path>,
@@ -118,6 +134,10 @@ pub async fn answer(
 }
 
 /// Abort a running worker (state becomes stopped).
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved.
 pub async fn stop(name: &str, cwd: Option<&Path>) -> anyhow::Result<crate::cli::ExitCode> {
     Ok(print_result(
         stop_core(name, cwd, Party::Orchestrator).await?,
@@ -127,6 +147,10 @@ pub async fn stop(name: &str, cwd: Option<&Path>) -> anyhow::Result<crate::cli::
 /// The CLI entry points attribute steering to the orchestrator — the agent
 /// driving these tools. The console passes [`Party::Console`] through the
 /// `_core` variants so the watcher can tell the two apart.
+///
+/// # Errors
+///
+/// Fails when the run cannot be resolved or the message is empty.
 pub async fn send_core(
     name: &str,
     cwd: Option<&Path>,
@@ -167,6 +191,10 @@ pub(crate) async fn send_core_with_env(
 }
 
 /// Queue a message for after the worker finishes its current work.
+///
+/// # Errors
+///
+/// Fails when the run cannot be resolved or the message is empty.
 pub async fn followup_core(
     name: &str,
     cwd: Option<&Path>,
@@ -208,6 +236,10 @@ pub(crate) async fn followup_core_with_env(
 
 /// Answer the run's pending question or dialog. An explicit `question_id`
 /// wins even when it is not the pending one — the monitor routes by id.
+///
+/// # Errors
+///
+/// Fails when the run cannot be resolved or the message is empty.
 pub async fn answer_core(
     name: &str,
     cwd: Option<&Path>,
@@ -251,6 +283,10 @@ pub(crate) async fn answer_core_with_env(
 }
 
 /// Abort a running worker (state becomes stopped).
+///
+/// # Errors
+///
+/// Fails when the run cannot be resolved.
 pub async fn stop_core(
     name: &str,
     cwd: Option<&Path>,
@@ -421,8 +457,7 @@ mod tests {
 
     fn inbox_lines(paths: &FleetPaths, run_id: &str) -> Vec<Envelope> {
         let raw = std::fs::read_to_string(paths.run_inbox(run_id)).unwrap_or_default();
-        raw.trim()
-            .split('\n')
+        raw.lines()
             .filter(|l| !l.is_empty())
             .map(Envelope::parse_line)
             .collect::<Option<Vec<_>>>()
@@ -431,8 +466,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_appends_a_steer_envelope_and_queues() {
-        let (_dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
-        let result = send_core_with_env("auth", Some(&_dir), "use tabs", Party::Orchestrator, None)
+        let (dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
+        let result = send_core_with_env("auth", Some(&dir), "use tabs", Party::Orchestrator, None)
             .await
             .unwrap();
         assert_eq!(result.code, ExitCode::Ok);
@@ -454,11 +489,11 @@ mod tests {
 
     #[tokio::test]
     async fn followup_and_stop_append_their_envelope_types() {
-        let (_dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
-        followup_core_with_env("auth", Some(&_dir), "then fmt", Party::Orchestrator, None)
+        let (dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
+        followup_core_with_env("auth", Some(&dir), "then fmt", Party::Orchestrator, None)
             .await
             .unwrap();
-        stop_core_with_env("auth", Some(&_dir), Party::Console, None)
+        stop_core_with_env("auth", Some(&dir), Party::Console, None)
             .await
             .unwrap();
         let envelopes = inbox_lines(&paths, &run_id);
@@ -470,26 +505,25 @@ mod tests {
         assert_eq!(envelopes[1].from, Party::Console);
         let payload = &envelopes[1].payload;
         assert!(
-            payload.as_object().is_some_and(|m| m.is_empty()),
+            payload.as_object().is_some_and(serde_json::Map::is_empty),
             "abort carries exactly {{}}: {payload}"
         );
     }
 
     #[tokio::test]
     async fn empty_messages_are_refused_before_touching_the_run() {
-        let (_dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
+        let (dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
         for (core, expect) in [
             (
-                send_core_with_env("auth", Some(&_dir), "  ", Party::Orchestrator, None).await,
+                send_core_with_env("auth", Some(&dir), "  ", Party::Orchestrator, None).await,
                 "send: message",
             ),
             (
-                followup_core_with_env("auth", Some(&_dir), "", Party::Orchestrator, None).await,
+                followup_core_with_env("auth", Some(&dir), "", Party::Orchestrator, None).await,
                 "followup: message",
             ),
             (
-                answer_core_with_env("auth", Some(&_dir), None, "", Party::Orchestrator, None)
-                    .await,
+                answer_core_with_env("auth", Some(&dir), None, "", Party::Orchestrator, None).await,
                 "answer: message",
             ),
         ] {
@@ -502,10 +536,10 @@ mod tests {
 
     #[tokio::test]
     async fn steering_a_terminal_run_refuses_with_the_resume_hint() {
-        let (_dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Settled, None);
+        let (dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Settled, None);
         for core in [
-            send_core_with_env("auth", Some(&_dir), "m", Party::Orchestrator, None).await,
-            followup_core_with_env("auth", Some(&_dir), "m", Party::Orchestrator, None).await,
+            send_core_with_env("auth", Some(&dir), "m", Party::Orchestrator, None).await,
+            followup_core_with_env("auth", Some(&dir), "m", Party::Orchestrator, None).await,
         ] {
             let result = core.unwrap();
             assert_eq!(result.code, ExitCode::Error);
@@ -516,15 +550,14 @@ mod tests {
                 "carries the copy-pasteable resume command: {err}"
             );
         }
-        let stop = stop_core_with_env("auth", Some(&_dir), Party::Orchestrator, None)
+        let stop = stop_core_with_env("auth", Some(&dir), Party::Orchestrator, None)
             .await
             .unwrap();
         assert_eq!(stop.code, ExitCode::Error);
         assert!(stop.err[0].contains("nothing to stop"), "{}", stop.err[0]);
-        let answer =
-            answer_core_with_env("auth", Some(&_dir), None, "x", Party::Orchestrator, None)
-                .await
-                .unwrap();
+        let answer = answer_core_with_env("auth", Some(&dir), None, "x", Party::Orchestrator, None)
+            .await
+            .unwrap();
         assert!(answer.err[0].contains("nothing is waiting for an answer"));
         // Nothing was written.
         assert!(inbox_lines(&paths, &run_id).is_empty());
@@ -532,10 +565,10 @@ mod tests {
 
     #[tokio::test]
     async fn answer_needs_a_question_dialog_or_explicit_id() {
-        let (_dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
+        let (dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
         let refused = answer_core_with_env(
             "auth",
-            Some(&_dir),
+            Some(&dir),
             None,
             "argon2",
             Party::Orchestrator,
@@ -554,7 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn answer_targets_the_pending_question_by_default() {
-        let (_dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
+        let (dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
         let run_dir = paths.run_dir(&run_id);
         let mut state = crate::fleet::run::load_state(&run_dir).unwrap();
         state.pending_question = Some(PendingQuestion {
@@ -566,10 +599,9 @@ mod tests {
         });
         crate::fleet::run::save_state(&run_dir, &state).unwrap();
 
-        let result =
-            answer_core_with_env("auth", Some(&_dir), None, "argon2", Party::Console, None)
-                .await
-                .unwrap();
+        let result = answer_core_with_env("auth", Some(&dir), None, "argon2", Party::Console, None)
+            .await
+            .unwrap();
         assert_eq!(result.code, ExitCode::Ok);
         assert_eq!(result.out, vec!["answer queued for auth (question m_q1)"]);
         assert_eq!(result.data.question_id.as_deref(), Some("m_q1"));
@@ -587,7 +619,7 @@ mod tests {
 
     #[tokio::test]
     async fn answer_falls_back_to_the_pending_dialog_and_explicit_ids_win() {
-        let (_dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
+        let (dir, paths, run_id) = fleet_with_run("parl-steer-", RunStatus::Running, Some(1));
         let run_dir = paths.run_dir(&run_id);
         let mut state = crate::fleet::run::load_state(&run_dir).unwrap();
         state.pending_dialog = Some(PendingDialog {
@@ -601,7 +633,7 @@ mod tests {
         crate::fleet::run::save_state(&run_dir, &state).unwrap();
 
         let result =
-            answer_core_with_env("auth", Some(&_dir), None, "yes", Party::Orchestrator, None)
+            answer_core_with_env("auth", Some(&dir), None, "yes", Party::Orchestrator, None)
                 .await
                 .unwrap();
         assert_eq!(result.data.question_id.as_deref(), Some("ui-9"));
@@ -617,7 +649,7 @@ mod tests {
         // An explicit id wins even when it is not the pending one.
         let result = answer_core_with_env(
             "auth",
-            Some(&_dir),
+            Some(&dir),
             Some("q_other"),
             "no",
             Party::Orchestrator,
@@ -639,13 +671,13 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_runs_and_empty_names_are_errors() {
-        let _dir = tmp_dir("parl-steer-none-");
-        let err = send_core_with_env("ghost", Some(&_dir), "m", Party::Orchestrator, None)
+        let dir = tmp_dir("parl-steer-none-");
+        let err = send_core_with_env("ghost", Some(&dir), "m", Party::Orchestrator, None)
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("No run found"), "{err}");
-        let err = send_core_with_env("  ", Some(&_dir), "m", Party::Orchestrator, None)
+        let err = send_core_with_env("  ", Some(&dir), "m", Party::Orchestrator, None)
             .await
             .unwrap_err()
             .to_string();

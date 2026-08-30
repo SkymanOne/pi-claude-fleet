@@ -49,15 +49,27 @@ pub struct MergeData {
     pub conflicts: Vec<String>,
 }
 
-/// What `cleanup` archived and refused, for programmatic callers.
+/// What `cleanup` archived, skipped and refused, for programmatic callers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanupData {
     pub archived: Vec<String>,
+    /// Runs `all` left alone because they are still running: `--force` only
+    /// aborts a worker it was pointed at by name, never a sweep.
+    pub skipped: Vec<String>,
+    /// Runs that could not be cleaned, as `<runId>: <reason>` lines so the
+    /// caller sees which failed and why without the batch aborting.
+    pub failed: Vec<String>,
+    /// Runs that need `--force` (still running when named, or a dirty
+    /// worktree) and were left untouched.
     pub refused: Vec<String>,
 }
 
 /// The worker's changes vs its base (git diff --stat, or --name-only).
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved.
 pub async fn diff(
     name: &str,
     cwd: Option<&Path>,
@@ -68,6 +80,10 @@ pub async fn diff(
 
 /// Merge the settled worker's branch into the run's recorded checkout.
 /// Exit 5 on conflicts.
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved.
 pub async fn merge(
     name: &str,
     cwd: Option<&Path>,
@@ -77,6 +93,10 @@ pub async fn merge(
 }
 
 /// Remove a run's worktree + branch and archive it (`<name>` or `all`).
+///
+/// # Errors
+///
+/// Fails when the fleet dir cannot be resolved.
 pub async fn cleanup(
     target: &str,
     cwd: Option<&Path>,
@@ -90,6 +110,11 @@ pub async fn cleanup(
 
 /// The diff core: committed work only. A dirty worktree warns on stderr —
 /// uncommitted changes are invisible to diff and merge.
+///
+/// # Errors
+///
+/// Fails when the run cannot be resolved (empty or unknown name); git diff
+/// failures come back as a `fail` result, not an error.
 pub async fn diff_core(
     name: &str,
     cwd: Option<&Path>,
@@ -170,6 +195,11 @@ fn dirty_warning(files: &[String], command: &str, consequence: &str) -> String {
 /// from, wherever this was invoked from. Exit 5 on conflicts; the merge is
 /// always rolled back so the checkout stays clean and the worker can rebase
 /// in its own worktree — the orchestrator never edits files itself.
+///
+/// # Errors
+///
+/// Fails when the run cannot be resolved; refusals (not settled, no branch,
+/// no checkout) and git failures come back as `fail` results.
 pub async fn merge_core(
     name: &str,
     cwd: Option<&Path>,
@@ -238,7 +268,25 @@ pub(crate) async fn merge_core_with_env(
             ));
         }
     }
-    match git::merge_branch(&repo_root, &branch, no_commit, true).await {
+    let outcome = git::merge_branch(&repo_root, &branch, no_commit, true).await;
+    Ok(merge_outcome_result(
+        outcome, state, branch, &repo_root, err, no_commit,
+    ))
+}
+
+/// Render a merge outcome as the core result: conflicts abort with the
+/// rebase brief (exit 5), git failures report stderr, success reports the
+/// merge — carrying the dirty warning built by the caller, which `ok`
+/// would zero.
+fn merge_outcome_result(
+    outcome: MergeOutcome,
+    state: &run::RunState,
+    branch: String,
+    repo_root: &Path,
+    mut err: Vec<String>,
+    no_commit: bool,
+) -> CommandResult<MergeData> {
+    match outcome {
         MergeOutcome::Conflicted(files) => {
             let base = state
                 .base_commit
@@ -252,7 +300,7 @@ in its own worktree, resolve the conflicts there, commit, and then merge again."
                 files.join("\n"),
                 repo_root.display(),
             ));
-            Ok(CommandResult {
+            CommandResult {
                 code: crate::cli::ExitCode::MergeConflict,
                 out: Vec::new(),
                 err,
@@ -262,12 +310,19 @@ in its own worktree, resolve the conflicts there, commit, and then merge again."
                     committed: false,
                     conflicts: files,
                 },
-            })
+            }
         }
-        MergeOutcome::Failed(stderr) => Ok(fail(
-            ExitCode::Error,
-            vec![format!("merge: git merge failed:\n{}", stderr.trim())],
-        )),
+        MergeOutcome::Failed(stderr) => {
+            // Hand-built like everywhere else: `fail` would zero `err`, and
+            // the dirty warning built by the caller must survive.
+            err.push(format!("merge: git merge failed:\n{}", stderr.trim()));
+            CommandResult {
+                code: ExitCode::Error,
+                out: Vec::new(),
+                err,
+                data: MergeData::default(),
+            }
+        }
         outcome => {
             let staged = matches!(outcome, MergeOutcome::Staged);
             let mut out = vec![format!(
@@ -280,7 +335,7 @@ in its own worktree, resolve the conflicts there, commit, and then merge again."
                 }
             )];
             out.push("Run your integration checks before cleanup.".to_string());
-            Ok(CommandResult {
+            CommandResult {
                 code: ExitCode::Ok,
                 out,
                 err,
@@ -290,7 +345,7 @@ in its own worktree, resolve the conflicts there, commit, and then merge again."
                     committed: !no_commit,
                     conflicts: Vec::new(),
                 },
-            })
+            }
         }
     }
 }
@@ -298,6 +353,12 @@ in its own worktree, resolve the conflicts there, commit, and then merge again."
 /// The same cleanup, for callers that already know the fleet dir (the
 /// console, the reaper). Archived by setting the status: reports and events
 /// are always kept.
+///
+/// # Errors
+///
+/// Fails on an empty target or an unknown single-name target. Per-run
+/// failures never abort a batch: with `all` they are collected in
+/// [`CleanupData::failed`] and the remaining runs are still cleaned.
 pub async fn cleanup_runs(
     fleet_dir: &Path,
     target: &str,
@@ -325,88 +386,153 @@ pub async fn cleanup_runs(
     let mut out: Vec<String> = Vec::new();
     let mut err: Vec<String> = Vec::new();
     let mut data = CleanupData::default();
-    let mut refused_any = false;
+    let mut failed_any = false;
     for target in targets {
-        if target.state.status == RunStatus::Archived {
-            if !all {
-                out.push(format!("{} is already archived", target.run_id));
+        match cleanup_one(&target, force, all).await {
+            CleanupOutcome::AlreadyArchived => {
+                if !all {
+                    out.push(format!("{} is already archived", target.run_id));
+                }
             }
-            continue;
-        }
-        let derived = run::derive_status(&target.state, run::is_alive, crate::util::now_ms());
-        if !derived.is_terminal() {
-            if !force {
-                // `all` skips and moves on; a single named run is a refusal.
-                let verb = if all { "skipping" } else { "refusing" };
-                err.push(format!(
-                    "cleanup: {verb} {} ({derived}) — use --force to abort and clean.",
-                    target.state.name
-                ));
+            CleanupOutcome::Archived { notes } => {
+                out.push(format!("archived {}", target.run_id));
+                data.archived.push(target.run_id.clone());
+                err.extend(notes);
+            }
+            CleanupOutcome::Skipped { note } => {
+                err.push(format!("cleanup: skipping {} — {note}", target.run_id));
+                data.skipped.push(target.run_id.clone());
+            }
+            CleanupOutcome::Refused { note } => {
+                err.push(format!("cleanup: refusing {} — {note}", target.run_id));
                 data.refused.push(target.run_id.clone());
                 if !all {
-                    refused_any = true;
+                    failed_any = true;
                 }
-                continue;
             }
-            let stopped = abort_and_wait(&target).await;
-            if !stopped {
-                err.push(format!(
-                    "cleanup: {} did not stop within {}s — archiving anyway",
-                    target.state.name,
-                    CLEANUP_ABORT_WAIT_MS / 1000
-                ));
+            CleanupOutcome::Failed { note } => {
+                err.push(format!("cleanup: failed {} — {note}", target.run_id));
+                data.failed.push(format!("{}: {note}", target.run_id));
+                failed_any = true;
             }
         }
-        if let (Some(worktree), Some(repo_root)) = (
-            target.state.worktree.clone(),
-            target.state.repo_root.clone(),
-        ) {
-            let removed = git::remove_worktree(
-                Path::new(&repo_root),
-                Path::new(&worktree),
-                target.state.branch.as_deref(),
-                force,
-            )
-            .await?;
-            if !removed.worktree_removed && Path::new(&worktree).exists() {
-                let verb = if all { "skipping" } else { "refusing" };
-                err.push(format!(
-                    "cleanup: {verb} {} — worktree {worktree} could not be removed \
-(uncommitted changes?) — inspect or commit them, or use --force to discard.",
-                    target.state.name
-                ));
-                data.refused.push(target.run_id.clone());
-                if !all {
-                    refused_any = true;
-                }
-                continue;
-            }
-            if let Some(branch) = &target.state.branch
-                && !removed.branch_deleted
-            {
-                err.push(format!(
-                    "cleanup: kept unmerged branch {branch} (use --force to delete it)"
-                ));
-            }
-        }
-        // Archive by setting the status; reports and events are always kept.
-        let mut state = target.state.clone();
-        state.status = RunStatus::Archived;
-        run::save_state(&target.run_dir, &state)?;
-        out.push(format!("archived {}", target.run_id));
-        data.archived.push(target.run_id.clone());
     }
-    let code = if refused_any {
-        ExitCode::Error
-    } else {
-        ExitCode::Ok
-    };
     Ok(CommandResult {
-        code,
+        code: if failed_any {
+            ExitCode::Error
+        } else {
+            ExitCode::Ok
+        },
         out,
         err,
         data,
     })
+}
+
+/// One run's verdict in a cleanup sweep; [`cleanup_runs`] turns it into
+/// lines and the [`CleanupData`] lists. Per-run decisions stay here so a
+/// single failure can never abort the batch — a run that cannot be cleaned
+/// is reported, the rest are still cleaned.
+enum CleanupOutcome {
+    /// Already archived; only a named target is told.
+    AlreadyArchived,
+    /// Worktree and branch are gone, the run is archived. `notes` carries
+    /// stderr lines that must survive the success (a kept unmerged branch,
+    /// a slow abort) — hand-built for the same reason `ok` is not used.
+    Archived { notes: Vec<String> },
+    /// Left alone because it is still running: a sweep never aborts a
+    /// worker it was not pointed at by name, even with `--force`.
+    Skipped { note: String },
+    /// Cleanable only with `--force` (running when named, or a dirty
+    /// worktree); the run is left untouched.
+    Refused { note: String },
+    /// Could not be cleaned at all (git refused, the archive write failed).
+    Failed { note: String },
+}
+
+/// Clean one run, best-effort. `all` skips live workers and other failures
+/// instead of aborting the sweep; a single named target fails loudly
+/// instead of being silently dropped.
+async fn cleanup_one(target: &RunRef, force: bool, all: bool) -> CleanupOutcome {
+    if target.state.status == RunStatus::Archived {
+        return CleanupOutcome::AlreadyArchived;
+    }
+    let derived = run::derive_status(&target.state, run::is_alive, crate::util::now_ms());
+    if !derived.is_terminal() {
+        if all {
+            // `--force` means "discard unmerged work", never "kill live
+            // workers": only an explicit name may abort a running run.
+            return CleanupOutcome::Skipped {
+                note: format!(
+                    "run {} is still {derived} — target it by name with --force to abort and clean.",
+                    target.state.name
+                ),
+            };
+        }
+        if !force {
+            return CleanupOutcome::Refused {
+                note: format!(
+                    "run {} is {derived} — use --force to abort and clean.",
+                    target.state.name
+                ),
+            };
+        }
+        let stopped = abort_and_wait(target).await;
+        if !stopped {
+            return CleanupOutcome::Failed {
+                note: format!(
+                    "run {} did not stop within {}s — not archiving a run whose monitor is still alive",
+                    target.state.name,
+                    CLEANUP_ABORT_WAIT_MS / 1000
+                ),
+            };
+        }
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if let (Some(worktree), Some(repo_root)) = (
+        target.state.worktree.clone(),
+        target.state.repo_root.clone(),
+    ) {
+        let removed = match git::remove_worktree(
+            Path::new(&repo_root),
+            Path::new(&worktree),
+            target.state.branch.as_deref(),
+            force,
+        )
+        .await
+        {
+            Ok(removed) => removed,
+            Err(err) => {
+                return CleanupOutcome::Failed {
+                    note: format!("worktree {worktree} could not be removed: {err:#}"),
+                };
+            }
+        };
+        if !removed.worktree_removed && Path::new(&worktree).exists() {
+            return CleanupOutcome::Refused {
+                note: format!(
+                    "worktree {worktree} could not be removed (uncommitted changes?) — \
+inspect or commit them, or use --force to discard."
+                ),
+            };
+        }
+        if let Some(branch) = &target.state.branch
+            && !removed.branch_deleted
+        {
+            notes.push(format!(
+                "cleanup: kept unmerged branch {branch} (use --force to delete it)"
+            ));
+        }
+    }
+    // Archive by setting the status; reports and events are always kept.
+    let mut state = target.state.clone();
+    state.status = RunStatus::Archived;
+    if let Err(save_err) = run::save_state(&target.run_dir, &state) {
+        return CleanupOutcome::Failed {
+            note: format!("could not archive {}: {save_err}", target.run_dir.display()),
+        };
+    }
+    CleanupOutcome::Archived { notes }
 }
 
 /// Send the abort envelope and wait (up to [`CLEANUP_ABORT_WAIT_MS`]) for
@@ -786,7 +912,7 @@ mod tests {
         // still Running with a live pid, a plain cleanup would refuse.
         let mut state = run::load_state(&target.run_dir).unwrap();
         state.status = RunStatus::Running;
-        state.pid = Some(std::process::id() as i32);
+        state.pid = Some(std::process::id().cast_signed());
         run::save_state(&target.run_dir, &state).unwrap();
         let tardy = target.run_dir.clone();
         tokio::spawn(async move {
@@ -839,7 +965,7 @@ mod tests {
             None,
         );
         busy.status = RunStatus::Running;
-        busy.pid = Some(std::process::id() as i32);
+        busy.pid = Some(std::process::id().cast_signed());
         run::save_state(&busy_dir, &busy).unwrap();
 
         let all = cleanup_runs(&fleet, "all", false).await.unwrap();
@@ -850,17 +976,78 @@ mod tests {
             "{:?}",
             all.err
         );
+        assert_eq!(all.data.skipped, vec![busy_id.to_string()]);
         assert_eq!(
             run::load_state(&busy_dir).unwrap().status,
             RunStatus::Running
         );
-        // --force archives the rest.
+        // --force still never aborts a run the sweep was not pointed at:
+        // `all` leaves the running one alone (only an explicit name may
+        // abort a live worker), and reports it as skipped.
         let forced = cleanup_runs(&fleet, "all", true).await.unwrap();
         assert_eq!(forced.code, ExitCode::Ok, "{:?}", forced.err);
+        assert_eq!(forced.data.archived, Vec::<String>::new());
+        assert_eq!(forced.data.skipped, vec![busy_id.to_string()]);
+        assert!(
+            forced.err.iter().any(|e| e.contains("skipping busy")),
+            "{:?}",
+            forced.err
+        );
         assert_eq!(
             run::load_state(&busy_dir).unwrap().status,
+            RunStatus::Running,
+            "`all --force` must leave a live worker alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_all_survives_one_runs_failure_and_archives_the_rest() {
+        let dir = init_repo("parl-int-batchfail-");
+        let (fleet, broken) = make_run(&dir, "broken", true).await;
+        settle(&broken.run_dir);
+        let (_fleet2, healthy) = make_run(&dir, "healthy", false).await;
+        settle(&healthy.run_dir);
+        // The broken run's git admin record is gone, as a crash left it in
+        // production: `git worktree remove` refuses even with --force — the
+        // exact failure that used to abort the whole batch, cleaning nothing.
+        let admin = dir.join(".git").join("worktrees").join(&broken.run_id);
+        std::fs::remove_dir_all(&admin).unwrap();
+
+        let all = cleanup_runs(&fleet, "all", true).await.unwrap();
+        assert_eq!(all.code, ExitCode::Error, "the failure is reported");
+        // The healthy run was still cleaned, and the broken one was not.
+        assert_eq!(all.data.archived, vec![healthy.run_id.clone()]);
+        assert!(
+            !all.out.iter().any(|l| l.contains(&broken.run_id)),
+            "broken run must not read as archived: {:?}",
+            all.out
+        );
+        // The failure is collected with its reason, naming the worktree.
+        assert_eq!(all.data.failed.len(), 1);
+        assert!(
+            all.data.failed[0].contains(&broken.run_id),
+            "{}",
+            all.data.failed[0]
+        );
+        assert!(
+            all.err.iter().any(|l| l.contains("could not be removed")),
+            "{:?}",
+            all.err
+        );
+        assert_eq!(
+            run::load_state(&broken.run_dir).unwrap().status,
+            RunStatus::Settled,
+            "the failed run is left untouched"
+        );
+        assert_eq!(
+            run::load_state(&healthy.run_dir).unwrap().status,
             RunStatus::Archived
         );
+        // A single named target still fails loudly on the same breakage.
+        let named = cleanup_runs(&fleet, "broken", true).await.unwrap();
+        assert_eq!(named.code, ExitCode::Error);
+        assert_eq!(named.data.failed.len(), 1);
+        assert_eq!(named.data.archived, Vec::<String>::new());
     }
 
     #[tokio::test]

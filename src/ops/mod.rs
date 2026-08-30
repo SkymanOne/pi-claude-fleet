@@ -32,7 +32,7 @@ pub struct CommandResult<T = serde_json::Value> {
 
 /// A successful core result. Failure paths use [`fail`] or a literal when the
 /// code itself carries meaning (wait timeouts, merge conflicts).
-pub fn ok<T>(data: T, out: Vec<String>) -> CommandResult<T> {
+pub const fn ok<T>(data: T, out: Vec<String>) -> CommandResult<T> {
     CommandResult {
         code: ExitCode::Ok,
         out,
@@ -77,6 +77,10 @@ pub struct ResolvedFleet {
 }
 
 /// Locate the fleet dir for `cwd` (default: the process's working directory).
+///
+/// # Errors
+///
+/// Fails when the target does not exist; git probe errors propagate.
 pub async fn resolve_fleet_dir(cwd: Option<&Path>) -> anyhow::Result<ResolvedFleet> {
     resolve_fleet_dir_with_env(cwd, ambient_parl_dir().as_deref()).await
 }
@@ -85,6 +89,10 @@ pub async fn resolve_fleet_dir(cwd: Option<&Path>) -> anyhow::Result<ResolvedFle
 /// [`FleetPaths::discover_with_env`]: production passes the real environment
 /// value; tests pass `None` so resolution can never leave the caller's own
 /// directories by inheriting an ambient variable.
+///
+/// # Errors
+///
+/// Fails when the target does not exist; git probe errors propagate.
 pub async fn resolve_fleet_dir_with_env(
     cwd: Option<&Path>,
     parl_dir: Option<&str>,
@@ -103,11 +111,11 @@ pub async fn resolve_fleet_dir_with_env(
     } else {
         None
     };
-    let resolved_root = root.clone().unwrap_or_else(|| target_dir.clone());
+    let resolved_root = root.as_deref().unwrap_or(&target_dir);
     Ok(ResolvedFleet {
-        repo_root: is_git.then_some(resolved_root.clone()),
+        repo_root: is_git.then_some(resolved_root.to_path_buf()),
         is_git,
-        paths: FleetPaths::discover_with_env(&resolved_root, parl_dir),
+        paths: FleetPaths::discover_with_env(resolved_root, parl_dir),
         target_dir,
     })
 }
@@ -152,9 +160,10 @@ mod tests {
         let deadline = Instant::now() + 3 * RETRY_BOUND;
         let mut last_seen = String::from("no attempt completed");
         let (sub_real, in_repo) = loop {
-            if Instant::now() >= deadline {
-                panic!("resolve_fleet_dir never anchored at the repo root: {last_seen}");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "resolve_fleet_dir never anchored at the repo root: {last_seen}"
+            );
             let root = tmp_dir("parl-ops-resolve-");
             git_sync(&root, &["init", "-q", "-b", "main"]);
             let sub = root.join("sub");
