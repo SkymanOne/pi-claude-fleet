@@ -288,10 +288,41 @@ fn option_row(label: &str, selected: bool, pal: &Palette) -> Line<'static> {
 fn palette(frame: &mut Frame, area: Rect, state: &PaletteState, pal: &Palette) {
     let width = 80u16.min(area.width.saturating_sub(4));
     let inner_width = width.saturating_sub(4) as usize;
-    // query + one footer line, plus room for as many results as fit
-    let max_items = area.height.saturating_sub(6) as usize;
-    let shown = state.visible.len().min(max_items.max(3));
-    let height = shown as u16 + 5; // query + blank + items + footer + borders
+    // budget the rows: query, a blank, and the footer are fixed; every
+    // distinct group in the window adds its label line
+    let fixed = 5u16; // query + blank + footer + both borders
+    let label_budget = 4u16; // five groups exist, one change earns a label
+    let max_items = (area.height.saturating_sub(fixed + label_budget)).max(3) as usize;
+    let shown = state.visible.len().min(max_items);
+    // a window over the ranked list, the selection kept in view
+    let selected = state.selected;
+    let start = if state.visible.len() <= shown {
+        0
+    } else {
+        selected
+            .saturating_sub(shown / 2)
+            .min(state.visible.len() - shown)
+    };
+    let window: Vec<usize> = state
+        .visible
+        .iter()
+        .skip(start)
+        .take(shown)
+        .copied()
+        .collect();
+    let label_rows = {
+        let mut labels: Vec<String> = Vec::new();
+        for &index in &window {
+            let label = state.items[index].group.label();
+            if labels.last() != Some(&label) {
+                labels.push(label);
+            }
+        }
+        labels.len() as u16
+    };
+    let height = (shown as u16 + fixed + label_rows)
+        .min(area.height.saturating_sub(2))
+        .max(5);
     let inner = panel(
         frame,
         centered(area, width, height),
@@ -306,17 +337,8 @@ fn palette(frame: &mut Frame, area: Rect, state: &PaletteState, pal: &Palette) {
         Span::styled("▍".to_string(), pal.accent()),
     ])];
 
-    // a window over the ranked list, the selection kept in view
-    let selected = state.selected;
-    let start = if state.visible.len() <= shown {
-        0
-    } else {
-        selected
-            .saturating_sub(shown / 2)
-            .min(state.visible.len() - shown)
-    };
     let mut previous_group: Option<String> = None;
-    for &index in state.visible.iter().skip(start).take(shown) {
+    for &index in &window {
         let Some(item) = state.items.get(index) else {
             continue;
         };
