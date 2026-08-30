@@ -48,6 +48,8 @@ pub enum KeyAction {
     Quit,
     /// `Q`: stop the orchestrator and every worker (asks first).
     Shutdown,
+    /// `i`: enter insert mode without typing the key.
+    EnterInsert,
     // -- session actions on the selected session (normal mode) --
     /// `a`: answer the pending question or dialog.
     Answer,
@@ -136,6 +138,7 @@ fn map_normal(key: KeyEvent) -> KeyAction {
         KeyCode::Char('?') => A::Help,
         KeyCode::Char('q') => A::Quit,
         KeyCode::Char('Q') => A::Shutdown,
+        KeyCode::Char('i') => A::EnterInsert,
         KeyCode::Char('a') => A::Answer,
         KeyCode::Char('s') => A::Stop,
         KeyCode::Char('x') => A::Remove,
@@ -277,8 +280,8 @@ pub const NORMAL_KEYS: &[KeyHelp] = &[
         what: "stop the orchestrator and every worker, then exit",
     },
     KeyHelp {
-        keys: "i (or any letter)",
-        what: "compose: enter insert mode, keeping the key",
+        keys: "i",
+        what: "compose: enter insert mode (any other key types and enters too)",
     },
 ];
 
@@ -440,6 +443,10 @@ mod tests {
         assert_eq!(map_key(Mode::Normal, key(KeyCode::Char('?'))), A::Help);
         assert_eq!(map_key(Mode::Normal, key(KeyCode::Char('q'))), A::Quit);
         assert_eq!(map_key(Mode::Normal, key(KeyCode::Char('Q'))), A::Shutdown);
+        assert_eq!(
+            map_key(Mode::Normal, key(KeyCode::Char('i'))),
+            A::EnterInsert
+        );
         assert_eq!(map_key(Mode::Normal, key(KeyCode::Char('a'))), A::Answer);
         assert_eq!(map_key(Mode::Normal, key(KeyCode::Char('s'))), A::Stop);
         assert_eq!(map_key(Mode::Normal, key(KeyCode::Char('x'))), A::Remove);
