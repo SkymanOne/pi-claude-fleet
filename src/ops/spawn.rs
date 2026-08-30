@@ -2,19 +2,19 @@
 //! write `run.json`, boot the detached monitor. (Ported from the TypeScript
 //! `src/spawn.ts` and `spawnCore` in `src/commands.ts`.)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use serde::Serialize;
 
 use crate::cli::ExitCode;
-use crate::fleet::run::RunState;
+use crate::fleet::run::{self, RunRef, RunState, RunStatus};
 use crate::git;
 use crate::paths::FleetPaths;
-use crate::util::{run_id_for, sanitize_name};
+use crate::util::{now_ms, run_id_for, sanitize_name};
 use crate::worker::models::{check_model, pi_bin_spec};
 
-use super::{CommandResult, fail, ok, print_result, resolve_fleet_dir_with_env};
+use super::{CommandResult, fail, print_result, resolve_fleet_dir_with_env};
 
 /// Everything `spawn` needs to know; constructed verbatim by `main.rs` from
 /// the parsed CLI, so the field set is a frozen contract.
@@ -60,6 +60,11 @@ pub struct CreatedRun {
 /// Spawn one worker: the CLI entry point. Prints the core's lines and hands
 /// back its exit code; hard errors (no brief, no name, bad cwd) surface
 /// through `main` as `parl: …` and exit 1.
+///
+/// # Errors
+///
+/// Fails on a missing brief or name, a bad `cwd`, or a name that already
+/// has a live run; model refusal comes back through the printed exit code.
 pub async fn spawn_run(request: SpawnRequest) -> anyhow::Result<ExitCode> {
     Ok(print_result(spawn_core(request).await?))
 }
@@ -67,6 +72,11 @@ pub async fn spawn_run(request: SpawnRequest) -> anyhow::Result<ExitCode> {
 /// The spawn core: the model is checked before a worktree and a branch exist,
 /// so a wrong name costs a second. The unknown-model refusal is a `fail`,
 /// not an error, and keeps the TypeScript exit code (`2`).
+///
+/// # Errors
+///
+/// Fails on a missing brief, an unresolvable `cwd`, a same-second name
+/// collision, or a name whose previous run is still live.
 pub async fn spawn_core(request: SpawnRequest) -> anyhow::Result<CommandResult<SpawnData>> {
     spawn_core_with_env(request, super::ambient_parl_dir().as_deref()).await
 }
@@ -88,7 +98,7 @@ pub(crate) async fn spawn_core_with_env(
     if !created.state.is_git && request.worktree {
         err.push("warning: target is not a git repo — running in place without a worktree".into());
     }
-    launch_monitor(&created.paths, &created.run_id).await?;
+    launch_monitor(&created.paths, &created.run_id)?;
     let run_dir = created.run_dir.to_string_lossy().into_owned();
     let mut out = vec![
         format!("Spawned {}", created.run_id),
@@ -111,11 +121,24 @@ pub(crate) async fn spawn_core_with_env(
             .map(|p| p.to_string_lossy().into_owned()),
         branch: created.state.branch.clone(),
     };
-    Ok(ok(data, out))
+    // The no-git warning lives in `err`, so `ok` (which zeroes it) is not used.
+    Ok(CommandResult {
+        code: ExitCode::Ok,
+        out,
+        err,
+        data,
+    })
 }
 
 /// Create the run: sanitise the name, stamp the run id, cut the worktree on
 /// its own branch from `--base` (or HEAD), and write the initial `run.json`.
+///
+/// # Errors
+///
+/// Fails on a missing name, a `cwd` that does not exist, a same-name spawn
+/// within one second, a name whose previous run is still live, or a
+/// worktree git cannot cut. A prior terminal run of the same name is
+/// archived here, not refused.
 pub async fn create_run(request: &SpawnRequest) -> anyhow::Result<CreatedRun> {
     create_run_with_env(request, super::ambient_parl_dir().as_deref()).await
 }
@@ -138,6 +161,25 @@ async fn create_run_with_env(
         anyhow::bail!(
             "spawn: run {run_id} already exists (same name spawned twice within one second) — retry"
         );
+    }
+    // A name may have only one live run. A prior terminal run of the same
+    // name is archived here as part of the spawn, so `cleanup <name>` and
+    // the other ops never resolve to a stale twin; a still-running namesake
+    // refuses the spawn — silently duplicating it is how a live worker was
+    // archived by accident before.
+    for prior in live_namesakes(fleet.paths.root(), &name) {
+        let derived = run::derive_status(&prior.state, run::is_alive, now_ms());
+        if !derived.is_terminal() {
+            anyhow::bail!(
+                "spawn: run {} (name \"{}\") is still {derived} — a name may have only \
+one live run; stop or clean it first, or use another name.",
+                prior.run_id,
+                name
+            );
+        }
+        let mut stale = prior.state.clone();
+        stale.status = RunStatus::Archived;
+        run::save_state(&prior.run_dir, &stale)?;
     }
 
     let (worktree_path, branch) = match fleet.repo_root.as_deref().filter(|_| request.worktree) {
@@ -201,13 +243,35 @@ async fn create_run_with_env(
     })
 }
 
+/// The non-archived runs sharing `name` — exact id or `<name>-<14-digit
+/// stamp>`, the same resolution set [`run::find_run`] picks from — newest
+/// first. Unreadable `run.json` files are skipped, like everywhere else.
+fn live_namesakes(fleet_dir: &Path, name: &str) -> Vec<RunRef> {
+    let key = sanitize_name(name);
+    let Ok(of_name) = regex::Regex::new(&format!("^{}-\\d{{14}}$", regex::escape(&key))) else {
+        return Vec::new();
+    };
+    run::list_runs(fleet_dir)
+        .into_iter()
+        .filter(|r| r.run_id == key || of_name.is_match(&r.run_id))
+        .filter_map(|r| {
+            run::load_state(&r.run_dir).ok().map(|state| RunRef {
+                run_id: r.run_id,
+                run_dir: r.run_dir,
+                state,
+            })
+        })
+        .filter(|r| r.state.status != RunStatus::Archived)
+        .collect()
+}
+
 /// Launch `parl monitor` for the run, detached: its own process group
 /// (`process_group(0)` — the safe equivalent of Node's `detached: true`),
 /// stdio into the run's `pi.log`. The child outlives this process, and it is
 /// reaped by a background task: nobody waits on the handle, and an unreaped
 /// child would linger as a zombie whose pid keeps answering `kill(pid, 0)` —
 /// so a crashed monitor could never read as dead. Returns the monitor's pid.
-async fn launch_monitor(paths: &FleetPaths, run_id: &str) -> std::io::Result<u32> {
+fn launch_monitor(paths: &FleetPaths, run_id: &str) -> std::io::Result<u32> {
     let exe = std::env::current_exe()?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -235,7 +299,9 @@ async fn launch_monitor(paths: &FleetPaths, run_id: &str) -> std::io::Result<u32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet::run::{RunStatus, save_state};
     use crate::git::test_support::{git_sync, tmp_dir};
+    use crate::ops::resolve_fleet_dir_with_env;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -367,7 +433,7 @@ mod tests {
         // `--fleet-dir`/`--run` flags and exits at once — a short-lived
         // stand-in for a monitor that crashes. This process stays alive
         // throughout, so reaping must come from the background task.
-        let pid = launch_monitor(&paths, run_id).await.unwrap();
+        let pid = launch_monitor(&paths, run_id).unwrap();
         let pid = i32::try_from(pid).unwrap();
         // A dropped (unreaped) child stays a zombie, and a zombie answers
         // `kill(pid, 0)` — exactly what `fleet::run::is_alive` checks. Poll
@@ -380,6 +446,102 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    /// A hand-written prior run on disk, the way an earlier spawn left it:
+    /// no worktree, a fixed id so it never collides with a live stamp.
+    fn put_run(
+        paths: &FleetPaths,
+        name: &str,
+        run_id: &str,
+        status: RunStatus,
+        pid: Option<i32>,
+    ) -> PathBuf {
+        let run_dir = paths.run_dir(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut state = RunState::new(
+            paths.root().to_string_lossy().as_ref(),
+            run_id,
+            name,
+            "/tmp/x",
+            "b",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        state.status = status;
+        state.pid = pid;
+        save_state(&run_dir, &state).unwrap();
+        run_dir
+    }
+
+    #[tokio::test]
+    async fn spawn_archives_a_stale_namesake() {
+        let root = init_repo("parl-spawn-dupe-");
+        let fleet = resolve_fleet_dir_with_env(Some(&root), None).await.unwrap();
+        fleet.paths.ensure().unwrap();
+        // A settled prior run of the same name: spawning anew archives it as
+        // part of the spawn, so the name keeps exactly one live entry and
+        // `cleanup <name>` cannot resolve to a stale twin.
+        let stale = put_run(
+            &fleet.paths,
+            "auth",
+            "auth-20990101000000",
+            RunStatus::Settled,
+            None,
+        );
+        let created = create_run_with_retry(&request("auth", "new work", &root, true))
+            .await
+            .unwrap();
+        assert_ne!(created.run_id, "auth-20990101000000", "a fresh run id");
+        assert_eq!(
+            crate::fleet::run::load_state(&stale).unwrap().status,
+            RunStatus::Archived,
+            "spawn archives the stale namesake"
+        );
+        assert_eq!(
+            crate::fleet::run::load_state(&created.run_dir)
+                .unwrap()
+                .status,
+            RunStatus::Starting
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_refuses_when_the_name_still_runs() {
+        let root = init_repo("parl-spawn-live-");
+        let fleet = resolve_fleet_dir_with_env(Some(&root), None).await.unwrap();
+        fleet.paths.ensure().unwrap();
+        // A still-running namesake refuses the spawn, naming the live run:
+        // silently duplicating the name is how a live worker was archived.
+        let live_id = "auth-20990101000001";
+        let live_dir = put_run(
+            &fleet.paths,
+            "auth",
+            live_id,
+            RunStatus::Running,
+            Some(std::process::id().cast_signed()),
+        );
+        let err = create_run_with_env(&request("auth", "again", &root, true), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(live_id), "{err}");
+        assert!(err.contains("still running"), "{err}");
+        assert!(err.contains("one live run"), "{err}");
+        assert_eq!(
+            crate::fleet::run::load_state(&live_dir).unwrap().status,
+            RunStatus::Running,
+            "the live run is untouched"
+        );
     }
 
     #[tokio::test]
