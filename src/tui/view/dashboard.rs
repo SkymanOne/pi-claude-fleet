@@ -165,19 +165,21 @@ fn secondary_line(row: &DashboardRow, selected: bool, pal: &Palette) -> Line<'st
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, console: &Console, pal: &Palette) {
-    let line = match console.flash() {
-        Some(flash) => Line::styled(
-            flash.text.clone(),
-            if flash.error { pal.error() } else { pal.dim() },
-        ),
-        None => {
+    let line = console.flash().map_or_else(
+        || {
             let hint = match console.mode() {
                 crate::tui::keys::Mode::Normal => HINTS_NORMAL,
                 crate::tui::keys::Mode::Insert => HINTS_INSERT,
             };
             Line::styled(hint.to_string(), pal.dim())
-        }
-    };
+        },
+        |flash| {
+            Line::styled(
+                flash.text.clone(),
+                if flash.error { pal.error() } else { pal.dim() },
+            )
+        },
+    );
     frame.render_widget(Paragraph::new(line), area);
 }
 
