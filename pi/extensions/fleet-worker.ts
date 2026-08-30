@@ -70,9 +70,9 @@ export function buildFleetProtocol(env: FleetEnv, cwd: string): string | null {
     `1. Before you finish (before your final assistant turn), write your final report to \`${reportPath}\` using EXACTLY the template below — keep every heading, in order.`,
     "2. For long tasks, call `fleet_progress` with a one-line note at each milestone. The orchestrator sees it live.",
     "3. Stay scoped to your task brief. Do not touch files outside your working directory. Never run `git merge`, never modify the parent checkout, never push.",
-    "4. If you receive steering messages mid-run (course corrections from the orchestrator or from the user's console), incorporate them immediately. Your final report MUST reflect the adjusted direction: list every steering message under \"Steering received\" and keep Status/Verification consistent with the work as finally done.",
-    "5. When you are blocked on a decision or a missing input, call `fleet_ask` (question, optional options and context) instead of guessing. It waits for the orchestrator's answer and returns it. If it reports that no answer arrived in time, proceed on your best judgment and record the choice under \"Decisions & assumptions\".",
-    "6. If you cannot proceed even after asking, set `Status: blocked` and fill \"Open questions for orchestrator\".",
+    '4. If you receive steering messages mid-run (course corrections from the orchestrator or from the user\'s console), incorporate them immediately. Your final report MUST reflect the adjusted direction: list every steering message under "Steering received" and keep Status/Verification consistent with the work as finally done.',
+    '5. When you are blocked on a decision or a missing input, call `fleet_ask` (question, optional options and context) instead of guessing. It waits for the orchestrator\'s answer and returns it. If it reports that no answer arrived in time, proceed on your best judgment and record the choice under "Decisions & assumptions".',
+    '6. If you cannot proceed even after asking, set `Status: blocked` and fill "Open questions for orchestrator".',
     "",
     "Report template:",
     "",
@@ -116,7 +116,11 @@ export function inboxPath(fleetDir: string, runId: string): string {
   return path.join(runDir(fleetDir, runId), "inbox.jsonl");
 }
 
-export function appendOutbox(fleetDir: string, runId: string, line: Omit<OutboxLine, "id" | "ts" | "from" | "to"> & { id?: string }): OutboxLine {
+export function appendOutbox(
+  fleetDir: string,
+  runId: string,
+  line: Omit<OutboxLine, "id" | "ts" | "from" | "to"> & { id?: string },
+): OutboxLine {
   const full: OutboxLine = {
     id: line.id ?? newId("m"),
     ts: nowIso(),
@@ -140,7 +144,10 @@ export function fileSize(p: string): number {
 }
 
 /** Complete lines appended after byte `offset`; a partial trailing line is left for next time. */
-export function readNewLines(p: string, offset: number): { lines: string[]; offset: number } {
+export function readNewLines(
+  p: string,
+  offset: number,
+): { lines: string[]; offset: number } {
   const size = fileSize(p);
   if (size <= offset) return { lines: [], offset };
   const buf = Buffer.alloc(size - offset);
@@ -173,21 +180,34 @@ export interface Answer {
  */
 export function findAnswer(lines: string[], questionId: string): Answer | null {
   for (const line of lines) {
-    let msg: { type?: unknown; from?: unknown; payload?: { questionId?: unknown; message?: unknown } };
+    let msg: {
+      type?: unknown;
+      from?: unknown;
+      payload?: { questionId?: unknown; message?: unknown };
+    };
     try {
       msg = JSON.parse(line);
     } catch {
       continue;
     }
     const payload = msg?.payload;
-    if (msg?.type === "answer" && payload && payload.questionId === questionId && typeof payload.message === "string") {
-      return { message: payload.message, source: typeof msg.from === "string" ? msg.from : "unknown" };
+    if (
+      msg?.type === "answer" &&
+      payload &&
+      payload.questionId === questionId &&
+      typeof payload.message === "string"
+    ) {
+      return {
+        message: payload.message,
+        source: typeof msg.from === "string" ? msg.from : "unknown",
+      };
     }
   }
   return null;
 }
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number): Promise<void> =>
+  new Promise((r) => setTimeout(r, ms));
 
 export interface AskParams {
   question: string;
@@ -213,8 +233,14 @@ export async function askOrchestrator(
 ): Promise<AskResult> {
   const fleetDir = env.PARL_DIR!;
   const runId = env.PARL_RUN!;
-  const pollMs = Number(env.PARL_ASK_POLL_MS) > 0 ? Number(env.PARL_ASK_POLL_MS) : DEFAULT_ASK_POLL_MS;
-  const timeoutMs = Number(env.PARL_ASK_TIMEOUT_MS) > 0 ? Number(env.PARL_ASK_TIMEOUT_MS) : DEFAULT_ASK_TIMEOUT_MS;
+  const pollMs =
+    Number(env.PARL_ASK_POLL_MS) > 0
+      ? Number(env.PARL_ASK_POLL_MS)
+      : DEFAULT_ASK_POLL_MS;
+  const timeoutMs =
+    Number(env.PARL_ASK_TIMEOUT_MS) > 0
+      ? Number(env.PARL_ASK_TIMEOUT_MS)
+      : DEFAULT_ASK_TIMEOUT_MS;
   const inbox = inboxPath(fleetDir, runId);
   // Answers can only arrive after the question is posted, so start reading at the current end.
   let offset = fileSize(inbox);
@@ -224,7 +250,10 @@ export async function askOrchestrator(
     type: "question",
     payload: {
       question: params.question,
-      options: Array.isArray(params.options) && params.options.length > 0 ? params.options : null,
+      options:
+        Array.isArray(params.options) && params.options.length > 0
+          ? params.options
+          : null,
       context: params.context ?? null,
     },
   });
@@ -247,7 +276,10 @@ export async function askOrchestrator(
     if (Date.now() >= deadline) break;
     await sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())));
   }
-  appendOutbox(fleetDir, runId, { type: "question_resolved", payload: { questionId, how } });
+  appendOutbox(fleetDir, runId, {
+    type: "question_resolved",
+    payload: { questionId, how },
+  });
   const minutes = Math.round(timeoutMs / 60_000);
   const text =
     how === "answered"
@@ -262,16 +294,32 @@ export async function askOrchestrator(
 export function noteProgress(env: FleetEnv, message: string): OutboxLine {
   const fleetDir = env.PARL_DIR!;
   const runId = env.PARL_RUN!;
-  return appendOutbox(fleetDir, runId, { type: "progress", payload: { message } });
+  return appendOutbox(fleetDir, runId, {
+    type: "progress",
+    payload: { message },
+  });
 }
 
 // ---------------------------------------------------------------------------
 // Tool definitions
 
 const ASK_PARAMS = Type.Object({
-  question: Type.String({ description: "The decision or input you need, phrased so someone can answer it in one line" }),
-  options: Type.Optional(Type.Array(Type.String(), { description: "Concrete choices, if the question has a small set of answers" })),
-  context: Type.Optional(Type.String({ description: "One or two sentences of context the orchestrator needs to decide" })),
+  question: Type.String({
+    description:
+      "The decision or input you need, phrased so someone can answer it in one line",
+  }),
+  options: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Concrete choices, if the question has a small set of answers",
+    }),
+  ),
+  context: Type.Optional(
+    Type.String({
+      description:
+        "One or two sentences of context the orchestrator needs to decide",
+    }),
+  ),
 });
 
 const PROGRESS_PARAMS = Type.Object({
@@ -285,22 +333,37 @@ export function fleetTools(env: FleetEnv) {
       label: "Ask orchestrator",
       description:
         "Ask the fleet orchestrator a question and wait for the answer. Use it when you are blocked on a decision or a missing input instead of guessing. Returns the answer, or tells you to proceed on your own judgment when none arrives in time.",
-      promptSnippet: "Ask the orchestrator when blocked on a decision or missing input",
+      promptSnippet:
+        "Ask the orchestrator when blocked on a decision or missing input",
       parameters: ASK_PARAMS,
       async execute(
         _toolCallId: string,
         params: AskParams,
         signal: AbortSignal | undefined,
-        onUpdate: ((partial: { content: { type: "text"; text: string }[]; details: unknown }) => void) | undefined,
+        onUpdate:
+          | ((partial: {
+              content: { type: "text"; text: string }[];
+              details: unknown;
+            }) => void)
+          | undefined,
       ) {
         const result = await askOrchestrator(env, params, {
           signal,
           onWaiting: (questionId) =>
-            onUpdate?.({ content: [{ type: "text", text: "waiting for the orchestrator…" }], details: { questionId } }),
+            onUpdate?.({
+              content: [
+                { type: "text", text: "waiting for the orchestrator…" },
+              ],
+              details: { questionId },
+            }),
         });
         return {
           content: [{ type: "text" as const, text: result.text }],
-          details: { questionId: result.questionId, how: result.how, answer: result.answer },
+          details: {
+            questionId: result.questionId,
+            how: result.how,
+            answer: result.answer,
+          },
         };
       },
     },
@@ -312,7 +375,10 @@ export function fleetTools(env: FleetEnv) {
       parameters: PROGRESS_PARAMS,
       async execute(_toolCallId: string, params: { message: string }) {
         const line = noteProgress(env, params.message);
-        return { content: [{ type: "text" as const, text: "noted" }], details: { id: line.id } };
+        return {
+          content: [{ type: "text" as const, text: "noted" }],
+          details: { id: line.id },
+        };
       },
     },
   ];

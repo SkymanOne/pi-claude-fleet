@@ -13,30 +13,39 @@ You are running as a worker for `parl`. The orchestrator never reads this chat. 
 # Fleet Report: <run name>
 
 ## Status
+
 done | blocked | failed
 
 ## Summary
+
 (3-8 sentences: what was accomplished and the outcome)
 
 ## What I did
+
 (numbered steps actually taken)
 
 ## Files changed
+
 (path: one-line reason, from your actual edits)
 
 ## Verification
+
 (command run → result, for each check performed)
 
 ## Decisions & assumptions
+
 (any choice made without explicit instruction)
 
 ## Steering received
+
 (mid-run course corrections you were given and how you handled them; "none" if none)
 
 ## Open questions for orchestrator
+
 (things you could not resolve; empty if none, REQUIRED if Status: blocked)
 
 ## Suggested next step
+
 (one concrete next action for the orchestrator)
 ```
 
