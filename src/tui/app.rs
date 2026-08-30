@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use anyhow::Context as _;
 use crossterm::event::KeyEvent;
 use serde_json::{Value, json};
 
@@ -2433,12 +2434,58 @@ fn char_to_byte(input: &str, char_index: usize) -> usize {
 
 /// Run the console until the user quits; workers keep running after.
 ///
-/// The terminal half is `runtime.rs` (the tui-render step): it installs the
-/// terminal, feeds key events to [`Console::handle_key`], executes the
-/// returned effects with [`Console::execute_all`], polls the fleet for the
-/// feeds, and draws the view model this module builds.
-pub async fn run_app(_options: TuiOptions) -> anyhow::Result<crate::cli::ExitCode> {
-    anyhow::bail!("not implemented yet: tui runtime (tui-render step wires this)")
+/// The terminal half is `runtime.rs`: this resolves the fleet, refuses a
+/// non-interactive launch with guidance, takes the single-instance lock
+/// (before the terminal goes raw, so a refusal prints to a normal shell),
+/// installs the terminal and the panic hook, and hands the event loop to
+/// [`crate::tui::runtime::run_console`]. The terminal is restored on every
+/// exit path — panic included — before anything prints.
+pub async fn run_app(options: TuiOptions) -> anyhow::Result<crate::cli::ExitCode> {
+    let cwd = match options.cwd.clone() {
+        Some(dir) => dir,
+        None => std::env::current_dir().context("no working directory")?,
+    };
+    if !crate::tui::runtime::is_interactive() {
+        anyhow::bail!(
+            "the fleet console needs an interactive terminal.\n\
+             Run it in one, or drive the fleet headlessly: \
+             `parl spawn <name> -- \"<brief>\"`, `parl status`, `parl report <name>`."
+        );
+    }
+    let fleet = FleetPaths::discover(&cwd);
+    fleet
+        .ensure()
+        .context("creating the fleet state directory")?;
+    let lock = crate::tui::runtime::ConsoleLock::acquire(&fleet)?;
+    crate::tui::runtime::install_panic_hook();
+    let mut terminal = crate::tui::runtime::enter()?;
+
+    let result = crate::tui::runtime::run_console(&mut terminal, fleet.clone(), &lock).await;
+
+    // the terminal comes back before anything prints, whatever happened
+    crate::tui::runtime::restore();
+    drop(lock);
+
+    let code = result?;
+    // what is left running decides the goodbye
+    let orchestrator_exited = std::fs::read_to_string(fleet.orchestrator_state())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<OrchestratorState>(&raw).ok())
+        .and_then(|state| state.exited)
+        .is_some();
+    if orchestrator_exited {
+        println!(
+            "Shutdown requested; the orchestrator is stopping. `parl status` shows the workers. \
+             Worktrees and branches are kept."
+        );
+    } else {
+        println!(
+            "The orchestrator and its workers keep running. `parl` reopens this console where \
+             you left it; `parl status` lists the workers. `/shutdown` inside the console stops \
+             everything."
+        );
+    }
+    Ok(code)
 }
 
 #[cfg(test)]
