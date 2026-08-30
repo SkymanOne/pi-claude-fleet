@@ -169,6 +169,24 @@ pub struct WorkerModel {
     pub name: Option<String>,
 }
 
+/// The fleet-level pi catalogue: the models and commands pi offers. These
+/// describe the pi installation, not the run — every run used to carry a
+/// byte-identical copy in `run.json`, which is what let a single `run.json`
+/// reach 128 KB across 40 runs. They now live once in `<fleet>/pi-cache.json`,
+/// written by a worker monitor at boot and merged back into state by
+/// [`load_state`], so the console's model switcher and command lists see the
+/// same data they always did. Serde-tolerant like everything on disk: unknown
+/// fields are ignored and missing ones default.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PiCache {
+    /// The models pi has configured, for the console's model switcher.
+    pub available_models: Vec<WorkerModel>,
+    /// Commands, skills and prompt templates this worker offers
+    /// (pi's `get_commands`).
+    pub commands: Vec<WorkerCommand>,
+}
+
 /// The run's durable facts, stored as `runs/<id>/run.json`.
 ///
 /// Field names stay camelCase on disk to match the JSON the fleet tooling and
@@ -250,9 +268,11 @@ pub struct RunState {
     /// like [`Self::pending_question`].
     #[serde(default)]
     pub pending_dialog: Option<PendingDialog>,
-    /// The models pi has configured (its `get_available_models`), for the
-    /// console's model switcher.
-    #[serde(default)]
+    /// The models pi has configured — a load-time view drawn from the
+    /// fleet-level pi cache. Never serialized: the on-disk `run.json` does
+    /// not carry the catalogue (legacy files that still do load fine and
+    /// are simply never written again).
+    #[serde(default, skip_serializing)]
     pub available_models: Vec<WorkerModel>,
     /// The model pi actually resolved (from its `get_state`), as opposed to
     /// the `--model` pattern asked for.
@@ -260,9 +280,10 @@ pub struct RunState {
     pub active_model: Option<String>,
     #[serde(default)]
     pub active_provider: Option<String>,
-    /// Commands, skills and prompt templates this worker offers
-    /// (pi's `get_commands`).
-    #[serde(default)]
+    /// Commands, skills and prompt templates this worker offers — the same
+    /// load-time fleet-cache view as [`Self::available_models`], equally
+    /// never serialized.
+    #[serde(default, skip_serializing)]
     pub commands: Vec<WorkerCommand>,
     /// The reasoning level pi is running at, as it reports it.
     #[serde(default)]
@@ -356,8 +377,52 @@ pub fn run_json_path(run_dir: &Path) -> PathBuf {
     run_dir.join("run.json")
 }
 
+/// `<fleet>/pi-cache.json` — the fleet-level pi catalogue ([`PiCache`]).
+#[must_use]
+pub fn pi_cache_json_path(fleet_dir: &Path) -> PathBuf {
+    fleet_dir.join(crate::paths::PI_CACHE_FILE)
+}
+
+/// Read the fleet-level pi catalogue. Tolerant on purpose: a missing,
+/// unreadable or unparsable cache reads as `None`, so callers degrade to an
+/// empty model/command list instead of erroring. A write is atomic, so a
+/// half-written file is never observed.
+#[must_use]
+pub fn read_pi_cache(fleet_dir: &Path) -> Option<PiCache> {
+    let raw = std::fs::read_to_string(pi_cache_json_path(fleet_dir)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Write the fleet-level pi catalogue atomically (tmp + fsync + rename, like
+/// [`save_state`]). Best-effort at the call sites: the cache is derived data
+/// a monitor rewrites at every boot, so a lost write just means the console
+/// shows an empty catalogue until the next boot.
+///
+/// # Errors
+///
+/// Returns `std::io::Error` when serialization or the atomic rename fails.
+pub fn write_pi_cache(fleet_dir: &Path, cache: &PiCache) -> std::io::Result<()> {
+    atomic_write_json(&pi_cache_json_path(fleet_dir), cache)
+}
+
+/// The read path for the pi catalogue: the fleet cache when it reads and
+/// parses, else empty. Legacy `run.json` values are never trusted and never
+/// re-persisted ([`save_state`] strips them); a missing or stale cache
+/// degrades to an empty catalogue, never to an error.
+fn state_pi_catalogue(run_dir: &Path) -> (Vec<WorkerModel>, Vec<WorkerCommand>) {
+    let Some(cache) = run_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(read_pi_cache)
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    (cache.available_models, cache.commands)
+}
+
 /// Read a run's `run.json`, tolerating nothing: a missing or corrupted file
-/// is an error with a message naming the directory.
+/// is an error with a message naming the directory. The pi catalogue fields
+/// come from the fleet-level cache, never from the file itself.
 ///
 /// # Errors
 ///
@@ -366,11 +431,16 @@ pub fn run_json_path(run_dir: &Path) -> PathBuf {
 pub fn load_state(run_dir: &Path) -> anyhow::Result<RunState> {
     let raw = std::fs::read_to_string(run_json_path(run_dir))
         .map_err(|_| anyhow::anyhow!("No readable run.json in {}", run_dir.display()))?;
-    serde_json::from_str(&raw)
-        .map_err(|_| anyhow::anyhow!("Corrupted run.json in {}", run_dir.display()))
+    let mut state: RunState = serde_json::from_str(&raw)
+        .map_err(|_| anyhow::anyhow!("Corrupted run.json in {}", run_dir.display()))?;
+    (state.available_models, state.commands) = state_pi_catalogue(run_dir);
+    Ok(state)
 }
 
-/// Write a run's `run.json` atomically.
+/// Write a run's `run.json` atomically. The pi catalogue fields carry
+/// `skip_serializing`, so they can never reappear in `run.json` — a
+/// loaded-then-saved state cannot grow a file back to 100+ KB of duplicated
+/// catalogue.
 ///
 /// # Errors
 ///
@@ -813,6 +883,92 @@ mod tests {
         assert_eq!(state.pending_question, None);
         assert!(!state.is_git);
         assert_eq!(state.commands, Vec::<WorkerCommand>::new());
+    }
+
+    #[test]
+    fn a_legacy_run_json_still_carrying_the_pi_catalogue_loads_and_is_stripped_on_save() {
+        let fleet = fleet_dir("parl-run-");
+        let run_dir = fleet.join("runs/auth-20260828141530");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // A state file written before the cache existed: both catalogue
+        // fields present, in the old camelCase spelling.
+        std::fs::write(
+            run_json_path(&run_dir),
+            r#"{
+                "id": "auth-20260828141530",
+                "name": "auth",
+                "status": "running",
+                "cwd": "/tmp/x",
+                "fleetDir": "/tmp/x/.parl",
+                "createdAt": "2026-08-28T14:15:30.000Z",
+                "taskBrief": "b",
+                "availableModels": [{"provider": "anthropic", "id": "claude-opus-5", "name": "Opus"}],
+                "commands": [{"name": "compact-notes", "description": "Summarize the session", "source": "prompt"}]
+            }"#,
+        )
+        .unwrap();
+        // Loads without error. Without a fleet cache the catalogue reads
+        // empty: the console sources it from pi-cache.json, never from here.
+        let state = load_state(&run_dir).unwrap();
+        assert_eq!(state.status, RunStatus::Running);
+        assert!(state.available_models.is_empty());
+        assert!(state.commands.is_empty());
+        // A save never writes the catalogue back into run.json.
+        save_state(&run_dir, &state).unwrap();
+        let raw = std::fs::read_to_string(run_json_path(&run_dir)).unwrap();
+        assert!(!raw.contains("availableModels"), "{raw}");
+        assert!(!raw.contains("\"commands\""), "{raw}");
+    }
+
+    #[test]
+    fn load_state_sources_the_pi_catalogue_from_the_fleet_cache() {
+        let fleet = fleet_dir("parl-run-");
+        let run_dir = fleet.join("runs/auth-20260828141530");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        save_state(&run_dir, &base_state(&fleet, "auth-20260828141530")).unwrap();
+        let cache = PiCache {
+            available_models: vec![WorkerModel {
+                provider: "anthropic".into(),
+                id: "claude-opus-5".into(),
+                name: Some("Opus".into()),
+            }],
+            commands: vec![WorkerCommand {
+                name: "compact-notes".into(),
+                description: "Summarize the session".into(),
+                source: "prompt".into(),
+            }],
+        };
+        write_pi_cache(&fleet, &cache).unwrap();
+        assert_eq!(read_pi_cache(&fleet), Some(cache.clone()));
+        let state = load_state(&run_dir).unwrap();
+        assert_eq!(state.available_models, cache.available_models);
+        assert_eq!(state.commands, cache.commands);
+        // The atomic write leaves no tmp files behind.
+        let leftovers: Vec<String> = std::fs::read_dir(&fleet)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_pi_cache_degrades_to_empty() {
+        let fleet = fleet_dir("parl-run-");
+        let run_dir = fleet.join("runs/auth-20260828141530");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        save_state(&run_dir, &base_state(&fleet, "auth-20260828141530")).unwrap();
+        assert_eq!(read_pi_cache(&fleet), None, "no cache file yet");
+        let state = load_state(&run_dir).unwrap();
+        assert!(state.available_models.is_empty());
+        assert!(state.commands.is_empty());
+        // A stale (unparsable) cache reads as empty too, never an error.
+        std::fs::write(fleet.join(crate::paths::PI_CACHE_FILE), "{oops").unwrap();
+        assert_eq!(read_pi_cache(&fleet), None);
+        let state = load_state(&run_dir).unwrap();
+        assert!(state.available_models.is_empty());
+        assert_eq!(state.id, "auth-20260828141530");
     }
 
     #[test]

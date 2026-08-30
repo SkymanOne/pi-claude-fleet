@@ -16,6 +16,10 @@ pub const STATE_DIR_NAME: &str = ".parl";
 pub const ENV_PREFIX: &str = "PARL";
 /// The command name users type; used in help text, hints, and the prompt.
 pub const BIN_NAME: &str = "parl";
+/// The fleet-level pi catalogue (`availableModels` + `commands`): a property
+/// of the pi installation, byte-identical across runs, so it lives once
+/// here instead of being copied into every `run.json`.
+pub const PI_CACHE_FILE: &str = "pi-cache.json";
 
 /// Env-var name from its suffix: `_DIR` -> `PARL_DIR`.
 #[must_use]
@@ -104,6 +108,13 @@ impl FleetPaths {
     /// remembered prefs.
     pub fn fleet_json(&self) -> PathBuf {
         self.root.join("fleet.json")
+    }
+
+    /// `pi-cache.json` — the fleet-level pi catalogue (models + commands),
+    /// written by a worker monitor at boot and read back through run state
+    /// loading so the console needs no other source.
+    pub fn pi_cache(&self) -> PathBuf {
+        self.root.join(PI_CACHE_FILE)
     }
 
     /// `console.lock` — single-instance lock for the TUI.
