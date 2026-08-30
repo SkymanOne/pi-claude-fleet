@@ -92,7 +92,7 @@ mod tests {
             None,
             None,
         );
-        state.steer_count = entries.len() as u32;
+        state.steer_count = u32::try_from(entries.len()).unwrap();
         state.steering_log = entries;
         state
     }

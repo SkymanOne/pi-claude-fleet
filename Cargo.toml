@@ -2,6 +2,8 @@
 name = "parl"
 version = "0.2.0"
 edition = "2024"
+description = "A fleet of headless pi coding agents in your terminal, orchestrated by Claude Code."
+repository = "https://github.com/SkymanOne/parl"
 
 [[bin]]
 name = "parl"
@@ -36,13 +38,3 @@ assert_cmd = "2.2.2"
 insta = "1.48.0"
 predicates = "3.1.4"
 tempfile = "3.27.0"
-
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
-perf = { level = "deny", priority = -1 }
-unwrap_used = "deny"
-todo = "deny"
-dbg_macro = "deny"

@@ -284,7 +284,7 @@ impl Envelope {
         payload.insert("message".into(), Value::String(model_id.into()));
         payload.insert(
             "provider".into(),
-            provider.map(Value::String).unwrap_or(Value::Null),
+            provider.map_or(Value::Null, Value::String),
         );
         Self::new(from, to, "model", Value::Object(payload))
     }
@@ -315,7 +315,8 @@ impl Envelope {
             from,
             Party::Fleet,
             "question",
-            serde_json::to_value(payload).unwrap_or_else(|_| Value::Object(Default::default())),
+            serde_json::to_value(payload)
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::default())),
         )
     }
 
@@ -350,6 +351,10 @@ impl Envelope {
 }
 
 /// Append an envelope as one JSONL line (creating the file when missing).
+///
+/// # Errors
+///
+/// Returns `std::io::Error` when serialization or appending fails.
 pub fn append_envelope(path: &std::path::Path, envelope: &Envelope) -> std::io::Result<()> {
     append_json_line(path, envelope)
 }

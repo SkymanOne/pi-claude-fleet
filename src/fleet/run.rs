@@ -37,7 +37,7 @@ pub enum RunStatus {
 impl RunStatus {
     /// Terminal states: `wait` stops polling once one is reached.
     #[must_use]
-    pub fn is_terminal(self) -> bool {
+    pub const fn is_terminal(self) -> bool {
         matches!(
             self,
             Self::Settled | Self::Stopped | Self::Error | Self::Dead | Self::Archived
@@ -340,6 +340,11 @@ pub fn run_json_path(run_dir: &Path) -> PathBuf {
 
 /// Read a run's `run.json`, tolerating nothing: a missing or corrupted file
 /// is an error with a message naming the directory.
+///
+/// # Errors
+///
+/// Returns `anyhow::Error` when `run.json` is missing or does not parse,
+/// with the run directory named in the message.
 pub fn load_state(run_dir: &Path) -> anyhow::Result<RunState> {
     let raw = std::fs::read_to_string(run_json_path(run_dir))
         .map_err(|_| anyhow::anyhow!("No readable run.json in {}", run_dir.display()))?;
@@ -348,6 +353,10 @@ pub fn load_state(run_dir: &Path) -> anyhow::Result<RunState> {
 }
 
 /// Write a run's `run.json` atomically.
+///
+/// # Errors
+///
+/// Returns `std::io::Error` when serialization or the atomic rename fails.
 pub fn save_state(run_dir: &Path, state: &RunState) -> std::io::Result<()> {
     atomic_write_json(&run_json_path(run_dir), state)
 }
@@ -363,8 +372,7 @@ pub fn is_alive(pid: Option<i32>) -> bool {
         return false;
     }
     match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
-        Ok(()) => true,
-        Err(nix::errno::Errno::EPERM) => true,
+        Ok(()) | Err(nix::errno::Errno::EPERM) => true,
         Err(_) => false,
     }
 }
@@ -486,6 +494,11 @@ pub fn list_runs(fleet_dir: &Path) -> Vec<RunSummary> {
 /// Resolve `<name>` (newest non-archived run of exactly that name) or a full
 /// run id. A name matches only `<name>-<14-digit stamp>`, so `api` never
 /// resolves to `api-tests-…`.
+///
+/// # Errors
+///
+/// Returns `anyhow::Error` when no run matches `name_or_id` (the regex is
+/// derived from an escaped literal, so its construction cannot fail).
 pub fn find_run(fleet_dir: &Path, name_or_id: &str) -> anyhow::Result<RunRef> {
     let key = sanitize_name(name_or_id.trim());
     let of_name = format!("^{0}-\\d{{14}}$", regex::escape(&key));
@@ -508,13 +521,15 @@ pub fn find_run(fleet_dir: &Path, name_or_id: &str) -> anyhow::Result<RunRef> {
         .iter()
         .find(|c| c.state.status != RunStatus::Archived)
         .or_else(|| candidates.first());
-    match chosen {
-        Some(c) => Ok(c.clone()),
-        None => Err(anyhow::anyhow!(
-            "No run found matching \"{name_or_id}\" in {}",
-            fleet_dir.join("runs").display()
-        )),
-    }
+    chosen.map_or_else(
+        || {
+            Err(anyhow::anyhow!(
+                "No run found matching \"{name_or_id}\" in {}",
+                fleet_dir.join("runs").display()
+            ))
+        },
+        |c| Ok(c.clone()),
+    )
 }
 
 /// Newest pi session file under `<run_dir>/session`, for `--session` resume
@@ -537,15 +552,16 @@ pub fn find_session_file(run_dir: &Path) -> Option<PathBuf> {
 /// Copy-pasteable command to continue a finished run's session in a new run.
 #[must_use]
 pub fn resume_hint(state: &RunState, run_dir: &Path) -> String {
-    let session = find_session_file(run_dir)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| {
+    let session = find_session_file(run_dir).map_or_else(
+        || {
             run_dir
                 .join("session")
                 .join("<session-file>")
                 .to_string_lossy()
                 .into_owned()
-        });
+        },
+        |p| p.to_string_lossy().into_owned(),
+    );
     format!(
         "{} spawn {}-2 --session {session} -- \"<new brief>\"",
         crate::paths::BIN_NAME,

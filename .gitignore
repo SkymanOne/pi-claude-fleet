@@ -6,3 +6,5 @@
 # out — do not remove this entry yet.
 .pi-fleet/
 node_modules
+# parl
+.parl/

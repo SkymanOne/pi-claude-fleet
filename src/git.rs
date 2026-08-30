@@ -1,8 +1,7 @@
 //! A thin wrapper over the `git` CLI (deliberately not `git2`): worktree
 //! create/remove, branch delete, diff against a base commit, merge with
 //! conflict detection, and the "is it merged / is it dirty" checks cleanup
-//! needs. Ported from the TypeScript `src/worktree.ts` and the git bits of
-//! `src/commands.ts`.
+//! needs.
 
 use std::path::{Path, PathBuf};
 
@@ -22,7 +21,7 @@ pub struct GitResult {
 
 impl GitResult {
     #[must_use]
-    pub fn ok(&self) -> bool {
+    pub const fn ok(&self) -> bool {
         self.code == 0
     }
 }
@@ -75,6 +74,10 @@ pub async fn repo_root(dir: &Path) -> Option<PathBuf> {
 
 /// Resolve a ref to its commit sha (`<ref>^{commit}`), pinning the base for
 /// later diffs: inside a worktree HEAD moves, so `diff` needs the sha.
+///
+/// # Errors
+///
+/// Fails when `rev-parse` cannot resolve `ref_` or returns nothing.
 pub async fn resolve_commit(repo: &Path, ref_: &str) -> anyhow::Result<String> {
     let r = git_raw(&["rev-parse", &format!("{ref_}^{{commit}}")], repo).await;
     if r.ok() {
@@ -102,6 +105,11 @@ pub struct WorktreeInfo {
 
 /// Create a worktree at `<worktrees_dir>/<run_id>` on a fresh branch
 /// `parl/<name>-<short7>`, cut from `base` (or `HEAD`).
+///
+/// # Errors
+///
+/// Fails when the base ref cannot be resolved or `git worktree add`
+/// refuses (e.g. the branch already exists).
 pub async fn ensure_worktree(
     repo_root: &Path,
     worktrees_dir: &Path,
@@ -154,6 +162,11 @@ pub struct RemoveWorktreeResult {
 /// A missing worktree is already gone — just tidy git's administrative files
 /// (`worktree prune`) and fall through to branch deletion. Non-force failures
 /// are reported in the result rather than thrown: cleanup is best-effort.
+///
+/// # Errors
+///
+/// Fails only when a forced removal cannot be performed by git; everything
+/// else is reported through [`RemoveWorktreeResult`].
 pub async fn remove_worktree(
     repo_root: &Path,
     worktree_path: &Path,
@@ -195,6 +208,11 @@ pub async fn remove_worktree(
 /// `git diff --stat` (or `--name-only`) of the worktree's committed work
 /// against its base. `base` is the run's `baseCommit`, falling back to its
 /// `base` ref, falling back to `HEAD`.
+///
+/// # Errors
+///
+/// Fails when git cannot diff against `base` (e.g. an unresolvable ref),
+/// with git's stderr in the message.
 pub async fn diff_against_base(
     worktree: &Path,
     base: &str,

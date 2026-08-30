@@ -26,7 +26,7 @@ pub enum FleetEventKind {
 
 impl FleetEventKind {
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Settled => "settled",
             Self::Stopped => "stopped",
@@ -153,7 +153,7 @@ pub fn attr(value: &str) -> String {
 
 const FLEET_TAG: &[u8] = b"fleet-event";
 
-fn utf8_len(first_byte: u8) -> usize {
+const fn utf8_len(first_byte: u8) -> usize {
     if first_byte < 0x80 {
         1
     } else if first_byte >> 5 == 0b110 {
@@ -302,8 +302,7 @@ mod tests {
         ] {
             assert!(
                 !describe_next_step(kind, "x").is_empty(),
-                "{} has an empty next step",
-                kind
+                "{kind} has an empty next step"
             );
         }
     }
