@@ -119,10 +119,8 @@ fn shares_stem(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::test_support::{RETRY_BOUND, RETRY_INTERVAL};
     use crate::util::new_id;
     use std::path::PathBuf;
-    use std::time::Instant;
 
     fn write_fake_pi(body: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -145,30 +143,6 @@ mod tests {
         .into_owned()
     }
 
-    /// The `sh <script>` listing can transiently come back empty under
-    /// full-suite parallel load (the spawn fails, or hangs out its full
-    /// internal [`LIST_TIMEOUT`]). The production code correctly refuses to
-    /// cache an empty listing — an empty answer means pi could not be asked,
-    /// never a definitive none — so the test polls until a real one arrives.
-    /// The bound has to outlive one full timed-out attempt plus the shared
-    /// retry budget, or the first slow attempt eats the whole window and the
-    /// poll never gets a second try; a listing that never fills still fails
-    /// the test, via the bound.
-    async fn listed_models(pi: &str) -> Vec<String> {
-        let deadline = Instant::now() + RETRY_BOUND + 2 * LIST_TIMEOUT;
-        loop {
-            let models = list_models(pi).await;
-            if !models.is_empty() {
-                return models;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "pi listing for {pi} never returned models"
-            );
-            tokio::time::sleep(RETRY_INTERVAL).await;
-        }
-    }
-
     #[tokio::test]
     async fn parses_the_second_column_and_dedupes() {
         let pi = listing_script(&[
@@ -177,7 +151,7 @@ mod tests {
             "  fake               glm-5.3-flash                1M",
         ]);
         let pi = format!("sh {pi}");
-        let models = listed_models(&pi).await;
+        let models = list_models(&pi).await;
         assert_eq!(models, vec!["glm-5.3", "glm-5.3-flash"]);
         // The listing is cached per pi spec: a second ask does not run pi again.
         let again = list_models(&pi).await;
@@ -194,9 +168,8 @@ mod tests {
                 "  fake               claude-sonnet-5                1M",
             ])
         );
-        // prime the cache through the bounded poll; the checks below then
-        // read the one real listing, however many transient spawns it took
-        listed_models(&pi).await;
+        // prime the cache; the checks below then read the one real listing
+        list_models(&pi).await;
         assert_eq!(check_model(&pi, None).await.unwrap(), None);
         assert_eq!(check_model(&pi, Some("glm-5.3")).await.unwrap(), None);
         let bad = check_model(&pi, Some("glm-5.3-max"))
