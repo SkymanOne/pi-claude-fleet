@@ -163,6 +163,30 @@ impl RpcResponse {
             .map(str::to_string)
     }
 
+    /// The thinking levels the selected model actually has, in canonical
+    /// order, from the `thinkingLevelMap` pi reports with the model
+    /// (`get_state`, `set_model`). pi maps every level it knows, using null
+    /// for the ones this model does not support — `deepseek-v4-flash` maps
+    /// `max` to null, and setting it succeeds while changing nothing. Empty
+    /// when pi did not report a map, which reads as "we do not know".
+    #[must_use]
+    pub fn available_thinking_levels(&self) -> Vec<String> {
+        let Some(map) = self
+            .data
+            .as_ref()
+            .and_then(|d| d.get("model"))
+            .and_then(|m| m.get("thinkingLevelMap"))
+            .and_then(Value::as_object)
+        else {
+            return Vec::new();
+        };
+        crate::fleet::run::THINKING_LEVELS
+            .iter()
+            .filter(|level| map.get(**level).is_some_and(|v| !v.is_null()))
+            .map(|level| (*level).to_string())
+            .collect()
+    }
+
     /// The commands pi offers (`get_commands` data), unfiltered.
     #[must_use]
     pub fn commands(&self) -> Vec<CommandEntry> {
@@ -513,6 +537,33 @@ mod tests {
             })
         );
         assert_eq!(r.thinking_level().as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn available_thinking_levels_come_from_pis_own_map() {
+        // the real get_state payload from a deepseek-v4-flash worker: pi maps
+        // every level it knows and nulls the ones this model lacks
+        let line = r#"{"type":"response","command":"get_state","success":true,"data":{
+            "model":{"id":"deepseek/deepseek-v4-flash-0731","provider":"openrouter",
+            "thinkingLevelMap":{"off":"none","minimal":null,"low":null,"medium":null,
+            "high":"high","xhigh":"xhigh","max":null}},"thinkingLevel":"xhigh"}}"#;
+        let RpcMessage::Response(r) = parse_line(line).unwrap() else {
+            panic!("a response")
+        };
+        assert_eq!(
+            r.available_thinking_levels(),
+            vec!["off", "high", "xhigh"],
+            "canonical order, nulls dropped — `max` is not one of them"
+        );
+        assert_eq!(r.thinking_level().as_deref(), Some("xhigh"));
+
+        // no map at all reads as "we do not know", never as "none"
+        let line = r#"{"type":"response","command":"get_state","success":true,
+            "data":{"model":{"id":"m"},"thinkingLevel":"high"}}"#;
+        let RpcMessage::Response(r) = parse_line(line).unwrap() else {
+            panic!("a response")
+        };
+        assert!(r.available_thinking_levels().is_empty());
 
         let commands = r#"{"type":"response","command":"get_commands","success":true,"data":{"commands":[
             {"name":"skill:x","description":"a skill","source":"skill"},

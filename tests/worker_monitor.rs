@@ -424,6 +424,59 @@ fn reports_and_changes_the_thinking_level() {
     assert_eq!(fleet.wait_monitor_exit(Duration::from_secs(15)), Some(0));
 }
 
+/// pi answers `success: true` to a level its model does not have and keeps
+/// running at the old one (verified against a real deepseek-v4-flash worker,
+/// whose `thinkingLevelMap` nulls `max`). The monitor must report what pi
+/// came back with, not what the console wished for.
+#[test]
+fn a_level_the_model_lacks_is_reported_not_silently_swallowed() {
+    let mut fleet = Fleet::new("pf-think-gap-");
+    fleet.write_state();
+    fleet.spawn_monitor(&[
+        ("FAKE_PI_DELAY_MS", "20000"),
+        ("FAKE_PI_THINKING", "xhigh"),
+        ("FAKE_PI_THINKING_LEVELS", "off,high,xhigh"),
+    ]);
+    let state = fleet.wait_state(Duration::from_secs(20), |state| {
+        !state.available_thinking_levels.is_empty()
+    });
+    assert_eq!(
+        state.available_thinking_levels,
+        vec!["off", "high", "xhigh"],
+        "what pi says the model has, so the console stops offering the rest"
+    );
+
+    fleet.append_inbox(&Envelope::thinking(
+        Party::Console,
+        fleet.worker_party(),
+        "max",
+    ));
+    fleet.wait_event(Duration::from_secs(20), |ev| {
+        ev["type"] == "thinking_unavailable"
+    });
+    let state = fleet.state();
+    assert_eq!(
+        state.thinking_level.as_deref(),
+        Some("xhigh"),
+        "the level pi is actually running at, not the one we asked for"
+    );
+
+    // a level it does have still lands, and says nothing extra
+    fleet.append_inbox(&Envelope::thinking(
+        Party::Console,
+        fleet.worker_party(),
+        "high",
+    ));
+    let state = fleet.wait_state(Duration::from_secs(20), |state| {
+        state.thinking_level.as_deref() == Some("high")
+    });
+    assert_eq!(state.thinking_level.as_deref(), Some("high"));
+
+    fleet.append_inbox(&Envelope::abort(Party::Console, fleet.worker_party()));
+    settled_or(&fleet, Duration::from_secs(20));
+    assert_eq!(fleet.wait_monitor_exit(Duration::from_secs(15)), Some(0));
+}
+
 #[test]
 fn records_the_model_pi_resolved_and_the_available_models() {
     let mut fleet = Fleet::new("pf-model-");

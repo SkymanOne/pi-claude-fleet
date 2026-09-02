@@ -288,6 +288,12 @@ pub struct RunState {
     /// The reasoning level pi is running at, as it reports it.
     #[serde(default)]
     pub thinking_level: Option<String>,
+    /// The levels the worker's model actually has, from pi's
+    /// `thinkingLevelMap`. Empty means pi has not told us yet, which reads
+    /// as "every level" rather than "none" — a model's map is per-model, so
+    /// this changes with `/model`.
+    #[serde(default)]
+    pub available_thinking_levels: Vec<String>,
     /// What the worker is doing right now.
     #[serde(default)]
     pub activity: Option<WorkerActivity>,
@@ -359,6 +365,7 @@ impl RunState {
             active_provider: None,
             commands: Vec::new(),
             thinking_level: None,
+            available_thinking_levels: Vec::new(),
             activity: None,
             last_progress: None,
         }

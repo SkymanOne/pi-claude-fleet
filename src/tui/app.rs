@@ -2215,7 +2215,7 @@ impl Console {
                     .get(&run_id)
                     .map(String::as_str)
                     .or(state.thinking_level.as_deref());
-                let next = next_level(&THINKING_LEVELS, current);
+                let next = next_level(&worker_thinking_levels(&state), current);
                 // optimistic, like the orchestrator's pending_effort: the
                 // statusline reads it via the state overlay in set_runs, and
                 // the next press advances from it instead of the stale state
@@ -2435,9 +2435,14 @@ impl Console {
                 }
                 "/thinking" => {
                     let level = argument.to_lowercase();
-                    if !THINKING_LEVELS.contains(&level.as_str()) {
+                    let levels = worker_thinking_levels(&state);
+                    if !levels.contains(&level.as_str()) {
                         self.notice(
-                            format!("! usage: /thinking <{}>", THINKING_LEVELS.join("|")),
+                            format!(
+                                "! usage: /thinking <{}> — what {} has",
+                                levels.join("|"),
+                                state.active_model.as_deref().unwrap_or("this model")
+                            ),
                             true,
                         );
                         return Vec::new();
@@ -2807,6 +2812,45 @@ pub fn next_level(levels: &[&str], current: Option<&str>) -> String {
     let at = current.and_then(|c| levels.iter().position(|l| *l == c));
     let next = at.map_or(0, |at| (at + 1) % levels.len());
     levels[next].to_string()
+}
+
+/// The thinking levels a worker will actually take: the ones pi says its
+/// model has, or all of them while pi has not said. pi answers `success` to
+/// a level the model does not have and keeps running at the old one, so
+/// offering the full list would keep promising what cannot happen.
+#[must_use]
+pub fn worker_thinking_levels(state: &RunState) -> Vec<&str> {
+    if state.available_thinking_levels.is_empty() {
+        THINKING_LEVELS.to_vec()
+    } else {
+        state
+            .available_thinking_levels
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod thinking_levels_tests {
+    use super::*;
+
+    #[test]
+    fn a_worker_offers_only_the_levels_its_model_has() {
+        let mut state = RunState::default();
+        assert_eq!(
+            worker_thinking_levels(&state),
+            THINKING_LEVELS.to_vec(),
+            "until pi says, every level is on the table"
+        );
+        state.available_thinking_levels = vec!["off".into(), "high".into(), "xhigh".into()];
+        assert_eq!(worker_thinking_levels(&state), vec!["off", "high", "xhigh"]);
+        // and cycling stays inside them instead of stopping on a level that
+        // would be accepted and ignored
+        let levels = worker_thinking_levels(&state);
+        assert_eq!(next_level(&levels, Some("xhigh")), "off");
+        assert_eq!(next_level(&levels, Some("high")), "xhigh");
+    }
 }
 
 /// Parse `/answer [<questionId>] <text>` — the id is optional, never spaced.

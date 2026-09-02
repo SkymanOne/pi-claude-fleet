@@ -245,6 +245,9 @@ struct Shared {
     /// Resolved when the post-settle `get_last_assistant_text` arrives, so
     /// the 2 s watcher can stop early.
     last_text_done: Option<oneshot::Sender<()>>,
+    /// The thinking level we last asked pi for, held until the `get_state`
+    /// that follows tells us what pi actually did with it.
+    requested_thinking: Option<String>,
 }
 
 impl Shared {
@@ -324,6 +327,7 @@ impl Monitor {
                 dialogs: Vec::new(),
                 stderr_tail: VecDeque::new(),
                 last_text_done: None,
+                requested_thinking: None,
             }),
         });
         // A missing pi.log is fine, but say we are here.
@@ -525,15 +529,38 @@ impl Monitor {
         let success = response.success == Some(true);
         match (command.as_str(), success) {
             ("get_state", true) => {
+                let levels = response.available_thinking_levels();
                 let mut sh = self.shared();
                 if let Some(model) = response.model() {
                     sh.state.active_model = model.id.or(model.name);
                     sh.state.active_provider = model.provider;
                 }
+                if !levels.is_empty() {
+                    sh.state.available_thinking_levels = levels;
+                }
                 if let Some(level) = response.thinking_level() {
                     sh.state.thinking_level = Some(level);
                 }
+                // pi answers `success: true` to a level the model does not
+                // have and then goes on running at the old one, so the only
+                // honest report is the level it comes back with.
+                let asked = sh.requested_thinking.take();
+                let landed = sh.state.thinking_level.clone();
+                let model = sh.state.active_model.clone();
+                let available = sh.state.available_thinking_levels.clone();
                 sh.dirty = true;
+                drop(sh);
+                if let Some(asked) = asked
+                    && landed.as_deref() != Some(asked.as_str())
+                {
+                    self.write_event(json!({
+                        "type": "thinking_unavailable",
+                        "level": asked,
+                        "level_now": landed,
+                        "model": model,
+                        "available": available,
+                    }));
+                }
             }
             ("set_thinking_level", _) => {
                 // The level we asked for is only real once pi confirms it; a
@@ -819,6 +846,7 @@ impl Monitor {
                     })
                     .await;
                 if delivered {
+                    self.shared().requested_thinking = Some(level.to_string());
                     self.write_event(json!({
                         "type": "thinking_requested",
                         "source": envelope.from.to_string(),

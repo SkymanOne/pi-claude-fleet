@@ -586,6 +586,31 @@ impl Transcript {
                     &format!("· thinking level → {level} ({source})"),
                 );
             }
+            "thinking_unavailable" => {
+                let level = event.get("level").and_then(Value::as_str).unwrap_or("?");
+                let now = event
+                    .get("level_now")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unchanged");
+                let model = event
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("this model");
+                let available: Vec<&str> = event
+                    .get("available")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let has = if available.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — it has {}", available.join(", "))
+                };
+                self.push(
+                    BlockKind::Error,
+                    &format!("! {model} has no {level} thinking, still {now}{has}"),
+                );
+            }
             "thinking_rejected" => {
                 let error = event.get("error").and_then(Value::as_str).unwrap_or("");
                 self.push(

@@ -39,6 +39,17 @@ let model = {
   provider: process.env.FAKE_PI_PROVIDER || "fakeprovider",
 };
 let thinkingLevel = process.env.FAKE_PI_THINKING || "medium";
+// Every level pi knows, and the ones this "model" actually has. Real pi maps
+// the rest to null and then answers `success: true` to a set it will not
+// honour, which is what FAKE_PI_THINKING_LEVELS reproduces.
+const ALL_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const SUPPORTED = (process.env.FAKE_PI_THINKING_LEVELS || ALL_LEVELS.join(","))
+  .split(",")
+  .map((l) => l.trim())
+  .filter(Boolean);
+const thinkingLevelMap = Object.fromEntries(
+  ALL_LEVELS.map((l) => [l, SUPPORTED.includes(l) ? l : null]),
+);
 const fleetDir = process.env.PARL_DIR;
 const runId = process.env.PARL_RUN;
 const delay = Number(process.env.FAKE_PI_DELAY_MS || 300);
@@ -240,15 +251,22 @@ process.stdin.on("data", (chunk) => {
         command: "get_state",
         success: true,
         data: {
-          model: { id: model.id, name: "Fake Model", provider: model.provider },
+          model: {
+            id: model.id,
+            name: "Fake Model",
+            provider: model.provider,
+            thinkingLevelMap,
+          },
           thinkingLevel,
           isStreaming: false,
           sessionId: "fake-session",
         },
       });
     } else if (msg.type === "set_thinking_level") {
-      if (["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(msg.level)) {
-        thinkingLevel = msg.level;
+      if (ALL_LEVELS.includes(msg.level)) {
+        // a level this model lacks is accepted and then ignored, exactly as
+        // pi does for `max` on deepseek-v4-flash
+        if (SUPPORTED.includes(msg.level)) thinkingLevel = msg.level;
         send({ id: msg.id, type: "response", command: "set_thinking_level", success: true });
       } else {
         send({ id: msg.id, type: "response", command: "set_thinking_level", success: false, error: `unknown level: ${msg.level}` });
