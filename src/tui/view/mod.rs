@@ -42,6 +42,30 @@ pub fn draw(frame: &mut Frame, console: &mut Console, feeds: &Feeds<'_>, pal: &P
     if let Some(overlay) = console.overlay().cloned() {
         overlay::draw(frame, area, console, feeds, &overlay, pal);
     }
+    scrub_controls(frame.buffer_mut());
+}
+
+/// The last thing every frame passes through: no control character reaches
+/// the terminal.
+///
+/// Almost everything on screen is written by an agent or by whatever it
+/// ran, and command-line tools draw with control characters — `git rebase`
+/// emits `Rebasing (1/6)\rRebasing (2/6)\r…`. A cell holding a bare CR
+/// sends the cursor back to column 0 mid-row, so the rest of the row
+/// repaints over what was already drawn and the frame tears; an `ESC` could
+/// do considerably worse. Models cannot be careless here, so this is the one
+/// place it is caught, after every widget has had its say: a control cell
+/// becomes a space, which keeps the geometry the layout already computed.
+///
+/// [`crate::util::visible_line`] keeps the transcript's own text honest, so
+/// what reaches here is the residue — a widget that skipped it, or a source
+/// added later.
+fn scrub_controls(buffer: &mut ratatui::buffer::Buffer) {
+    for cell in &mut buffer.content {
+        if cell.symbol().chars().any(char::is_control) {
+            cell.set_symbol(" ");
+        }
+    }
 }
 
 /// Clip to `max` printed columns, ellipsis on the cut. Shared by the
@@ -69,6 +93,21 @@ pub(crate) fn clip_to(text: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::fleet::run::{PendingQuestion, RunState, RunStatus};
+
+    #[test]
+    fn the_frame_scrub_leaves_no_control_character_for_the_terminal() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 1));
+        for (x, ch) in "a\rb\u{1b}c\t".chars().enumerate() {
+            buffer[(x as u16, 0)].set_symbol(&ch.to_string());
+        }
+        scrub_controls(&mut buffer);
+        let row: String = (0..6).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert_eq!(row, "a b c ", "controls became spaces, the width held");
+        assert!(!row.chars().any(char::is_control));
+    }
+
     use crate::orch::protocol::{CanUseToolRequest, PermissionRequest};
     use crate::orch::records::{EventRecord, OrchestratorEvent};
     use crate::paths::FleetPaths;

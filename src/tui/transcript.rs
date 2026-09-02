@@ -817,11 +817,15 @@ impl Transcript {
     // -----------------------------------------------------------------------
     // Shared block plumbing
 
+    /// The one way a block is made, so every block is safe to draw: agent
+    /// text reaches here from tool output, model prose and worker events,
+    /// and [`crate::util::visible_line`] is what stops a stray control
+    /// character tearing the frame.
     fn push(&mut self, kind: BlockKind, text: &str) {
         for line in text.split('\n') {
             self.blocks.push(Block {
                 kind,
-                text: line.to_string(),
+                text: crate::util::visible_line(line),
             });
         }
         self.trim();
@@ -1155,6 +1159,42 @@ mod tests {
         assert!(
             !text.iter().any(|l| l.contains("toolu_")),
             "the correlation id costs a row and says nothing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn tool_output_progress_lines_cannot_tear_the_frame() {
+        let mut t = Transcript::new();
+        let msg = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "git rebase"}},
+            ]},
+        });
+        t.apply_claude_message(&msg);
+        // the real payload: git draws progress with carriage returns
+        let result = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "t1",
+                "content": "Rebasing (1/6)\rRebasing (2/6)\rRebasing (6/6)\rSuccessfully rebased and updated refs/heads/feat/escrow.\n=== exit: 0 ===",
+            }]},
+        });
+        t.apply_claude_message(&result);
+        let texts: Vec<&str> = t.blocks().iter().map(|b| b.text.as_str()).collect();
+        assert!(
+            texts.iter().all(|l| !l.chars().any(char::is_control)),
+            "no block carries a control character: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|l| l.contains("Successfully rebased and updated")),
+            "what the progress finally said survives: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|l| l.contains("Rebasing (1/6)")),
+            "the overwritten steps do not: {texts:?}"
         );
     }
 

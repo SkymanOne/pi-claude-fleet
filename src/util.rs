@@ -200,6 +200,27 @@ pub fn first_line(s: &str) -> &str {
     s.find('\n').map_or(s, |idx| &s[..idx])
 }
 
+/// One line of agent-controlled text as a terminal can safely show it.
+///
+/// Tool output is written by whatever the agent ran, and command-line tools
+/// draw progress with control characters: `git rebase` emits
+/// `Rebasing (1/6)\rRebasing (2/6)\r…\rSuccessfully rebased and updated …`.
+/// Carriage returns are applied the way a terminal would — the last segment
+/// is what the sequence finally said — and every other control character,
+/// `ESC` above all, becomes a space, so agent output can never move the
+/// cursor, repaint a row, or start an escape sequence of its own.
+///
+/// Newlines are the caller's business: split first, then call this per line.
+#[must_use]
+pub fn visible_line(text: &str) -> String {
+    let settled = text.rsplit('\r').find(|part| !part.is_empty());
+    settled
+        .unwrap_or("")
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
 /// Compact human age: `30s`, `5m`, `2h`, `3d`.
 pub fn format_age(ms: i64) -> String {
     if ms < 60_000 {
@@ -297,6 +318,55 @@ pub fn read_new_lines(path: &Path, offset: u64) -> (Vec<String>, u64) {
         result.lines.into_iter().filter(|l| !l.is_empty()).collect(),
         offset + last_nl as u64 + 1,
     )
+}
+
+#[cfg(test)]
+mod visible_line_tests {
+    use super::visible_line;
+
+    #[test]
+    fn carriage_returns_resolve_the_way_a_terminal_shows_them() {
+        // the real `git rebase` output that tore the console's frame
+        assert_eq!(
+            visible_line(
+                "Rebasing (1/6)\rRebasing (2/6)\rRebasing (6/6)\rSuccessfully rebased and updated refs/heads/feat/escrow."
+            ),
+            "Successfully rebased and updated refs/heads/feat/escrow.",
+            "progress collapses to what it finally said"
+        );
+        assert_eq!(
+            visible_line("done\r"),
+            "done",
+            "a trailing CR is not a line"
+        );
+        assert_eq!(visible_line("plain"), "plain");
+        assert_eq!(visible_line(""), "");
+        assert_eq!(visible_line("\r"), "");
+    }
+
+    #[test]
+    fn every_other_control_character_becomes_a_space() {
+        assert_eq!(visible_line("a\tb"), "a b", "a tab would jump a tab stop");
+        assert_eq!(
+            visible_line("\x1b[31mred\x1b[0m"),
+            " [31mred [0m",
+            "an escape sequence never starts"
+        );
+        assert_eq!(visible_line("a\x08b"), "a b");
+        assert_eq!(visible_line("bell\x07"), "bell ");
+        let out = visible_line("ok\u{9b}[2J");
+        assert!(
+            !out.chars().any(char::is_control),
+            "nothing controlling survives: {out:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_text_is_untouched() {
+        for text in ["héllo · wörld", "日本語のテキスト", "→ ⚙ ↳ ▸ ▍"] {
+            assert_eq!(visible_line(text), text);
+        }
+    }
 }
 
 #[cfg(test)]
