@@ -55,6 +55,19 @@ pub fn session_display_name(alias: Option<&str>, uuid: Uuid) -> String {
     })
 }
 
+/// What the console calls the session it is serving: always `orchestrator`,
+/// with the session's alias appended when it has one. The rail row and the
+/// composer prompt both use this, so the row that owns the conversation is
+/// never a bare hex id — [`session_display_name`] stays the identifier for
+/// naming *other* sessions, where the uuid still has to disambiguate.
+#[must_use]
+pub fn session_label(alias: Option<&str>) -> String {
+    match alias.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(alias) => format!("orchestrator · {alias}"),
+        None => "orchestrator".to_string(),
+    }
+}
+
 /// One dashboard row: a session at a glance — state glyph, name, what it is
 /// doing right now, age, and for a worker its branch and diff stat if known.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,6 +378,17 @@ mod tests {
         assert_eq!(
             row.target,
             SessionTarget::Orchestrator(crate::util::nil_uuid())
+        );
+    }
+
+    #[test]
+    fn the_session_label_always_says_orchestrator_and_carries_the_alias() {
+        assert_eq!(session_label(None), "orchestrator");
+        assert_eq!(session_label(Some("db")), "orchestrator · db");
+        assert_eq!(
+            session_label(Some("   ")),
+            "orchestrator",
+            "a blank alias is no alias"
         );
     }
 

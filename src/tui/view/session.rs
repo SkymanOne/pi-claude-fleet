@@ -128,14 +128,21 @@ fn draw_rail(frame: &mut Frame, area: Rect, console: &Console, pal: &Palette) {
 /// yields for it.
 fn rail_line(row: &DashboardRow, selected: bool, width: u16, pal: &Palette) -> Line<'static> {
     let width = width as usize;
-    let base = if selected {
-        pal.selected()
-    } else if row.attention {
+    // the orchestrator owns the conversation, so it keeps its accent in
+    // every state: selection paints the background over the row's own
+    // colour rather than replacing it, which also keeps a worker that wants
+    // the human yellow while it is the selected row
+    let base = if row.attention {
         pal.attention()
     } else if row.target.is_worker() {
         Style::default()
     } else {
         pal.accent().add_modifier(Modifier::BOLD)
+    };
+    let base = if selected {
+        base.patch(pal.selected())
+    } else {
+        base
     };
     let marker = if selected { "▸ " } else { "  " };
     let age_room = usize::from(!row.age.is_empty()) * (row.age.width() + 1);
@@ -499,6 +506,7 @@ fn apply_highlight(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::tui::model::SessionTarget;
 
     fn plain(rows: &[Line<'static>]) -> Vec<String> {
         rows.iter()
@@ -534,6 +542,72 @@ mod tests {
         );
         assert_eq!((units[0].start, units[0].end), (0, 3));
         assert_eq!((units[1].start, units[1].end), (3, 4));
+    }
+
+    #[test]
+    fn the_orchestrator_row_keeps_its_accent_when_selected() {
+        let pal = Palette::colored();
+        let orch = DashboardRow {
+            key: "orchestrator".into(),
+            glyph: "●",
+            name: "orchestrator · docs".into(),
+            detail: "idle".into(),
+            age: String::new(),
+            target: SessionTarget::Orchestrator(uuid::Uuid::nil()),
+            attention: false,
+            branch: None,
+            diff_stat: None,
+        };
+        let worker = DashboardRow {
+            key: "auth-1f2e3d4".into(),
+            name: "auth".into(),
+            target: SessionTarget::Worker {
+                run_id: "auth-1f2e3d4".into(),
+            },
+            ..orch.clone()
+        };
+        let accent = pal.accent().fg;
+        for selected in [false, true] {
+            let line = rail_line(&orch, selected, 30, &pal);
+            assert!(
+                line.spans.iter().all(|s| s.style.fg == accent),
+                "the session that owns the conversation keeps its colour                  (selected: {selected}): {line:?}"
+            );
+            let line = rail_line(&worker, selected, 30, &pal);
+            assert!(
+                line.spans.iter().all(|s| s.style.fg != accent),
+                "a worker never borrows it (selected: {selected}): {line:?}"
+            );
+        }
+        // selection still paints its background over both
+        let line = rail_line(&orch, true, 30, &pal);
+        assert!(
+            line.spans.iter().all(|s| s.style.bg == pal.selected().bg),
+            "{line:?}"
+        );
+    }
+
+    #[test]
+    fn a_selected_worker_that_wants_the_human_stays_yellow() {
+        let pal = Palette::colored();
+        let row = DashboardRow {
+            key: "auth-1f2e3d4".into(),
+            glyph: "●",
+            name: "auth".into(),
+            detail: "blocked".into(),
+            age: "2m".into(),
+            target: SessionTarget::Worker {
+                run_id: "auth-1f2e3d4".into(),
+            },
+            attention: true,
+            branch: None,
+            diff_stat: None,
+        };
+        let line = rail_line(&row, true, 30, &pal);
+        assert!(
+            line.spans.iter().all(|s| s.style.fg == pal.attention().fg),
+            "selection must not hide a pending question: {line:?}"
+        );
     }
 
     #[test]

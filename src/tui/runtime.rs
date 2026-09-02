@@ -1322,7 +1322,11 @@ mod tests {
         .await;
         assert_eq!(console.orch_key, first_key);
         let names: Vec<String> = console.rows().iter().map(|row| row.name.clone()).collect();
-        assert_eq!(names, vec!["alpha", "auth"], "only alpha's own worker");
+        assert_eq!(
+            names,
+            vec!["orchestrator · alpha", "auth"],
+            "only alpha's own worker"
+        );
 
         // a switch re-anchors on the other session: fresh row set, fresh
         // transcript, and the console follows
@@ -1343,7 +1347,11 @@ mod tests {
         .await;
         assert_eq!(console.orch_key, second_key);
         let names: Vec<String> = console.rows().iter().map(|row| row.name.clone()).collect();
-        assert_eq!(names, vec!["beta", "db"], "only beta's own worker");
+        assert_eq!(
+            names,
+            vec!["orchestrator · beta", "db"],
+            "only beta's own worker"
+        );
         assert!(
             console
                 .orchestrator_transcript()

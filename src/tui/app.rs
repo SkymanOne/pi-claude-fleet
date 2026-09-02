@@ -31,7 +31,7 @@ use crate::tui::completions::{
 use crate::tui::keys::{KeyAction, Mode, map_key};
 use crate::tui::model::{
     DashboardRow, OrchSummary, RunRow, SessionTarget, activity_line, build_rows,
-    session_display_name, worker_activity_line,
+    session_display_name, session_label, worker_activity_line,
 };
 use crate::tui::palette::{
     McpServerInfo, PaletteAction, PaletteContext, PaletteItem, PaletteScope, build_items, ranked,
@@ -733,11 +733,10 @@ impl Console {
         }
     }
 
-    /// What to call the served orchestrator session: its alias, its short
-    /// uuid (until the orchestrator derives an alias), or the legacy
-    /// `orchestrator` spelling for the default session.
+    /// What to call the served orchestrator session in the rail and the
+    /// composer: `orchestrator`, plus its alias when it has one.
     fn session_name(&self) -> String {
-        session_display_name(self.orch_key.alias.as_deref(), self.orch_key.uuid)
+        session_label(self.orch_key.alias.as_deref())
     }
 
     fn worker_transcript_mut(&mut self, run_id: &str) -> &mut Transcript {
@@ -4190,19 +4189,17 @@ mod tests {
             SessionTarget::Orchestrator(key.uuid),
             "the orchestrator row names its session"
         );
-        assert_eq!(c.rows()[0].name, "docs");
+        assert_eq!(c.rows()[0].name, "orchestrator · docs");
         assert_eq!(c.selected_target(), SessionTarget::Orchestrator(key.uuid));
         assert_eq!(c.selected_target().key(), "orchestrator");
 
-        // a session without an alias is shown by its short uuid until one
-        // appears, and the composer prompt follows
-        let key = SessionKey::new(None, Uuid::new_v4());
-        c.orch_key = key.clone();
+        // an alias-less session says what it is rather than showing a hex
+        // prefix nobody can read, and the composer prompt follows
+        c.orch_key = SessionKey::new(None, Uuid::new_v4());
         c.set_runs(Vec::new());
-        let short = crate::util::short_uuid(&key.uuid);
-        assert_eq!(c.rows()[0].name, short);
-        assert_eq!(c.composer_prompt(), format!("{short} > "));
-        // the legacy default session keeps the old spelling
+        assert_eq!(c.rows()[0].name, "orchestrator");
+        assert_eq!(c.composer_prompt(), "orchestrator > ");
+        // and so does the legacy default session
         c.orch_key = SessionKey::default();
         c.set_runs(Vec::new());
         assert_eq!(c.rows()[0].name, "orchestrator");
