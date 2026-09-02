@@ -30,6 +30,9 @@ use crate::util::now_ms;
 const TRANSCRIPT_MIN_ROWS: u16 = 3;
 /// The session list's automatic width: glyph + name + age, nothing more.
 const RAIL_AUTO: u16 = 24;
+/// Every non-text block opens with a one-column marker and a space (`> `,
+/// `⚙ `, `↳ `), so its wrapped rows hang two columns in to line up under it.
+const MARKER_WIDTH: usize = 2;
 
 /// Width of the session list, from the remembered `/rail` mode. `full`
 /// hides the list — the transcript is the pane; `/rail` brings it back.
@@ -375,18 +378,48 @@ fn render_unit(
         range
             .iter()
             .enumerate()
-            .map(|(i, block)| {
-                let line = if block.text.is_empty() {
-                    Line::from(Span::raw(String::new()))
-                } else {
-                    // the style rides on the span, so the search highlight
-                    // can patch it
-                    Line::from(Span::styled(block.text.clone(), pal.block(block.kind)))
-                };
-                (unit.start + i, line)
-            })
+            .flat_map(|(i, block)| wrap_block(block, unit.start + i, width, pal))
             .collect()
     }
+}
+
+/// One non-text block as rows. A block is a single line of text, so anything
+/// longer than the pane would be clipped at the right edge: wrap it, and hang
+/// the continuation rows under the marker (`> `, `⚙ `, `↳ `) so a wrapped
+/// prompt still reads as one prompt. Every row keeps the block's index, so
+/// pinning and search stay per-block.
+fn wrap_block(
+    block: &Block,
+    index: usize,
+    width: usize,
+    pal: &Palette,
+) -> Vec<(usize, Line<'static>)> {
+    if block.text.is_empty() {
+        return vec![(index, Line::from(Span::raw(String::new())))];
+    }
+    // the style rides on the span, so the search highlight can patch it
+    let style = pal.block(block.kind);
+    let indent = leading_spaces(&block.text) + MARKER_WIDTH;
+    // one column budget for every row, the first included: a wrap point that
+    // moved with the row it lands on would be harder to read than a first row
+    // a marker's width short of the edge
+    let body = width.saturating_sub(indent).max(1);
+    let hang = " ".repeat(indent);
+    markdown::wrap_spans(&[Span::styled(block.text.clone(), style)], body)
+        .into_iter()
+        .enumerate()
+        .map(|(row, mut spans)| {
+            if row > 0 {
+                spans.insert(0, Span::styled(hang.clone(), style));
+            }
+            (index, Line::from(spans))
+        })
+        .collect()
+}
+
+/// How many columns of leading whitespace a block opens with.
+fn leading_spaces(text: &str) -> usize {
+    text.len() - text.trim_start_matches(' ').len()
 }
 
 /// One blank row between units — but never two: an existing gap block, or a
@@ -501,6 +534,54 @@ mod tests {
         );
         assert_eq!((units[0].start, units[0].end), (0, 3));
         assert_eq!((units[1].start, units[1].end), (3, 4));
+    }
+
+    #[test]
+    fn a_long_prompt_wraps_and_hangs_under_its_marker() {
+        let blocks = vec![block(
+            BlockKind::User,
+            "> plan the development of the thing and present it to me",
+        )];
+        let rows = render_rows(&blocks, None, None, None, 24, 20, &Palette::plain());
+        let rows = plain(&rows);
+        assert!(rows.len() > 1, "the prompt wrapped: {rows:?}");
+        assert!(
+            rows.iter()
+                .all(|r| UnicodeWidthStr::width(r.as_str()) <= 24),
+            "no row overflows the pane: {rows:?}"
+        );
+        assert!(rows[0].starts_with("> "), "the marker leads: {rows:?}");
+        assert!(
+            rows[1..].iter().all(|r| r.starts_with("  ")),
+            "continuations hang under it: {rows:?}"
+        );
+        assert_eq!(
+            rows.join(" ").split_whitespace().collect::<Vec<_>>(),
+            blocks[0].text.split_whitespace().collect::<Vec<_>>(),
+            "nothing was lost to the wrap"
+        );
+    }
+
+    #[test]
+    fn an_indented_tool_result_keeps_its_indent_when_it_wraps() {
+        let blocks = vec![block(
+            BlockKind::ToolResult,
+            "  \u{21b3} bash: a b c d e f g h",
+        )];
+        let rows = plain(&render_rows(
+            &blocks,
+            None,
+            None,
+            None,
+            16,
+            20,
+            &Palette::plain(),
+        ));
+        assert!(rows.len() > 1, "wrapped: {rows:?}");
+        assert!(
+            rows[1..].iter().all(|r| r.starts_with("    ")),
+            "the block's own indent plus the marker: {rows:?}"
+        );
     }
 
     #[test]
