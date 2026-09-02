@@ -43,6 +43,37 @@ pub enum BlockKind {
     Error,
 }
 
+/// The fields of the `<task-notification>` block claude injects as a plain
+/// user message when a background task it started finishes. Claude writes
+/// it, not the human, so it must never render as a prompt — `None` for
+/// anything that is not one of these blocks.
+///
+/// `tool-use-id` is dropped: it correlates the notification with a tool call
+/// the console cannot act on, and it costs a row to say nothing.
+fn task_notification_fields(text: &str) -> Option<Vec<(String, String)>> {
+    let body = text
+        .trim()
+        .strip_prefix("<task-notification>")?
+        .strip_suffix("</task-notification>")?;
+    let mut fields = Vec::new();
+    for line in body.lines() {
+        let Some(rest) = line.trim().strip_prefix('<') else {
+            continue;
+        };
+        let Some((tag, rest)) = rest.split_once('>') else {
+            continue;
+        };
+        if tag.is_empty() || tag.starts_with('/') || tag == "tool-use-id" {
+            continue;
+        }
+        let Some(value) = rest.strip_suffix(&format!("</{tag}>")) else {
+            continue;
+        };
+        fields.push((tag.to_string(), value.trim().to_string()));
+    }
+    (!fields.is_empty()).then_some(fields)
+}
+
 /// One transcript block: kind plus the text to draw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
@@ -401,6 +432,19 @@ impl Transcript {
                 // our own message coming back; we already rendered it
                 if let Some(at) = self.pending_echoes.iter().position(|e| *e == text) {
                     self.pending_echoes.remove(at);
+                    return;
+                }
+                if let Some(fields) = task_notification_fields(&text) {
+                    self.push(BlockKind::System, "· task-notification");
+                    for (tag, value) in fields {
+                        self.push_block(
+                            BlockKind::System,
+                            &format!("  {tag}: "),
+                            &value,
+                            TOOL_RESULT_LINES,
+                            TOOL_RESULT_CHARS,
+                        );
+                    }
                     return;
                 }
                 self.push(BlockKind::User, &format!("> {text}"));
@@ -1046,6 +1090,59 @@ mod tests {
             .map(|b| b.text.as_str())
             .collect();
         assert_eq!(texts, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn a_task_notification_is_a_system_block_not_a_prompt() {
+        let mut t = Transcript::new();
+        let msg = serde_json::json!({
+            "type": "user",
+            "parent_tool_use_id": null,
+            "message": {"role": "user", "content": concat!(
+                "<task-notification>\n",
+                "<task-id>bp8o9ho35</task-id>\n",
+                "<tool-use-id>toolu_01KrKcxKBLorGKu9aZtwHATU</tool-use-id>\n",
+                "<status>completed</status>\n",
+                "<summary>Background command \"cargo test\" completed (exit code 0)</summary>\n",
+                "</task-notification>",
+            )},
+        });
+        t.apply_claude_message(&msg);
+        assert!(
+            t.blocks().iter().all(|b| b.kind == BlockKind::System),
+            "claude wrote it, not the human: {:?}",
+            t.blocks()
+        );
+        let text: Vec<&str> = t.blocks().iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(text[0], "· task-notification");
+        assert!(
+            text.iter().any(|l| l.contains("task-id: bp8o9ho35")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("status: completed")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("cargo test")),
+            "the summary is the point: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|l| l.contains("toolu_")),
+            "the correlation id costs a row and says nothing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_real_prompt_is_still_a_prompt() {
+        let mut t = Transcript::new();
+        let msg = serde_json::json!({
+            "type": "user",
+            "parent_tool_use_id": null,
+            "message": {"role": "user", "content": "<task-notification> is what I want to discuss"},
+        });
+        t.apply_claude_message(&msg);
+        assert_eq!(t.blocks()[0].kind, BlockKind::User);
     }
 
     #[test]
