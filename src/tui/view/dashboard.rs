@@ -20,7 +20,7 @@ use crate::tui::theme::Palette;
 /// The key hints, by mode (the footer line).
 pub const HINTS_NORMAL: &str =
     "j/k move · enter open · a answer · s stop · i compose · : palette · ? help · q quit";
-pub const HINTS_INSERT: &str = "enter send · alt-enter newline · tab accept · esc normal";
+pub const HINTS_INSERT: &str = "enter send · shift-enter newline · tab accept · esc normal";
 
 /// Draw the dashboard over `area` (the frame minus the status line).
 pub fn draw(frame: &mut Frame, area: Rect, console: &Console, pal: &Palette) {

@@ -168,7 +168,17 @@ fn map_insert(key: KeyEvent) -> KeyAction {
     use KeyAction as A;
     match key.code {
         KeyCode::Char(ch) if !ctrl(&key) => A::InsertChar(ch),
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => A::Newline,
+        // shift-enter is the newline everyone reaches for, but a terminal
+        // only reports it as its own key under the kitty protocol
+        // (`runtime::enter` asks for it); alt-enter and ctrl-j are the
+        // fallbacks on the terminals that cannot
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            A::Newline
+        }
         KeyCode::Char('j') if ctrl(&key) => A::Newline,
         KeyCode::Enter => A::Send,
         KeyCode::Tab => A::AcceptCompletion,
@@ -312,8 +322,8 @@ pub const INSERT_KEYS: &[KeyHelp] = &[
         what: "message the orchestrator, or steer the selected worker",
     },
     KeyHelp {
-        keys: "alt-enter",
-        what: "newline",
+        keys: "shift-enter",
+        what: "newline (alt-enter or ctrl-j where the terminal cannot)",
     },
     KeyHelp {
         keys: "/",
@@ -545,6 +555,14 @@ mod tests {
         assert_eq!(
             map_key(
                 Mode::Insert,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+            ),
+            A::Newline,
+            "shift-enter is the newline the kitty protocol lets through"
+        );
+        assert_eq!(
+            map_key(
+                Mode::Insert,
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
             ),
             A::Newline
@@ -616,7 +634,7 @@ mod tests {
         assert!(whole.contains("Normal:"), "{whole}");
         assert!(whole.contains("Insert:"), "{whole}");
         assert!(whole.contains("answer the pending question"), "{whole}");
-        assert!(whole.contains("alt-enter"), "{whole}");
+        assert!(whole.contains("shift-enter"), "{whole}");
 
         // a tall window shows everything
         let lines = help_lines(100, 100);

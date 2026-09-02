@@ -15,7 +15,8 @@ use std::time::Duration;
 use anyhow::Context;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -68,7 +69,8 @@ pub fn is_interactive() -> bool {
     io::stdin().is_tty() && io::stdout().is_tty()
 }
 
-/// Install the terminal: raw mode, alternate screen, mouse capture, backend.
+/// Install the terminal: raw mode, alternate screen, mouse capture, the
+/// kitty keyboard protocol, backend.
 ///
 /// # Errors
 /// Raw mode or the screen switch failing — there is nothing to restore yet.
@@ -76,6 +78,18 @@ pub fn enter() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Without this a terminal cannot tell shift-enter from enter — both are
+    // a bare CR — so the composer could never bind the newline everyone
+    // reaches for. `DISAMBIGUATE_ESCAPE_CODES` makes the terminal send
+    // `CSI 13;2u` instead. Pushed blind and best effort: a terminal that
+    // does not speak the protocol ignores both the push and the pop, while
+    // `supports_keyboard_enhancement` costs a 2 s round trip on exactly
+    // those terminals, and a slow console start is worse than a key that
+    // falls back to alt-enter.
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
@@ -84,7 +98,14 @@ pub fn enter() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
 /// every exit path, and it must never mask the error that brought us here.
 pub fn restore() {
     use std::io::Write as _;
-    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    // the enhancement flags pop first: leaving them on would outlive the
+    // console and confuse whatever the shell runs next
+    let _ = execute!(
+        io::stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
     let _ = disable_raw_mode();
     let _ = io::stdout().flush();
 }

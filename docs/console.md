@@ -61,7 +61,7 @@ Keys in insert mode:
 | Keys | What they do |
 | --- | --- |
 | type + `enter` | message the orchestrator, or steer the selected worker |
-| `alt-enter` (or `ctrl-j`) | a newline, not a send |
+| `shift-enter` | a newline, not a send — `alt-enter` or `ctrl-j` on a terminal without the kitty keyboard protocol |
 | `/` | commands and skills |
 | `@` | workers and repository files |
 | `tab` | accept the highlighted suggestion |

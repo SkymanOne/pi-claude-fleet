@@ -3181,18 +3181,20 @@ mod tests {
     }
 
     #[test]
-    fn alt_enter_inserts_a_newline_instead_of_sending() {
-        let mut c = setup_with_worker();
-        c.handle_key(ch('i'));
-        c.handle_key(ch('a'));
-        let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
-        c.handle_key(alt_enter);
-        c.handle_key(ch('b'));
-        let effects = c.handle_key(enter());
-        assert_eq!(
-            effects,
-            vec![Effect::SendToOrchestrator("a\nb".to_string())]
-        );
+    fn a_modified_enter_inserts_a_newline_instead_of_sending() {
+        for modifier in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            let mut c = setup_with_worker();
+            c.handle_key(ch('i'));
+            c.handle_key(ch('a'));
+            c.handle_key(KeyEvent::new(KeyCode::Enter, modifier));
+            c.handle_key(ch('b'));
+            let effects = c.handle_key(enter());
+            assert_eq!(
+                effects,
+                vec![Effect::SendToOrchestrator("a\nb".to_string())],
+                "{modifier:?}+enter"
+            );
+        }
     }
 
     #[test]
