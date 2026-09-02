@@ -93,6 +93,8 @@ git is the git CLI, not `git2`: everything goes through `git_raw`, which trusts 
 
 **4. `deepseek-v4-flash` is provider-dependent (measured 2026-08-30).** On `openrouter` pi receives well-formed structured tool calls but the model never invokes a write tool — runs end with no edits, no commit, no report, so it is unusable for agentic work. On `opencode-go` it edits and commits normally; `opencode-go` needs an explicit account opt-in, without which every spawn dies instantly with `403 {"type":"RegionError", ...}`.
 
+**5. pi accepts a thinking level its model does not have and then ignores it (measured 2026-09-02 against a real deepseek-v4-flash worker).** `{"type":"set_thinking_level","level":"max"}` came back `{"command":"set_thinking_level","success":true}`, and the `get_state` that followed still read `"thinkingLevel":"xhigh"`. The reason is in the model payload `get_state` already returns: `thinkingLevelMap` maps every level pi knows and nulls the ones the model lacks — deepseek-v4-flash nulls `minimal`, `low`, `medium` and `max`, so it has only `off`, `high`, `xhigh`. So `success` means "understood", not "applied", and the only honest source for the running level is the `thinkingLevel` a refresh comes back with. `available_thinking_levels` on the run is that map, filtered to [`THINKING_LEVELS`] order; empty means pi has not said yet, which reads as every level rather than none. `get_available_thinking_levels` returns the same list as its own round trip, but the map rides along with the `get_state` the monitor already does at boot.
+
 ## The `.parl` layout
 
 ```text
