@@ -63,11 +63,11 @@ pub fn draw(
         (None, area)
     };
 
-    let composer_lines = console
-        .composer()
-        .input
-        .split('\n')
-        .count()
+    // the box grows by the rows the text actually wraps to, not by its
+    // newlines: a long unbroken sentence needs the room just as much
+    let composer_lines = composer::layout(&console.composer().input, 0, composer::inner_width(rest))
+        .rows
+        .len()
         .clamp(1, composer::MAX_LINES) as u16;
     let composer_height = composer_lines + 2; // the borders
     let now = now_ms();
