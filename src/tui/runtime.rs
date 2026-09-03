@@ -110,6 +110,18 @@ pub fn restore() {
     let _ = io::stdout().flush();
 }
 
+/// Take the mouse for the console, or hand it back to the terminal so its
+/// own click-and-drag selection works. Best effort: a terminal that ignores
+/// the sequence simply keeps whatever it was doing, and the console's
+/// keyboard scrolling is unaffected either way.
+pub fn set_mouse_capture(on: bool) {
+    let _ = if on {
+        execute!(io::stdout(), EnableMouseCapture)
+    } else {
+        execute!(io::stdout(), DisableMouseCapture)
+    };
+}
+
 /// Restore the terminal when the process panics anywhere.
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
@@ -691,6 +703,13 @@ pub async fn run_console(
                         _ => None,
                     });
                     let quit = effects.iter().any(|effect| matches!(effect, Effect::Quit));
+                    let mouse = effects.iter().find_map(|effect| match effect {
+                        Effect::SetMouseCapture(on) => Some(*on),
+                        _ => None,
+                    });
+                    if let Some(on) = mouse {
+                        set_mouse_capture(on);
+                    }
                     console.execute_all(effects).await;
                     if let Some(new_key) = switch {
                         // the session we are leaving keeps its watcher

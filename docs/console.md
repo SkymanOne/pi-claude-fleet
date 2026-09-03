@@ -51,6 +51,7 @@ Keys in normal mode:
 | `t` | cycle the thinking level |
 | `m` | switch the model (palette, over models) |
 | `p` | permission mode (orchestrator only) |
+| `v` | release the mouse so you can select and copy; `v` again takes it back |
 | `ctrl-d` / `ctrl-u` | scroll half a page down / up |
 | `ctrl-f` / `ctrl-b` | scroll a page down / up |
 | `q` | close the console (workers keep running) |
@@ -96,9 +97,18 @@ With the orchestrator selected the composer is a normal message. With a worker s
 | `/model <model>` | | switches its model, live |
 | `/permissions <mode>` | `/perm` | how the orchestrator's tool use is approved. With no argument it says what is in force |
 | `/rail <mode>` | `/rw` | width of the drill-down's session list: `compact`, `auto`, `wide`, or `full` |
+| `/mouse` | | the same toggle as `v`, for the palette |
 | `/help` | `/h` | keys and commands |
 | `/quit` | `/q` | leave the console (workers keep running) |
 | `/shutdown` | `/sd` | stop the orchestrator and every worker, then exit. Asks first, and worktrees and branches are kept |
+
+## Copying text
+
+The console captures the mouse so the wheel scrolls the transcript, and that is exactly what stops your terminal from ever seeing a drag — while it is on, the terminal's own click-and-drag selection cannot run.
+
+`v` (or `/mouse`) hands the mouse back. Select and copy the way you would in any other program, then press `v` again to take it back. The status line says `select` for as long as the mouse is the terminal's, so a wheel that has stopped scrolling is never a mystery, and keyboard scrolling (`j`/`k`, `ctrl-d`/`ctrl-u`, `ctrl-f`/`ctrl-b`, `g`/`G`) works in both states. The setting is deliberately not remembered across launches.
+
+Most terminals also let you bypass mouse capture by holding a modifier while dragging — `option` in iTerm2 and Terminal.app, `shift` in kitty, Ghostty and WezTerm — which needs no toggle at all.
 
 `/model` and `/thinking` change a running session without restarting it and without spending a turn, on either side. For the orchestrator, claude validates the model name itself, so an unknown one shows claude's own error rather than a list of ours. For a worker the console resolves the id against the models pi reported. An ambiguous or unknown id sends nothing and says so, while an explicit `provider:model` passes straight through.
 

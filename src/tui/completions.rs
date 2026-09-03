@@ -116,6 +116,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         aliases: &["/perm", "/p"],
     },
     CommandSpec {
+        name: "/mouse",
+        detail: "release the mouse to select and copy, or take it back for the wheel",
+        takes_argument: false,
+        worker_only: false,
+        aliases: &[],
+    },
+    CommandSpec {
         name: "/rail",
         detail: "width of the session list: compact, auto, wide, full",
         takes_argument: true,

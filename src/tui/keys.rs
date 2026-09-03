@@ -97,6 +97,9 @@ pub enum KeyAction {
     /// Ctrl-K: the palette, from the composer.
     PaletteInInsert,
     /// Bound to nothing.
+    /// Hand the mouse to the terminal so its own selection works, or take
+    /// it back so the wheel scrolls again.
+    ToggleMouse,
     Ignored,
 }
 
@@ -151,6 +154,7 @@ fn map_normal(key: KeyEvent) -> KeyAction {
         KeyCode::Char('t') => A::CycleThinking,
         KeyCode::Char('m') => A::Models,
         KeyCode::Char('p') => A::PermissionMode,
+        KeyCode::Char('v') => A::ToggleMouse,
         KeyCode::Char('n') => A::NextMatch,
         KeyCode::Char('N') => A::PrevMatch,
         KeyCode::Char('d') if ctrl(&key) => A::ScrollHalfDown,
@@ -309,6 +313,10 @@ pub const NORMAL_KEYS: &[KeyHelp] = &[
     KeyHelp {
         keys: "Q",
         what: "stop the orchestrator and every worker, then exit",
+    },
+    KeyHelp {
+        keys: "v",
+        what: "release the mouse so you can select and copy; again takes it back",
     },
     KeyHelp {
         keys: "i",
@@ -616,6 +624,19 @@ mod tests {
             A::Ignored
         );
         assert_eq!(map_mouse(mouse(MouseEventKind::Moved)), A::Ignored);
+    }
+
+    #[test]
+    fn v_releases_the_mouse_in_normal_mode_and_types_in_insert() {
+        assert_eq!(
+            map_key(Mode::Normal, key(KeyCode::Char('v'))),
+            A::ToggleMouse
+        );
+        assert_eq!(
+            map_key(Mode::Insert, key(KeyCode::Char('v'))),
+            A::InsertChar('v'),
+            "writing a message never toggles the mouse"
+        );
     }
 
     #[test]

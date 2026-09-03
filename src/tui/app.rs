@@ -298,6 +298,10 @@ pub enum Effect {
     WorkerCommand { run_id: String, message: String },
     /// Remove a worker: worktree, branch, dashboard row (`force` aborts first).
     RemoveWorker { run_id: String, force: bool },
+    /// Take the mouse, or hand it back to the terminal so its own selection
+    /// works. Terminal IO, so the runtime's event loop does it; `execute`
+    /// leaves it alone, the way it leaves [`Effect::Quit`].
+    SetMouseCapture(bool),
     /// Write the remembered preferences.
     SavePrefs,
     /// Close the console; workers keep running.
@@ -380,6 +384,12 @@ pub struct Console {
     /// Per-run optimistic thinking levels, until the worker monitor persists
     /// them into the run's state and the next poll confirms it.
     pending_thinking: HashMap<String, String>,
+    /// Is the mouse ours? While it is, the wheel scrolls the transcript and
+    /// the terminal never sees a drag, so its own selection cannot run.
+    /// Releasing it hands both back — see [`Self::toggle_mouse`]. Never
+    /// remembered across launches: a console that came up unable to scroll
+    /// with the wheel, for a reason set days ago, is a bug report.
+    mouse_captured: bool,
 }
 
 impl Console {
@@ -398,6 +408,7 @@ impl Console {
             orch_key: SessionKey::default(),
             mode: Mode::Normal,
             view: View::Dashboard,
+            mouse_captured: true,
             selected: 0,
             rows: Vec::new(),
             runs: Vec::new(),
@@ -1359,6 +1370,7 @@ impl Console {
                 Vec::new()
             }
             KeyAction::PermissionMode => self.cycle_permission_mode(),
+            KeyAction::ToggleMouse => self.toggle_mouse(),
             KeyAction::ScrollHalfDown => {
                 if self.view == View::Session {
                     self.scroll_page(self.viewport_rows as i64 / 2);
@@ -2229,6 +2241,33 @@ impl Console {
         }
     }
 
+    /// `v`: hand the mouse to the terminal, or take it back.
+    ///
+    /// Mouse capture is what lets the wheel scroll the transcript, and it is
+    /// also what stops the terminal ever seeing a drag — so while it is on,
+    /// the terminal's own click-and-drag selection cannot run and there is
+    /// no way to copy what is on screen. Releasing it trades the wheel for
+    /// selection; the status line says which is in force, because a wheel
+    /// that silently stopped working is worse than either.
+    fn toggle_mouse(&mut self) -> Vec<Effect> {
+        self.mouse_captured = !self.mouse_captured;
+        if self.mouse_captured {
+            self.toast("· mouse taken back — the wheel scrolls again", false);
+        } else {
+            self.toast(
+                "· mouse released — drag to select and copy, v takes it back",
+                false,
+            );
+        }
+        vec![Effect::SetMouseCapture(self.mouse_captured)]
+    }
+
+    /// Is the mouse the console's, rather than the terminal's?
+    #[must_use]
+    pub const fn mouse_captured(&self) -> bool {
+        self.mouse_captured
+    }
+
     /// `p`: cycle the orchestrator's permission mode.
     fn cycle_permission_mode(&mut self) -> Vec<Effect> {
         if !self.selected_target().is_worker() {
@@ -2305,6 +2344,7 @@ impl Console {
             }
             Some("/session") => return self.session_command(argument),
             Some("/rail") => return self.set_rail((!argument.is_empty()).then_some(argument)),
+            Some("/mouse") => return self.toggle_mouse(),
             _ => {}
         }
         self.remember_history(&text);
@@ -2764,7 +2804,7 @@ impl Console {
                     crate::ops::integrate::cleanup(&run_id, Some(&repo_root), force).await?;
                 }
                 Effect::SavePrefs => self.save_prefs(),
-                Effect::Quit => {}
+                Effect::SetMouseCapture(_) | Effect::Quit => {}
             }
             Ok(())
         }
@@ -3659,6 +3699,32 @@ mod tests {
             &effects[0],
             Effect::WorkerThinking { level, .. } if level == "max"
         ));
+    }
+
+    #[test]
+    fn v_hands_the_mouse_to_the_terminal_and_takes_it_back() {
+        let mut c = test_console();
+        assert!(c.mouse_captured(), "the console owns the wheel by default");
+
+        let effects = c.handle_key(ch('v'));
+        assert_eq!(effects, vec![Effect::SetMouseCapture(false)]);
+        assert!(!c.mouse_captured());
+        assert!(
+            c.flash().is_some_and(|f| f.text.contains("select")),
+            "it says what just happened"
+        );
+
+        let effects = c.handle_key(ch('v'));
+        assert_eq!(effects, vec![Effect::SetMouseCapture(true)]);
+        assert!(c.mouse_captured());
+
+        // and the command reaches the same place, for the palette
+        c.mode = Mode::Insert;
+        c.composer.input = "/mouse".to_string();
+        c.composer.cursor = 6;
+        let effects = c.handle_key(enter());
+        assert_eq!(effects, vec![Effect::SetMouseCapture(false)]);
+        assert!(!c.mouse_captured());
     }
 
     #[test]

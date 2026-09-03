@@ -97,6 +97,11 @@ pub fn draw(frame: &mut Frame, area: Rect, console: &Console, feeds: &Feeds<'_>,
         }
     }
 
+    // a wheel that stopped scrolling must never be a mystery
+    if !console.mouse_captured() {
+        part(&mut spans, "select".to_string(), pal.attention());
+    }
+
     let approvals = feeds.orch.pending_requests.len();
     if approvals > 0 {
         part(
